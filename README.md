@@ -35,7 +35,7 @@ effect the next time the game starts.
 * **Core layout** (default: Let Android decide). "Doris" puts Eden's GPU emulation thread, the busiest one, on the
   fastest CPU core (the prime core on Snapdragon 8 Gen 2) and the other heavy emulator threads on the middle cores,
   through Eden's own core groups. The prime core is also the hottest, so this is off by default.
-* **CPU profiler** (default: on for now, while the speed-up work needs data). Samples where the GPU thread and the
+* **CPU profiler** (default: off). Samples where the GPU thread and the
   Vulkan worker spend their CPU time (with call stacks, and system-library function names) and writes the totals to
   `doris_profile.txt` in the log folder every 20 seconds.
   Each release includes `libyuzu-android-symbols-<n>.zip` to turn the offsets into function names.
@@ -47,13 +47,6 @@ effect the next time the game starts.
   middle or little cores; worker wake-ups, render passes cut by a submit, memory-protection changes, wait-for-idles
   and tiled-cache barriers per frame; texture uploads (and how many replaced GPU-drawn contents) and what the texture
   garbage collector removed, with GPU memory against its thresholds. Share it with **Share debug logs**.
-* **Texture memory cleanup** (default: Doris). Eden's texture garbage collector starts at 40% of the GPU memory budget
-  (1.6 GiB of the 4 GiB it allows on Snapdragon 8 Gen 2), counted over all of the app's GPU memory. TotK sits above
-  that in every busy area, so the collector ran every frame: thousands of textures removed and re-uploaded every few
-  seconds, textures the GPU had drawn into copied back to guest memory (each copy waits for the GPU to finish all its
-  work: a hitch) or thrown away (rebuilt later from stale memory: flicker). Doris starts at 2.4 GiB, removes only
-  textures unused for 300 frames (120 under pressure, 20 when critical), and keeps GPU drawings unless memory is
-  critical. "Eden (as before)" switches back. Takes effect right away.
 * **Wait for new textures** (default: up to 8 ms per frame). Only matters with ASTC Decoding Method on CPU Async:
   Eden draws new textures before they are decoded, so new places flash as textures fill in. Doris waits briefly for
   each new texture and uploads it straight away.
@@ -73,10 +66,17 @@ effect the next time the game starts.
   and the worker made another one per chunk; on Android every notify is a futex system call. Doris only notifies a
   thread that is actually asleep (build 11 profile: these calls were about 12% of the GPU emulation thread and 9% of
   the worker).
-* Work goes to the worker every 8 draws instead of 4 (Eden's desktop value), halving those calls. Submits stay every
-  512 draws, exactly as in Eden.
-* Build 12 also held submits back while a render pass was open. That started the GPU later in each frame and caused
-  hitches, so it was undone.
+* Hand-offs (every 4 draws) and submits (every 512 draws) happen exactly when Eden does them. Build 12 handed work
+  over less often and held submits back while a render pass was open; that started the GPU later in each frame and
+  caused hitches, so it was undone.
+
+## Texture cleanup
+
+Eden's texture garbage collector rules are unchanged (build 14 tried keeping every texture the GPU drew into until
+memory was critical; GPU memory climbed to 3.5 GiB and the collector then purged thousands of textures at once, so it
+was reverted in build 15). One change on top: textures that must be copied back to guest memory before removal are
+copied together, and the pass waits for the GPU once instead of once per texture. Eden waited up to 2059 times in 10
+seconds when entering a busy area (build 12 log), with the GPU thread spending 19.5 ms of every frame waiting.
 
 ## Frame generation after a hitch
 
