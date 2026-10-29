@@ -6,7 +6,7 @@ name: Build Eden (Doris)
 on:
   push:
     branches: [main]
-    paths: [UPSTREAM, 'patches/**', '.github/workflows/build.yml']
+    paths: [UPSTREAM, 'patches/**', 'upstream/**', '.github/workflows/build.yml']
   workflow_dispatch:
 
 permissions:
@@ -45,23 +45,32 @@ jobs:
 
       - uses: mozilla-actions/sccache-action@v0.0.9
 
-      - name: Eden source at the pinned commit + Doris patches
+      - name: Eden source (the PR #4324 build) + Doris patches
         run: |
-          read -r SHA < UPSTREAM
+          val() { awk -v k="$1" '$1 == k { print $2 }' UPSTREAM; }
+          SHA=$(val commit)
           git init -q eden
           cd eden
-          git remote add origin https://github.com/eden-emulator/mirror.git
-          git fetch -q --depth 1 origin "$SHA"
-          git checkout -q FETCH_HEAD
-          git -c user.name="Eden (Doris)" -c user.email=doris@localhost am -3 ../patches/*.patch
-          git log --oneline -n 20 > ../patch-log.txt
+          AM="git -c user.name=Eden-Doris -c user.email=doris@localhost am -3"
+          if git fetch -q --depth 60 "$(val server)" "$(val pr_ref)" && [ "$(git rev-parse FETCH_HEAD)" = "$SHA" ]; then
+            git checkout -q FETCH_HEAD
+            echo "Eden source: PR #4324 build $SHA, made on $(git rev-parse HEAD^)" | tee ../source.txt
+          else
+            echo "::warning::Eden's server did not give $SHA; using the GitHub mirror + upstream/pr4324.patch"
+            git fetch -q --depth 60 "$(val fallback_mirror)" "$(val fallback_base)"
+            git checkout -q FETCH_HEAD
+            $AM ../upstream/pr4324.patch
+            echo "Eden source: mirror $(val fallback_base) + PR #4324 patch" | tee ../source.txt
+          fi
+          $AM ../patches/*.patch
+          git log --oneline -n 6 > ../patch-log.txt
           cat ../patch-log.txt
 
       - name: Restore downloaded dependencies
         uses: actions/cache@v4
         with:
           path: eden/.cache/cpm
-          key: cpm-${{ hashFiles('UPSTREAM') }}
+          key: cpm-${{ hashFiles('UPSTREAM', 'patches/**') }}
           restore-keys: cpm-
 
       - name: Build the APK
@@ -95,7 +104,7 @@ jobs:
           {
             echo "Eden (Doris) build ${{ github.run_number }} — package dev.eden.eden_doris (installs beside every other Eden)."
             echo
-            echo "Upstream Eden commit: \`$(cat UPSTREAM)\`"
+            cat source.txt
             echo
             echo "Doris changes in this build:"
             echo '```'

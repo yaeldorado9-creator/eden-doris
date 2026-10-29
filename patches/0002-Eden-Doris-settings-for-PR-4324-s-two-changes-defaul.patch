@@ -1,0 +1,226 @@
+From 897319d280318760e9589865d82842e431d8277b Mon Sep 17 00:00:00 2001
+From: "Eden (Doris) build" <doris@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 09:23:41 -0500
+Subject: [PATCH 2/2] Eden (Doris): settings for PR #4324's two changes
+ (defaults = PR #4324 behaviour)
+
+- Shader loop limit (256 as in PR #4324; 512 to 8192, or no limit)
+- Monster Hunter Rise record fix: always (as in PR #4324), only in MHR, or off;
+  the log says when it rewrites a copy and in which game
+---
+ .../features/settings/model/IntSetting.kt     |  2 ++
+ .../settings/model/view/SettingsItem.kt       | 18 +++++++++++
+ .../settings/ui/SettingsFragmentPresenter.kt  |  5 +++
+ .../app/src/main/res/values/arrays.xml        | 32 +++++++++++++++++++
+ .../app/src/main/res/values/strings.xml       | 10 ++++++
+ src/common/settings.h                         |  9 ++++++
+ .../backend/spirv/emit_spirv.cpp              |  5 +--
+ src/video_core/buffer_cache/buffer_cache.h    | 18 +++++++++--
+ 8 files changed, 95 insertions(+), 4 deletions(-)
+
+diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/IntSetting.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/IntSetting.kt
+index ea31692fb..da16941bd 100644
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/IntSetting.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/IntSetting.kt
+@@ -30,6 +30,8 @@ enum class IntSetting(override val key: String) : AbstractIntSetting {
+     RENDERER_ASPECT_RATIO("aspect_ratio"),
+ 
+     RENDERER_DYNA_STATE("dyna_state"),
++    DORIS_SHADER_LOOP_LIMIT("doris_shader_loop_limit"),
++    DORIS_MHR_FIX("doris_mhr_fix"),
+     DMA_ACCURACY("dma_accuracy"),
+     GPU_FENCE_BEHAVIOR("gpu_fence_behavior"),
+     FRAME_PACING_MODE("frame_pacing_mode"),
+diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt
+index 6d46b5005..08d1272e3 100644
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt
+@@ -178,6 +178,24 @@ abstract class SettingsItem(
+                     descriptionId = R.string.frame_limit_enable_description
+                 )
+             )
++            put(
++                SingleChoiceSetting(
++                    IntSetting.DORIS_SHADER_LOOP_LIMIT,
++                    titleId = R.string.doris_shader_loop_limit,
++                    descriptionId = R.string.doris_shader_loop_limit_description,
++                    choicesId = R.array.dorisShaderLoopLimitEntries,
++                    valuesId = R.array.dorisShaderLoopLimitValues
++                )
++            )
++            put(
++                SingleChoiceSetting(
++                    IntSetting.DORIS_MHR_FIX,
++                    titleId = R.string.doris_mhr_fix,
++                    descriptionId = R.string.doris_mhr_fix_description,
++                    choicesId = R.array.dorisMhrFixEntries,
++                    valuesId = R.array.dorisMhrFixValues
++                )
++            )
+             put(
+                 SingleChoiceSetting(
+                     IntSetting.RENDERER_DYNA_STATE,
+diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt
+index 8e4984efe..8454b49b0 100644
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt
+@@ -350,6 +350,11 @@ class SettingsFragmentPresenter(
+             add(BooleanSetting.RENDERER_ASYNC_PRESENTATION.key)
+             add(SettingsItem.GPU_UNSWIZZLE_COMBINED)
+ 
++            add(HeaderSetting(R.string.doris_experiments))
++
++            add(IntSetting.DORIS_SHADER_LOOP_LIMIT.key)
++            add(IntSetting.DORIS_MHR_FIX.key)
++
+             add(HeaderSetting(R.string.extensions))
+ 
+             add(IntSetting.RENDERER_DYNA_STATE.key)
+diff --git a/src/android/app/src/main/res/values/arrays.xml b/src/android/app/src/main/res/values/arrays.xml
+index b1c0a98a6..e2b6da980 100644
+--- a/src/android/app/src/main/res/values/arrays.xml
++++ b/src/android/app/src/main/res/values/arrays.xml
+@@ -647,6 +647,38 @@
+         <item>1</item>
+     </integer-array>
+ 
++    <string-array name="dorisShaderLoopLimitEntries">
++        <item>@string/doris_loop_limit_256</item>
++        <item>512</item>
++        <item>1024</item>
++        <item>2048</item>
++        <item>4096</item>
++        <item>@string/doris_loop_limit_8192</item>
++        <item>@string/doris_loop_limit_off</item>
++    </string-array>
++
++    <integer-array name="dorisShaderLoopLimitValues">
++        <item>256</item>
++        <item>512</item>
++        <item>1024</item>
++        <item>2048</item>
++        <item>4096</item>
++        <item>8192</item>
++        <item>0</item>
++    </integer-array>
++
++    <string-array name="dorisMhrFixEntries">
++        <item>@string/doris_mhr_fix_always</item>
++        <item>@string/doris_mhr_fix_mhr_only</item>
++        <item>@string/disabled</item>
++    </string-array>
++
++    <integer-array name="dorisMhrFixValues">
++        <item>2</item>
++        <item>1</item>
++        <item>0</item>
++    </integer-array>
++
+     <string-array name="dynaStateEntries">
+         <item>@string/disabled</item>
+         <item>ExtendedDynamicState 1</item>
+diff --git a/src/android/app/src/main/res/values/strings.xml b/src/android/app/src/main/res/values/strings.xml
+index 7cd9c62ff..e377d6ad1 100644
+--- a/src/android/app/src/main/res/values/strings.xml
++++ b/src/android/app/src/main/res/values/strings.xml
+@@ -599,6 +599,16 @@
+ 
+ 
+     <string name="extensions">Extensions</string>
++    <string name="doris_experiments">Eden (Doris) experiments</string>
++    <string name="doris_shader_loop_limit">Shader loop limit</string>
++    <string name="doris_shader_loop_limit_description">How many times a loop inside a game shader may repeat before it is cut short. The PR #4324 build uses 256 (faster, but long loops are cut); Eden normally uses 8192. Takes effect the next time the game starts.</string>
++    <string name="doris_mhr_fix">Monster Hunter Rise record fix</string>
++    <string name="doris_mhr_fix_description">The PR #4324 workaround for character flicker in Monster Hunter Rise. That build runs it in every game; it can be limited to Monster Hunter Rise or turned off.</string>
++    <string name="doris_loop_limit_256">256 (PR #4324)</string>
++    <string name="doris_loop_limit_8192">8192 (Eden default)</string>
++    <string name="doris_loop_limit_off">No limit</string>
++    <string name="doris_mhr_fix_always">Always (PR #4324)</string>
++    <string name="doris_mhr_fix_mhr_only">Only in Monster Hunter Rise</string>
+ 
+     <string name="dyna_state">Extended Dynamic State</string>
+     <string name="dyna_state_description">Controls the number of features that can be used in ExtendedDynamicState (EDS). The higher value will allow to reduce the amount of pipeline compilations based on the dynamic state supported by driver.</string>
+diff --git a/src/common/settings.h b/src/common/settings.h
+index 60cf87430..4af340ee7 100644
+--- a/src/common/settings.h
++++ b/src/common/settings.h
+@@ -584,6 +584,15 @@ struct Values {
+     SwitchableSetting<bool> barrier_feedback_loops{linkage, true, "barrier_feedback_loops",
+                                                    Category::RendererAdvanced};
+ 
++    // Eden (Doris) experiments. Defaults reproduce the PR #4324 build exactly.
++    // Iterations each shader loop may run before it is cut short (0 = no cap).
++    // PR #4324 lowered Eden's 8192 to 256 for Monster Hunter Rise.
++    SwitchableSetting<u32> doris_shader_loop_limit{linkage, 256, "doris_shader_loop_limit",
++                                                   Category::RendererAdvanced};
++    // PR #4324's Monster Hunter Rise record fix: 0 = off, 1 = only in Monster Hunter Rise,
++    // 2 = always, in every game (as the PR #4324 build does).
++    SwitchableSetting<u32> doris_mhr_fix{linkage, 2, "doris_mhr_fix", Category::RendererAdvanced};
++
+     SwitchableSetting<bool> enable_buffer_history{linkage,
+                                                   false,
+                                                   "enable_buffer_history",
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv.cpp b/src/shader_recompiler/backend/spirv/emit_spirv.cpp
+index 0a5bd1cfe..4d29df657 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv.cpp
+@@ -165,10 +165,11 @@ void Traverse(EmitContext& ctx, IR::Program& program) {
+             break;
+         case IR::AbstractSyntaxNode::Type::Repeat: {
+             Id cond{ctx.Def(node.data.repeat.cond)};
+-            if (!Settings::values.disable_shader_loop_safety_checks) {
++            const u32 loop_limit{Settings::values.doris_shader_loop_limit.GetValue()};
++            if (!Settings::values.disable_shader_loop_safety_checks && loop_limit != 0) {
+                 const Id pointer_type{ctx.TypePointer(spv::StorageClass::Private, ctx.U32[1])};
+                 const Id safety_counter{ctx.AddGlobalVariable(
+-                    pointer_type, spv::StorageClass::Private, ctx.Const(0x100u))};
++                    pointer_type, spv::StorageClass::Private, ctx.Const(loop_limit))};
+                 if (ctx.profile.supported_spirv >= 0x00010400) {
+                     ctx.interfaces.push_back(safety_counter);
+                 }
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 4620f80a3..ce28f0f7f 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -8,6 +8,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <cstring>
+ #include <memory>
+ #include <mutex>
+@@ -240,8 +241,14 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
+         return amount == mhr_record_size && address >= slot &&
+                address <= slot + mhr_slot_size - mhr_record_size;
+     };
+-    const bool mhr_source_a = in_mhr_slot(*cpu_src_address, mhr_slot_a);
+-    const bool mhr_source_b = in_mhr_slot(*cpu_src_address, mhr_slot_b);
++    // Eden (Doris): 0 = off, 1 = only in Monster Hunter Rise, 2 = always (PR #4324 behaviour).
++    constexpr u64 mhr_program_id = 0x0100B04011742000ULL;
++    const u32 mhr_fix_mode{Settings::values.doris_mhr_fix.GetValue()};
++    const bool mhr_fix_enabled =
++        mhr_fix_mode == 2 ||
++        (mhr_fix_mode == 1 && Settings::GetCurrentProgramID() == mhr_program_id);
++    const bool mhr_source_a = mhr_fix_enabled && in_mhr_slot(*cpu_src_address, mhr_slot_a);
++    const bool mhr_source_b = mhr_fix_enabled && in_mhr_slot(*cpu_src_address, mhr_slot_b);
+     bool mhr_override{};
+     MhrRecord mhr_healthy_record{};
+     if (mhr_source_a || mhr_source_b) {
+@@ -341,6 +348,13 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
+     }
+ 
+     if (mhr_override) {
++        // Eden (Doris): say in the log when the record fix rewrites a copy, and in which game.
++        static std::atomic<u64> mhr_override_count{};
++        const u64 n = ++mhr_override_count;
++        if (n <= 20 || (n & (n - 1)) == 0) {
++            LOG_WARNING(HW_GPU, "Doris: MHR record fix replaced DMA copy #{} to {:#x} (program {:016X})",
++                        n, *cpu_dest_address, Settings::GetCurrentProgramID());
++        }
+         device_memory.WriteBlockUnsafe(*cpu_dest_address, mhr_healthy_record.data(),
+                                        mhr_healthy_record.size());
+         InlineMemoryImplementation(*cpu_dest_address, mhr_healthy_record.size(),
+-- 
+2.43.0
+

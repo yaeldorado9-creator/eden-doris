@@ -1,8 +1,8 @@
-From 4417d0f3852021aaa7d6965711115715b6e46a0a Mon Sep 17 00:00:00 2001
+From 9eafc6518582d8e47f86f63e7e842487001ee986 Mon Sep 17 00:00:00 2001
 From: "Eden (Doris) build" <doris@users.noreply.github.com>
 Date: Thu, 29 Oct 2026 09:04:53 -0500
-Subject: [PATCH] [android] Eden (Doris): own app ID, name and icon so it
- installs beside every other Eden
+Subject: [PATCH 1/2] Eden (Doris): own app ID, name and icon so it installs
+ beside every other Eden
 
 - new 'doris' product flavor: applicationId dev.eden.eden_doris, label 'Eden (Doris)'
 - custom-config intent action is now per application ID (no chooser between Eden apps)
@@ -24,7 +24,7 @@ Subject: [PATCH] [android] Eden (Doris): own app ID, name and icon so it
  create mode 100644 src/android/app/src/doris/res/mipmap-anydpi-v26/ic_launcher_round.xml
 
 diff --git a/src/android/app/build.gradle.kts b/src/android/app/build.gradle.kts
-index 69dd6a8e4..c1400e27b 100644
+index 0cef7e719..75ec07279 100644
 --- a/src/android/app/build.gradle.kts
 +++ b/src/android/app/build.gradle.kts
 @@ -240,6 +240,20 @@ android {
@@ -55,8 +55,8 @@ index 69dd6a8e4..c1400e27b 100644
 -        resValue("string", "app_name", "Eden$suffix")
 +        resValue("string", "app_name", if (name == "doris") "$currentName$suffix" else "Eden$suffix")
      }
+ }
  
-     sourceSets {
 diff --git a/src/android/app/src/doris/res/drawable/ic_doris_background.xml b/src/android/app/src/doris/res/drawable/ic_doris_background.xml
 new file mode 100644
 index 000000000..b88e576d0

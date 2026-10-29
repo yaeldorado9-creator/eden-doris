@@ -1,1 +1,9 @@
-26a03d2473787abf3223b2d0e65b291eee00c1e1
+# The Eden source Eden (Doris) is built on: the PR #4324 build
+# (in-app version "c3bdfd14c5-xbzk/mhr-flicker-slow-evidences").
+commit c3bdfd14c551a995759dacdaf74ee37266ed33a0
+pr_ref refs/pull/4324/head
+server https://git.eden-emu.dev/eden-emu/eden.git
+# Used only if Eden's own server can't be reached: the late-August GitHub mirror commit
+# that PR #4324 was made on, plus upstream/pr4324.patch.
+fallback_base e5b656e3725dc3718e31a4d6d91649801dcdd40b
+fallback_mirror https://github.com/eden-emulator/mirror.git
