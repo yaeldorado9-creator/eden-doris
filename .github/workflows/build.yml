@@ -120,5 +120,6 @@ jobs:
             cat patch-log.txt
             echo '```'
           } > notes.md
+          shopt -s nullglob
           gh release create "$DORIS_TAG" out/*.apk out/SHA256SUMS.txt out/*.zip \
             --title "Eden (Doris) ${{ github.run_number }}" --notes-file notes.md --target "${{ github.sha }}"
