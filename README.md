@@ -36,14 +36,17 @@ effect the next time the game starts.
   fastest CPU core (the prime core on Snapdragon 8 Gen 2) and the other heavy emulator threads on the middle cores,
   through Eden's own core groups. The prime core is also the hottest, so this is off by default.
 * **CPU profiler** (default: on for now, while the speed-up work needs data). Samples where the GPU thread and the
-  Vulkan worker spend their CPU time and writes the totals to `doris_profile.txt` in the log folder every 20 seconds.
+  Vulkan worker spend their CPU time (with call stacks, and system-library function names) and writes the totals to
+  `doris_profile.txt` in the log folder every 20 seconds.
   Each release includes `libyuzu-android-symbols-<n>.zip` to turn the offsets into function names.
 * **Performance report** (default: off). While a game runs, writes a summary to the log every 10 seconds: frame
   times, how busy each emulator thread is (and on which core), CPU and GPU clocks, GPU load, battery temperature;
   per frame, the draws, dispatches, render passes and submits, new pipelines, how long the GPU thread waited for
   presentation and GPU fences and the Vulkan worker for shader builds, and the GPU time of the whole frame, of frame
-  generation and of output scaling (GPU timestamps); and how often the GPU thread and the Vulkan worker ran on prime,
-  middle or little cores. Share it with **Share debug logs**.
+  generation and of output scaling (GPU timestamps); how often the GPU thread and the Vulkan worker ran on prime,
+  middle or little cores; worker wake-ups, render passes cut by a submit, memory-protection changes, wait-for-idles
+  and tiled-cache barriers per frame; texture uploads (and how many replaced GPU-drawn contents) and what the texture
+  garbage collector removed, with GPU memory against its thresholds. Share it with **Share debug logs**.
 * **Wait for new textures** (default: up to 8 ms per frame). Only matters with ASTC Decoding Method on CPU Async:
   Eden draws new textures before they are decoded, so new places flash as textures fill in. Doris waits briefly for
   each new texture and uploads it straight away.
@@ -56,6 +59,16 @@ effect the next time the game starts.
   no limit.
 * **Monster Hunter Rise record fix**: always (PR #4324, default), only in Monster Hunter Rise, or off. The log notes
   every time it rewrites a copy, and in which game.
+
+## Submitting work to the GPU
+
+* Eden handed recorded commands to its Vulkan worker thread every 4 draws and woke the worker with a condition-variable
+  notify each time; on Android every notify is a futex system call, and the worker made another one per chunk. Doris
+  hands work over every 16 draws and only wakes a thread that is actually asleep (build 11 profile: these calls were
+  about 12% of the GPU emulation thread and 9% of the worker).
+* Eden submitted every 512 draws even in the middle of a render pass. A submit ends the render pass, and on a tiled
+  GPU like Adreno the rest of that pass then has to store and reload all its attachments. Doris waits for a moment
+  when no render pass is open (up to 2048 draws).
 
 ## Frame generation after a hitch
 

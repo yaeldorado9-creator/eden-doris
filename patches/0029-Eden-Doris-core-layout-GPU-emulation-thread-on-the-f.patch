@@ -1,7 +1,7 @@
 From 1810ff4d7d40dde830a93eb3fd4dec5112fda00d Mon Sep 17 00:00:00 2001
 From: "Eden (Doris) build" <doris@users.noreply.github.com>
 Date: Thu, 29 Oct 2026 12:05:36 -0500
-Subject: [PATCH 29/34] Eden (Doris): core layout - GPU emulation thread on the
+Subject: [PATCH 29/35] Eden (Doris): core layout - GPU emulation thread on the
  fastest core (setting, on by default)
 
 The performance report from a Thor at ClusterTune's Medium underclock showed Eden's GPU thread as the

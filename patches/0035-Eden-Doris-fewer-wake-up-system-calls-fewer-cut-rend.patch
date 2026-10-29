@@ -1,0 +1,619 @@
+From 3bc5ca115024a3384028f2532cd131077c4882b2 Mon Sep 17 00:00:00 2001
+From: "Eden (Doris) build" <doris@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 14:42:38 -0500
+Subject: [PATCH 35/35] Eden (Doris): fewer wake-up system calls, fewer cut
+ render passes; more report data
+
+Speed:
+- The GPU thread handed recorded work to the Vulkan worker every 4 draws and
+  woke it with a condition-variable notify each time; on Android every notify
+  is a futex system call, and the worker made another one for every chunk it
+  took. In build 11 that was about 12% of the GPU thread and 9% of the worker.
+  Now work goes over every 16 draws, and either side only notifies when the
+  other one is actually waiting.
+- Every 512 draws Eden submitted, which ends the open render pass; on a tiled
+  GPU the rest of that pass then has to store and reload all its attachments.
+  Doris now waits for a moment when no render pass is open (up to 2048 draws).
+
+Report (per frame / per 10 s): worker wake-ups, render passes cut by a submit,
+memory-protection changes, wait-for-idles, tiled-cache barriers, texture
+uploads (and uploads over GPU-drawn contents), garbage-collector removals
+(copied back / lost), GPU memory against the collector thresholds.
+
+Profiler: records call stacks (frame-pointer chain, bounded by the thread
+stack) and names system-library functions (nearest exported symbol).
+---
+ src/common/doris_perf.cpp                     |  35 +++++
+ src/common/doris_perf.h                       |  34 +++++
+ src/common/doris_profiler.cpp                 | 140 ++++++++++++++++--
+ src/common/doris_profiler.h                   |   8 +-
+ src/core/memory.cpp                           |   2 +
+ .../renderer_vulkan/vk_rasterizer.cpp         |  14 +-
+ .../renderer_vulkan/vk_scheduler.cpp          |  28 +++-
+ src/video_core/renderer_vulkan/vk_scheduler.h |   4 +
+ src/video_core/texture_cache/texture_cache.h  |  15 ++
+ 9 files changed, 256 insertions(+), 24 deletions(-)
+
+diff --git a/src/common/doris_perf.cpp b/src/common/doris_perf.cpp
+index c5cb0d6fc..2435646b1 100644
+--- a/src/common/doris_perf.cpp
++++ b/src/common/doris_perf.cpp
+@@ -46,6 +46,8 @@ std::once_flag start_flag;
+ std::array<std::atomic<std::uint64_t>, static_cast<size_t>(Count::Max)> counters{};
+ std::array<std::atomic<std::uint64_t>, static_cast<size_t>(Wait::Max)> wait_ns{};
+ std::array<std::atomic<std::uint64_t>, static_cast<size_t>(GpuPart::Max)> gpu_ns{};
++std::array<std::atomic<std::uint64_t>, static_cast<size_t>(Gauge::Max)> gauge_now{};
++std::array<std::atomic<std::uint64_t>, static_cast<size_t>(Gauge::Max)> gauge_max{};
+ 
+ thread_local bool is_gpu_thread = false;
+ 
+@@ -272,6 +274,7 @@ void ReportLoop() {
+         const auto counted = TakeAll(counters);
+         const auto waited = TakeAll(wait_ns);
+         const auto gpu = TakeAll(gpu_ns);
++        const auto gauges_max = TakeAll(gauge_max);
+         std::vector<Clock::time_point> stamps;
+         {
+             std::scoped_lock lock{frame_mutex};
+@@ -386,6 +389,29 @@ void ReportLoop() {
+                  ms_per_frame(gpu[static_cast<size_t>(GpuPart::FrameGen)]),
+                  ms_per_frame(gpu[static_cast<size_t>(GpuPart::Output)]),
+                  cores.empty() ? "n/a" : cores);
++        const auto count_of = [&](Count counter) {
++            return counted[static_cast<size_t>(counter)];
++        };
++        const auto gauge_of = [&](Gauge gauge) {
++            return gauge_now[static_cast<size_t>(gauge)].load(std::memory_order_relaxed);
++        };
++        LOG_INFO(Frontend,
++                 "Doris perf: per frame {:.0f} worker wake-ups, {:.1f} render passes cut by a "
++                 "submit, {:.1f} protection changes, {:.1f} wait-for-idles, {:.1f} tiled-cache "
++                 "barriers | textures: {} uploads ({} over GPU-drawn "
++                 "contents), garbage collector removed {} ({} copied back first, {} with GPU-drawn "
++                 "contents lost) | GPU memory {} MiB (max {}), collection from {} MiB, aggressive "
++                 "from {} MiB",
++                 per_frame(count_of(Count::WorkerWakeups)),
++                 per_frame(count_of(Count::RenderPassSplits)),
++                 per_frame(count_of(Count::ProtectCalls)),
++                 per_frame(count_of(Count::WaitForIdle)),
++                 per_frame(count_of(Count::TiledCacheBarriers)), count_of(Count::TextureUploads),
++                 count_of(Count::TextureUploadsOverGpuData), count_of(Count::GcRemoved),
++                 count_of(Count::GcDownloaded), count_of(Count::GcDroppedGpuData),
++                 gauge_of(Gauge::TextureCacheMemory),
++                 gauges_max[static_cast<size_t>(Gauge::TextureCacheMemory)],
++                 gauge_of(Gauge::TextureCacheExpected), gauge_of(Gauge::TextureCacheCritical));
+     }
+ }
+ 
+@@ -419,6 +445,15 @@ ScopedWait::~ScopedWait() {
+                                                 std::memory_order_relaxed);
+ }
+ 
++void SetGauge(Gauge gauge, std::uint64_t value) {
++    const auto index = static_cast<size_t>(gauge);
++    gauge_now[index].store(value, std::memory_order_relaxed);
++    std::uint64_t seen = gauge_max[index].load(std::memory_order_relaxed);
++    while (value > seen &&
++           !gauge_max[index].compare_exchange_weak(seen, value, std::memory_order_relaxed)) {
++    }
++}
++
+ void AddGpuTime(GpuPart part, std::uint64_t nanoseconds) {
+     gpu_ns[static_cast<size_t>(part)].fetch_add(nanoseconds, std::memory_order_relaxed);
+ }
+diff --git a/src/common/doris_perf.h b/src/common/doris_perf.h
+index d0ff1f0d1..d771aa070 100644
+--- a/src/common/doris_perf.h
++++ b/src/common/doris_perf.h
+@@ -24,9 +24,43 @@ enum class Count : int {
+     RenderPasses,
+     Submits,
+     NewPipelines,
++    /// The Vulkan worker had to be woken up for new work.
++    WorkerWakeups,
++    /// A submission had to end an open render pass (costly on tiled GPUs).
++    RenderPassSplits,
++    /// Textures uploaded from guest memory (new, or written by the game's CPU code).
++    TextureUploads,
++    /// ... of which the GPU had drawn into the texture before (the upload replaces that).
++    TextureUploadsOverGpuData,
++    /// Textures the texture cache's garbage collector removed.
++    GcRemoved,
++    /// ... that it first copied back to guest memory (each one waits for the GPU to finish).
++    GcDownloaded,
++    /// ... that the GPU had drawn into but could not be copied back (their contents are lost).
++    GcDroppedGpuData,
++    /// Memory protection changes for CPU write tracking.
++    ProtectCalls,
++    /// The game's "wait for idle" GPU commands.
++    WaitForIdle,
++    /// The game's tiled-cache barriers.
++    TiledCacheBarriers,
+     Max,
+ };
+ 
++/// Values that are sampled rather than counted.
++enum class Gauge : int {
++    /// GPU memory in use, as the texture cache sees it (MiB).
++    TextureCacheMemory,
++    /// The texture cache starts removing old textures above this (MiB).
++    TextureCacheExpected,
++    /// ... and removes them aggressively above this (MiB).
++    TextureCacheCritical,
++    Max,
++};
++
++/// Sets a gauge (the report shows the latest and the highest value of each window).
++void SetGauge(Gauge gauge, std::uint64_t value);
++
+ /// Adds to a counter. Cheap (one relaxed atomic add); does nothing while the report is off.
+ void Add(Count counter, std::uint64_t amount = 1);
+ 
+diff --git a/src/common/doris_profiler.cpp b/src/common/doris_profiler.cpp
+index e91d5a8b0..1f83e1f9f 100644
+--- a/src/common/doris_profiler.cpp
++++ b/src/common/doris_profiler.cpp
+@@ -42,18 +42,25 @@
+ namespace Doris::Profiler {
+ namespace {
+ 
+-constexpr int MAX_THREADS = 8;
+-constexpr uint32_t CAPACITY = 1u << 15;             // samples per buffer
++constexpr int MAX_THREADS = 4;
++constexpr uint32_t CAPACITY = 1u << 14;             // samples per buffer
+ constexpr long PERIOD_NS = 1'000'000;                // 1 ms of the thread's CPU time
+-constexpr auto WRITE_INTERVAL = std::chrono::seconds{20};
++constexpr auto DRAIN_INTERVAL = std::chrono::seconds{10};
++constexpr int DRAINS_PER_WRITE = 2;                  // write the file every 20 seconds
++constexpr int MAX_DEPTH = 14;                        // pc, lr and up to 12 frame-pointer frames
++constexpr size_t MAX_STACK_ROWS = 8000;
+ 
+ struct Sample {
+     uintptr_t pc;
+     uintptr_t lr;
++    uint32_t depth;                                  // valid entries in frames
++    std::array<uintptr_t, MAX_DEPTH - 2> frames;     // return addresses from the frame chain
+ };
+ 
+ struct Slot {
+     char label[32]{};
++    uintptr_t stack_low{};                           // the thread's stack, for safe unwinding
++    uintptr_t stack_high{};
+     std::atomic<uint32_t> active{0};                 // buffer the signal handler writes to
+     std::array<std::atomic<uint32_t>, 2> count{};
+     std::array<std::array<Sample, CAPACITY>, 2> samples{};
+@@ -72,59 +79,125 @@ void Handler(int, siginfo_t* info, void* raw_context) {
+     Slot& slot = slots[index];
+     const uint32_t buffer = slot.active.load(std::memory_order_relaxed) & 1;
+     const uint32_t position = slot.count[buffer].fetch_add(1, std::memory_order_relaxed);
+-    if (position < CAPACITY) {
+-        slot.samples[buffer][position] = {static_cast<uintptr_t>(context->uc_mcontext.pc),
+-                                          static_cast<uintptr_t>(context->uc_mcontext.regs[30])};
++    if (position >= CAPACITY) {
++        return;
++    }
++    Sample& sample = slot.samples[buffer][position];
++    sample.pc = static_cast<uintptr_t>(context->uc_mcontext.pc);
++    sample.lr = static_cast<uintptr_t>(context->uc_mcontext.regs[30]);
++    // Walk the frame-pointer chain (x29), only through 16-byte aligned records that lie inside
++    // this thread's stack and move strictly upwards, so a bad frame pointer can't fault.
++    uint32_t depth = 0;
++    uintptr_t fp = static_cast<uintptr_t>(context->uc_mcontext.regs[29]);
++    while (depth < sample.frames.size()) {
++        if ((fp & 15) != 0 || fp < slot.stack_low || fp + 16 > slot.stack_high) {
++            break;
++        }
++        const auto* record = reinterpret_cast<const uintptr_t*>(fp);
++        const uintptr_t next = record[0];
++        const uintptr_t ret = record[1];
++        if (ret == 0) {
++            break;
++        }
++        sample.frames[depth++] = ret;
++        if (next <= fp) {
++            break;
++        }
++        fp = next;
+     }
++    sample.depth = depth;
+ }
+ 
+ struct Location {
+     std::string module;
+     uintptr_t offset;
++    std::string symbol; // nearest exported symbol, for libraries without our debug info
+ };
+ 
+ Location Resolve(uintptr_t address, std::unordered_map<uintptr_t, Location>& cache) {
+     if (const auto it = cache.find(address); it != cache.end()) {
+         return it->second;
+     }
+-    Location location{"?", address};
++    Location location{"?", address, {}};
+     Dl_info info{};
+     if (address != 0 && dladdr(reinterpret_cast<void*>(address), &info) != 0 &&
+         info.dli_fname != nullptr) {
+         const std::string path = info.dli_fname;
+         location.module = path.substr(path.find_last_of('/') + 1);
+         location.offset = address - reinterpret_cast<uintptr_t>(info.dli_fbase);
++        if (info.dli_sname != nullptr && location.module.rfind("libyuzu", 0) != 0) {
++            location.symbol = fmt::format("{}+{:#x}", info.dli_sname,
++                                          address - reinterpret_cast<uintptr_t>(info.dli_saddr));
++        }
+     }
+     cache.emplace(address, location);
+     return location;
+ }
+ 
++std::string Describe(uintptr_t address, std::unordered_map<uintptr_t, Location>& cache) {
++    const Location location = Resolve(address, cache);
++    if (!location.symbol.empty()) {
++        return fmt::format("{}:{}", location.module, location.symbol);
++    }
++    return fmt::format("{}+{:#x}", location.module, location.offset);
++}
++
++/// Hash for a call stack (a vector of addresses).
++struct StackHash {
++    size_t operator()(const std::vector<uintptr_t>& stack) const noexcept {
++        size_t hash = 1469598103934665603ULL;
++        for (const uintptr_t address : stack) {
++            hash = (hash ^ address) * 1099511628211ULL;
++        }
++        return hash;
++    }
++};
++
+ void WriterLoop() {
+     Common::SetCurrentThreadName("DorisProfiler");
+     Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+     const auto start = std::chrono::steady_clock::now();
+-    // Totals since the profiler started, per thread: address -> count.
++    // Totals since the profiler started, per thread: address -> count, and stack -> count.
+     std::array<std::unordered_map<uintptr_t, uint64_t>, MAX_THREADS> pc_totals, lr_totals;
++    std::array<std::unordered_map<std::vector<uintptr_t>, uint64_t, StackHash>, MAX_THREADS>
++        stack_totals;
+     std::array<uint64_t, MAX_THREADS> sample_totals{};
+     std::unordered_map<uintptr_t, Location> cache;
+     const std::string path =
+         Common::FS::GetEdenPathString(Common::FS::EdenPath::LogDir) + "/doris_profile.txt";
+ 
+-    while (true) {
+-        std::this_thread::sleep_for(WRITE_INTERVAL);
+-        const int threads = slot_count.load();
++    std::vector<uintptr_t> stack;
++    for (int drains = 1;; ++drains) {
++        std::this_thread::sleep_for(DRAIN_INTERVAL);
++        const int threads = std::min(slot_count.load(), MAX_THREADS);
+         for (int index = 0; index < threads; ++index) {
+             Slot& slot = slots[index];
+             const uint32_t old = slot.active.fetch_xor(1) & 1;
+             std::this_thread::sleep_for(std::chrono::milliseconds{2});
+             const uint32_t taken = std::min(slot.count[old].load(), CAPACITY);
+             for (uint32_t i = 0; i < taken; ++i) {
+-                ++pc_totals[index][slot.samples[old][i].pc];
+-                ++lr_totals[index][slot.samples[old][i].lr];
++                const Sample& sample = slot.samples[old][i];
++                ++pc_totals[index][sample.pc];
++                ++lr_totals[index][sample.lr];
++                // Stack, innermost first: pc, lr (unless the frame chain already starts with
++                // it), then the frame chain.
++                stack.clear();
++                stack.push_back(sample.pc);
++                const uint32_t depth = std::min<uint32_t>(sample.depth, MAX_DEPTH - 2);
++                if (depth == 0 || sample.frames[0] != sample.lr) {
++                    stack.push_back(sample.lr);
++                }
++                for (uint32_t frame = 0; frame < depth; ++frame) {
++                    stack.push_back(sample.frames[frame]);
++                }
++                ++stack_totals[index][stack];
+             }
+             sample_totals[index] += taken;
+             slot.count[old].store(0);
+         }
++        if (drains % DRAINS_PER_WRITE != 0) {
++            continue;
++        }
+ 
+         std::ofstream file(path, std::ios::trunc);
+         if (!file) {
+@@ -135,15 +208,19 @@ void WriterLoop() {
+             std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() -
+                                                              start)
+                 .count();
+-        file << fmt::format("# Doris profile: {} s, one sample per ms of CPU time\n", seconds);
++        file << fmt::format("# Doris profile v2: {} s, one sample per ms of CPU time\n", seconds);
+         for (int index = 0; index < threads; ++index) {
+             const auto write_table = [&](const char* kind,
+                                          const std::unordered_map<uintptr_t, uint64_t>& totals) {
+                 // Fold addresses into module + offset, then sort by count.
+                 std::map<std::pair<std::string, uintptr_t>, uint64_t> folded;
++                std::map<std::pair<std::string, uintptr_t>, std::string> symbols;
+                 for (const auto& [address, count] : totals) {
+                     const Location location = Resolve(address, cache);
+                     folded[{location.module, location.offset}] += count;
++                    if (!location.symbol.empty()) {
++                        symbols[{location.module, location.offset}] = location.symbol;
++                    }
+                 }
+                 std::vector<std::pair<uint64_t, std::pair<std::string, uintptr_t>>> rows;
+                 rows.reserve(folded.size());
+@@ -154,12 +231,33 @@ void WriterLoop() {
+                 file << fmt::format("[{} {}] samples {}\n", slots[index].label, kind,
+                                     sample_totals[index]);
+                 for (size_t i = 0; i < rows.size() && i < 4000; ++i) {
+-                    file << fmt::format("{} {:#x} {}\n", rows[i].second.first, rows[i].second.second,
+-                                        rows[i].first);
++                    const auto symbol = symbols.find(rows[i].second);
++                    file << fmt::format("{} {:#x} {}{}{}\n", rows[i].second.first,
++                                        rows[i].second.second, rows[i].first,
++                                        symbol != symbols.end() ? " " : "",
++                                        symbol != symbols.end() ? symbol->second : "");
+                 }
+             };
+             write_table("pc", pc_totals[index]);
+             write_table("lr", lr_totals[index]);
++
++            // Call stacks, innermost first, most frequent first.
++            std::vector<std::pair<uint64_t, const std::vector<uintptr_t>*>> stacks;
++            stacks.reserve(stack_totals[index].size());
++            for (const auto& [frames, count] : stack_totals[index]) {
++                stacks.emplace_back(count, &frames);
++            }
++            std::ranges::sort(stacks, [](const auto& a, const auto& b) { return a.first > b.first; });
++            file << fmt::format("[{} stacks] samples {} unique {}\n", slots[index].label,
++                                sample_totals[index], stacks.size());
++            for (size_t i = 0; i < stacks.size() && i < MAX_STACK_ROWS; ++i) {
++                std::string line = std::to_string(stacks[i].first);
++                for (const uintptr_t address : *stacks[i].second) {
++                    line += ' ';
++                    line += Describe(address, cache);
++                }
++                file << line << '\n';
++            }
+         }
+         LOG_INFO(Frontend, "Doris profiler: wrote {} ({} s)", path, seconds);
+     }
+@@ -184,6 +282,16 @@ void RegisterCurrentThread(const char* label) {
+         return;
+     }
+     std::snprintf(slots[index].label, sizeof(slots[index].label), "%s", label);
++    pthread_attr_t attributes;
++    if (pthread_getattr_np(pthread_self(), &attributes) == 0) {
++        void* stack_address = nullptr;
++        size_t stack_size = 0;
++        if (pthread_attr_getstack(&attributes, &stack_address, &stack_size) == 0) {
++            slots[index].stack_low = reinterpret_cast<uintptr_t>(stack_address);
++            slots[index].stack_high = slots[index].stack_low + stack_size;
++        }
++        pthread_attr_destroy(&attributes);
++    }
+ 
+     clockid_t clock{};
+     if (pthread_getcpuclockid(pthread_self(), &clock) != 0) {
+diff --git a/src/common/doris_profiler.h b/src/common/doris_profiler.h
+index 69215f115..ddcb62039 100644
+--- a/src/common/doris_profiler.h
++++ b/src/common/doris_profiler.h
+@@ -6,9 +6,11 @@
+ namespace Doris::Profiler {
+ 
+ /// Starts sampling the calling thread, if the "CPU profiler" setting is on: about once per
+-/// millisecond of CPU time the thread uses (never while it sleeps), its program counter and return
+-/// address are recorded. Every 20 seconds the totals so far are written to doris_profile.txt in the
+-/// log folder, as module + offset, for symbolizing against the build's unstripped library.
++/// millisecond of CPU time the thread uses (never while it sleeps), its program counter, return
++/// address and call stack (frame-pointer chain, checked against the thread's stack bounds) are
++/// recorded. Every 20 seconds the totals so far are written to doris_profile.txt in the log
++/// folder, as module + offset (plus the nearest exported symbol for system libraries), for
++/// symbolizing against the build's unstripped library.
+ /// Only for host threads (GPU, Vulkan worker); never for threads that run guest code.
+ void RegisterCurrentThread(const char* label);
+ 
+diff --git a/src/core/memory.cpp b/src/core/memory.cpp
+index a5e6b8592..013e83562 100644
+--- a/src/core/memory.cpp
++++ b/src/core/memory.cpp
+@@ -13,6 +13,7 @@
+ #include <type_traits>
+ #include <vector>
+ 
++#include "common/doris_perf.h"
+ #include "common/assert.h"
+ #include "common/atomic_ops.h"
+ #include "common/common_types.h"
+@@ -458,6 +459,7 @@ struct Memory::Impl {
+                 perm |= Common::MemoryPermission::Write;
+             }
+             host_buffer->Protect(vaddr, size, perm);
++            Doris::Perf::Add(Doris::Perf::Count::ProtectCalls);
+         }
+ 
+         // Iterate over a contiguous CPU address space, which corresponds to the specified GPU
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index c85daebd5..2471103a2 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -895,6 +895,7 @@ void RasterizerVulkan::DorisFullBarrier() {
+ }
+ 
+ void RasterizerVulkan::WaitForIdle() {
++    Doris::Perf::Add(Doris::Perf::Count::WaitForIdle);
+     if (Settings::values.doris_gpu_barriers.GetValue() != 0) {
+         // Eden (Doris): the event wait below has TOP_OF_PIPE as its destination and no memory
+         // barrier, so Vulkan guarantees neither ordering nor visibility of earlier writes. On
+@@ -933,6 +934,7 @@ void RasterizerVulkan::FragmentBarrier() {
+ }
+ 
+ void RasterizerVulkan::TiledCacheBarrier() {
++    Doris::Perf::Add(Doris::Perf::Count::TiledCacheBarriers);
+     // TODO: Implementing tiled barriers requires rewriting a good chunk of the Vulkan backend
+     if (Settings::values.doris_gpu_barriers.GetValue() >= 2) {
+         DorisFullBarrier();
+@@ -1040,17 +1042,25 @@ void RasterizerVulkan::LoadDiskResources(u64 title_id, std::stop_token stop_load
+ void RasterizerVulkan::FlushWork() {
+ #ifdef __ANDROID__
+     static constexpr u32 DRAWS_TO_DISPATCH = 512;
+-    static constexpr u32 CHECK_MASK = 3;
++    // Eden (Doris): hand recorded work to the Vulkan worker every 16 draws, not every 4. Each
++    // hand-off costs a queue lock and (when the worker sleeps) a wake-up system call; 16 draws
++    // are still only a fraction of a millisecond of work.
++    static constexpr u32 CHECK_MASK = 15;
+ #else
+     static constexpr u32 DRAWS_TO_DISPATCH = 4096;
+     static constexpr u32 CHECK_MASK = 7;
+ #endif // __ANDROID__
++    // Eden (Doris): a submission ends the open render pass, and on a tiled GPU (Adreno) the second
++    // half then has to store and reload every attachment. Wait for a point where no render pass
++    // is open, up to 4x the usual number of draws.
++    static constexpr u32 MAX_DRAWS_TO_DISPATCH = DRAWS_TO_DISPATCH * 4;
+ 
+     static_assert(DRAWS_TO_DISPATCH % (CHECK_MASK + 1) == 0);
+     if ((++draw_counter & CHECK_MASK) != CHECK_MASK) {
+         return;
+     }
+-    if (draw_counter < DRAWS_TO_DISPATCH) {
++    if (draw_counter < DRAWS_TO_DISPATCH ||
++        (scheduler.IsRenderPassActive() && draw_counter < MAX_DRAWS_TO_DISPATCH)) {
+         scheduler.DispatchWork();
+         return;
+     }
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index 195a598d1..879e5b1fe 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -79,7 +79,9 @@ void Scheduler::WaitWorker() {
+     // Ensure the queue is drained.
+     {
+         std::unique_lock ql{queue_mutex};
++        ++drain_waiters;
+         event_cv.wait(ql, [this] { return work_queue.empty(); });
++        --drain_waiters;
+     }
+ 
+     // Now wait for execution to finish.
+@@ -88,11 +90,18 @@ void Scheduler::WaitWorker() {
+ 
+ void Scheduler::DispatchWork() {
+     if (chunk && !chunk->Empty()) {
++        // Eden (Doris): wake the worker only when it is actually asleep. On Android every
++        // notify is a futex system call, and this runs every few draws.
++        bool wake_worker = false;
+         {
+             std::scoped_lock ql{queue_mutex};
+             work_queue.push(std::move(chunk));
++            wake_worker = worker_waiting;
++        }
++        if (wake_worker) {
++            Doris::Perf::Add(Doris::Perf::Count::WorkerWakeups);
++            event_cv.notify_all();
+         }
+-        event_cv.notify_all();
+         AcquireNewChunk();
+     }
+ }
+@@ -287,7 +296,11 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
+ 
+         work = std::move(work_queue.front());
+         work_queue.pop();
+-        event_cv.notify_all();
++        // Eden (Doris): only WaitWorker waits for the queue to drain; skip the system call when
++        // nobody is waiting.
++        if (drain_waiters != 0) {
++            event_cv.notify_all();
++        }
+         return true;
+     }};
+ 
+@@ -298,7 +311,12 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
+             std::unique_lock lk{queue_mutex};
+ 
+             // Wait for work.
+-            event_cv.wait(lk, stop_token, [&] { return TryPopQueue(work); });
++            event_cv.wait(lk, stop_token, [&] {
++                const bool popped = TryPopQueue(work);
++                worker_waiting = !popped;
++                return popped;
++            });
++            worker_waiting = false;
+ 
+             // If we've been asked to stop, we're done.
+             if (stop_token.stop_requested()) {
+@@ -408,6 +426,10 @@ void Scheduler::InvalidateState() {
+ 
+ void Scheduler::EndPendingOperations() {
+     query_cache->CounterReset(VideoCommon::QueryType::ZPassPixelCount64);
++    if (state.renderpass) {
++        // A submission that cuts an open render pass in two (costly on tiled GPUs).
++        Doris::Perf::Add(Doris::Perf::Count::RenderPassSplits);
++    }
+     EndRenderPass();
+ }
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.h b/src/video_core/renderer_vulkan/vk_scheduler.h
+index e85fba089..57e31674c 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.h
++++ b/src/video_core/renderer_vulkan/vk_scheduler.h
+@@ -334,6 +334,10 @@ private:
+     std::mutex reserve_mutex;
+     std::mutex queue_mutex;
+     std::condition_variable_any event_cv;
++    /// Eden (Doris): the worker is asleep waiting for work (guarded by queue_mutex).
++    bool worker_waiting = false;
++    /// Eden (Doris): threads in WaitWorker waiting for the queue to drain (guarded by queue_mutex).
++    u32 drain_waiters = 0;
+     std::jthread worker_thread;
+ 
+     std::chrono::steady_clock::duration frame_interval{};
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 317afc7db..9ad83d976 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -15,6 +15,7 @@
+ #include <ankerl/unordered_dense.h>
+ #include <boost/container/small_vector.hpp>
+ 
++#include "common/doris_perf.h"
+ #include "common/alignment.h"
+ #include "common/settings.h"
+ #include "common/slot_vector.h"
+@@ -141,7 +142,12 @@ void TextureCache<P>::RunGarbageCollector() {
+         if ((!aggressive_mode && True(image.flags & ImageFlagBits::CostlyLoad)) || (!high_priority_mode && must_download)) {
+             return false;
+         }
++        Doris::Perf::Add(Doris::Perf::Count::GcRemoved);
++        if (!must_download && True(image.flags & ImageFlagBits::GpuModified)) {
++            Doris::Perf::Add(Doris::Perf::Count::GcDroppedGpuData);
++        }
+         if (must_download) {
++            Doris::Perf::Add(Doris::Perf::Count::GcDownloaded);
+             auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
+             const auto copies = FixSmallVectorADL(FullDownloadCopies(image.info));
+             image.DownloadMemory(map, copies);
+@@ -176,6 +182,11 @@ void TextureCache<P>::TickFrame() {
+     if (runtime.CanReportMemoryUsage()) {
+         total_used_memory = runtime.GetDeviceMemoryUsage();
+     }
++    if (Doris::Perf::Enabled()) {
++        Doris::Perf::SetGauge(Doris::Perf::Gauge::TextureCacheMemory, total_used_memory >> 20);
++        Doris::Perf::SetGauge(Doris::Perf::Gauge::TextureCacheExpected, expected_memory >> 20);
++        Doris::Perf::SetGauge(Doris::Perf::Gauge::TextureCacheCritical, critical_memory >> 20);
++    }
+     if (total_used_memory > minimum_memory) {
+         RunGarbageCollector();
+     }
+@@ -1122,6 +1133,10 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
+     }
+ 
+     image.flags &= ~ImageFlagBits::CpuModified;
++    Doris::Perf::Add(Doris::Perf::Count::TextureUploads);
++    if (True(image.flags & ImageFlagBits::GpuModified)) {
++        Doris::Perf::Add(Doris::Perf::Count::TextureUploadsOverGpuData);
++    }
+ 
+     TrackImage(image, image_id);
+ 
+-- 
+2.43.0
+
