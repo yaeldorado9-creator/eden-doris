@@ -32,6 +32,10 @@ effect the next time the game starts.
   work. On Adreno this lets draws read culling results, indirect draw arguments and vertex data that aren't finished
   yet, so distant terrain, buildings and shadows can drop out for a frame. Doris uses real barriers. "Eden (as before)"
   switches back, for comparison; "+ tiled-cache barriers" also makes the game's tiled-cache barriers real.
+* **Wait for new textures** (default: up to 8 ms per frame). Only matters with ASTC Decoding Method on CPU Async:
+  Eden draws new textures before they are decoded, so new places flash as textures fill in. Doris waits briefly for
+  each new texture and uploads it straight away.
+* **Texture decoding threads** (default 2; Eden uses 1). Background threads for CPU Async decoding.
 * **Wait for new shaders** (default: up to 8 ms per frame). Only matters with asynchronous shaders on: Eden hides
   anything whose shader is still compiling, so new places flicker as things pop in. Doris first waits up to this long
   per frame for the shader to finish. "Don't wait (Eden)" switches back.

@@ -1,0 +1,254 @@
+From 122fa16005408ef30e9c83557f8d1ab7b78e468f Mon Sep 17 00:00:00 2001
+From: "Eden (Doris) build" <doris@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 10:41:53 -0500
+Subject: [PATCH 5/5] Eden (Doris): stop new CPU Async textures from flashing
+ in
+
+With ASTC decoding on CPU Async, Eden draws a new texture before its decode is done and only uploads
+it at the end of a later frame, so new places flash as textures fill in. Doris waits for the decode
+it just queued, from a budget of doris_texture_decode_wait_ms per frame (default 8 ms), and uploads
+the result right away; if the budget runs out it falls back to Eden's end-of-frame upload.
+Decoding also uses doris_texture_decode_threads background threads (default 2, Eden 1).
+---
+ .../features/settings/model/IntSetting.kt     |  2 +
+ .../settings/model/view/SettingsItem.kt       | 18 ++++++++
+ .../settings/ui/SettingsFragmentPresenter.kt  |  2 +
+ .../app/src/main/res/values/arrays.xml        | 14 +++++++
+ .../app/src/main/res/values/strings.xml       |  4 ++
+ src/common/settings.h                         |  9 ++++
+ src/video_core/texture_cache/texture_cache.h  | 41 +++++++++++++++++++
+ .../texture_cache/texture_cache_base.h        | 14 ++++++-
+ 8 files changed, 102 insertions(+), 2 deletions(-)
+
+diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/IntSetting.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/IntSetting.kt
+index 30c817690..b53a5ec37 100644
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/IntSetting.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/IntSetting.kt
+@@ -34,6 +34,8 @@ enum class IntSetting(override val key: String) : AbstractIntSetting {
+     DORIS_MHR_FIX("doris_mhr_fix"),
+     DORIS_GPU_BARRIERS("doris_gpu_barriers"),
+     DORIS_ASYNC_SHADER_WAIT("doris_async_shader_wait_ms"),
++    DORIS_TEXTURE_DECODE_WAIT("doris_texture_decode_wait_ms"),
++    DORIS_TEXTURE_DECODE_THREADS("doris_texture_decode_threads"),
+     DMA_ACCURACY("dma_accuracy"),
+     GPU_FENCE_BEHAVIOR("gpu_fence_behavior"),
+     FRAME_PACING_MODE("frame_pacing_mode"),
+diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt
+index 63f24a04c..1f916895c 100644
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt
+@@ -204,6 +204,24 @@ abstract class SettingsItem(
+                     valuesId = R.array.dorisAsyncShaderWaitValues
+                 )
+             )
++            put(
++                SingleChoiceSetting(
++                    IntSetting.DORIS_TEXTURE_DECODE_WAIT,
++                    titleId = R.string.doris_texture_decode_wait,
++                    descriptionId = R.string.doris_texture_decode_wait_description,
++                    choicesId = R.array.dorisAsyncShaderWaitEntries,
++                    valuesId = R.array.dorisAsyncShaderWaitValues
++                )
++            )
++            put(
++                SingleChoiceSetting(
++                    IntSetting.DORIS_TEXTURE_DECODE_THREADS,
++                    titleId = R.string.doris_texture_decode_threads,
++                    descriptionId = R.string.doris_texture_decode_threads_description,
++                    choicesId = R.array.dorisDecodeThreadsEntries,
++                    valuesId = R.array.dorisDecodeThreadsValues
++                )
++            )
+             put(
+                 SingleChoiceSetting(
+                     IntSetting.DORIS_MHR_FIX,
+diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt
+index 12c42aa62..6c9a7d983 100644
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt
+@@ -352,6 +352,8 @@ class SettingsFragmentPresenter(
+             add(HeaderSetting(R.string.doris_experiments))
+ 
+             add(IntSetting.DORIS_GPU_BARRIERS.key)
++            add(IntSetting.DORIS_TEXTURE_DECODE_WAIT.key)
++            add(IntSetting.DORIS_TEXTURE_DECODE_THREADS.key)
+             add(IntSetting.DORIS_ASYNC_SHADER_WAIT.key)
+             add(IntSetting.DORIS_SHADER_LOOP_LIMIT.key)
+             add(IntSetting.DORIS_MHR_FIX.key)
+diff --git a/src/android/app/src/main/res/values/arrays.xml b/src/android/app/src/main/res/values/arrays.xml
+index d1219244b..f5b45badf 100644
+--- a/src/android/app/src/main/res/values/arrays.xml
++++ b/src/android/app/src/main/res/values/arrays.xml
+@@ -675,6 +675,20 @@
+         <item>0</item>
+     </integer-array>
+ 
++    <string-array name="dorisDecodeThreadsEntries">
++        <item>2</item>
++        <item>3</item>
++        <item>4</item>
++        <item>1 (Eden)</item>
++    </string-array>
++
++    <integer-array name="dorisDecodeThreadsValues">
++        <item>2</item>
++        <item>3</item>
++        <item>4</item>
++        <item>1</item>
++    </integer-array>
++
+     <string-array name="dorisShaderLoopLimitEntries">
+         <item>@string/doris_loop_limit_256</item>
+         <item>512</item>
+diff --git a/src/android/app/src/main/res/values/strings.xml b/src/android/app/src/main/res/values/strings.xml
+index 127162b82..d79418e5b 100644
+--- a/src/android/app/src/main/res/values/strings.xml
++++ b/src/android/app/src/main/res/values/strings.xml
+@@ -612,6 +612,10 @@
+     <string name="doris_wait_8">Up to 8 ms per frame</string>
+     <string name="doris_wait_16">Up to 16 ms per frame</string>
+     <string name="doris_wait_33">Up to 33 ms per frame</string>
++    <string name="doris_texture_decode_wait">Wait for new textures</string>
++    <string name="doris_texture_decode_wait_description">Only matters with ASTC Decoding Method set to CPU Async. Eden draws new textures before they are decoded, so new places flash as textures fill in. Doris first waits up to this long per frame for a new texture and uploads it straight away.</string>
++    <string name="doris_texture_decode_threads">Texture decoding threads</string>
++    <string name="doris_texture_decode_threads_description">Background threads that decode textures with CPU Async (Eden uses 1). More threads let new places fill in faster. Takes effect the next time the game starts.</string>
+     <string name="doris_shader_loop_limit">Shader loop limit</string>
+     <string name="doris_shader_loop_limit_description">How many times a loop inside a game shader may repeat before it is cut short. The PR #4324 build uses 256 (faster, but long loops are cut); Eden normally uses 8192. Takes effect the next time the game starts.</string>
+     <string name="doris_mhr_fix">Monster Hunter Rise record fix</string>
+diff --git a/src/common/settings.h b/src/common/settings.h
+index a08fe10dc..7dae42897 100644
+--- a/src/common/settings.h
++++ b/src/common/settings.h
+@@ -605,6 +605,15 @@ struct Values {
+     // (shared by all draws in it) for the shader to finish. 0 = skip right away, as Eden does.
+     SwitchableSetting<u32> doris_async_shader_wait_ms{linkage, 8, "doris_async_shader_wait_ms",
+                                                       Category::RendererAdvanced};
++    // ASTC decoding "CPU Async": Eden decodes new textures on one background thread and draws them
++    // before they are ready, so new places flash as textures fill in. Doris waits up to this many
++    // milliseconds per frame for a new texture's decode and uploads it straight away.
++    // 0 = don't wait, as Eden does.
++    SwitchableSetting<u32> doris_texture_decode_wait_ms{linkage, 8, "doris_texture_decode_wait_ms",
++                                                        Category::RendererAdvanced};
++    // Background threads for "CPU Async" texture decoding (Eden uses 1). Read when a game starts.
++    SwitchableSetting<u32> doris_texture_decode_threads{linkage, 2, "doris_texture_decode_threads",
++                                                        Category::RendererAdvanced};
+ 
+     SwitchableSetting<bool> enable_buffer_history{linkage,
+                                                   false,
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index b6a37286a..052d12e08 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -6,7 +6,10 @@
+ 
+ #pragma once
+ 
++#include <chrono>
++#include <cstring>
+ #include <limits>
++#include <thread>
+ #include <optional>
+ #include <bit>
+ #include <ankerl/unordered_dense.h>
+@@ -1129,6 +1132,7 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
+     }
+     if (True(image.flags & ImageFlagBits::AsynchronousDecode)) {
+         QueueAsyncDecode(image, image_id);
++        DorisWaitForDecode(image_id);
+         return;
+     }
+ 
+@@ -1372,6 +1376,43 @@ void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
+     texture_decode_worker.QueueWork(std::move(func));
+ }
+ 
++template <class P>
++void TextureCache<P>::DorisWaitForDecode(ImageId image_id) {
++    using namespace std::chrono;
++    const u32 wait_ms{Settings::values.doris_texture_decode_wait_ms.GetValue()};
++    if (wait_ms == 0 || async_decodes.empty()) {
++        return;
++    }
++    if (doris_decode_budget_frame != frame_tick) {
++        doris_decode_budget_frame = frame_tick;
++        doris_decode_wait_left = milliseconds{wait_ms};
++    }
++    AsyncDecodeContext* const decode = async_decodes.back().get();
++    if (decode->image_id != image_id || doris_decode_wait_left <= microseconds::zero()) {
++        return;
++    }
++    const auto start = steady_clock::now();
++    const auto deadline = start + doris_decode_wait_left;
++    while (!decode->complete.load(std::memory_order_acquire) && steady_clock::now() < deadline) {
++        std::this_thread::sleep_for(microseconds{100});
++    }
++    doris_decode_wait_left -= duration_cast<microseconds>(steady_clock::now() - start);
++    if (!decode->complete.load(std::memory_order_acquire)) {
++        return; // still decoding: TickAsyncDecode uploads it at the end of the frame, as in Eden
++    }
++    {
++        std::unique_lock lock{decode->mutex};
++        Image& image = slot_images[image_id];
++        auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
++        std::memcpy(staging.mapped_span.data(), decode->decoded_data.data(),
++                    decode->decoded_data.size());
++        image.UploadMemory(staging, FixSmallVectorADL(decode->copies));
++        image.flags &= ~ImageFlagBits::IsDecoding;
++    }
++    async_decodes.pop_back();
++    runtime.InsertUploadMemoryBarrier();
++}
++
+ template <class P>
+ void TextureCache<P>::QueueAsyncUnswizzle(Image& image, ImageId image_id) {
+     if (True(image.flags & ImageFlagBits::IsDecoding)) {
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index d143c1ef7..3e1ad0126 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -6,7 +6,9 @@
+ 
+ #pragma once
+ 
++#include <algorithm>
+ #include <atomic>
++#include <chrono>
+ #include <deque>
+ #include <limits>
+ #include <mutex>
+@@ -26,6 +28,7 @@
+ #include "common/lru_cache.h"
+ #include <ranges>
+ #include "common/scratch_buffer.h"
++#include "common/settings.h"
+ #include "common/slot_vector.h"
+ #include "common/thread_worker.h"
+ #include "video_core/compatible_formats.h"
+@@ -419,6 +422,8 @@ private:
+     u64 GetScaledImageSizeBytes(const ImageBase& image);
+ 
+     void QueueAsyncDecode(Image& image, ImageId image_id);
++    /// Eden (Doris): wait briefly for the decode just queued for image_id and upload it now.
++    void DorisWaitForDecode(ImageId image_id);
+     void TickAsyncDecode();
+ 
+     void QueueAsyncUnswizzle(Image& image, ImageId image_id);
+@@ -507,8 +512,13 @@ private:
+     u64 modification_tick = 0;
+     u64 frame_tick = 0;
+ 
+-    Common::ThreadWorker texture_decode_worker{1, "TextureDecoder", {},
+-                                               Common::ThreadPlacement::Efficiency};
++    // Eden (Doris): the number of decode threads is a setting (Eden: 1).
++    Common::ThreadWorker texture_decode_worker{
++        std::clamp<size_t>(Settings::values.doris_texture_decode_threads.GetValue(), 1, 4),
++        "TextureDecoder", {}, Common::ThreadPlacement::Efficiency};
++    // Eden (Doris): per-frame budget for waiting on new textures' decodes (DorisWaitForDecode).
++    u64 doris_decode_budget_frame = ~0ULL;
++    std::chrono::microseconds doris_decode_wait_left{};
+     std::vector<std::unique_ptr<AsyncDecodeContext>> async_decodes;
+ 
+     std::deque<PendingUnswizzle> unswizzle_queue;
+-- 
+2.43.0
+
