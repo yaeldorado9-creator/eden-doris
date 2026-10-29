@@ -1,0 +1,106 @@
+name: Build Eden (Doris)
+
+# Every push to main builds the APK and publishes it as a release (doris-<number>).
+# The Eden source comes from the official GitHub mirror at the commit pinned in UPSTREAM;
+# everything Doris changes is in patches/ and is applied on top, in order.
+on:
+  push:
+    branches: [main]
+    paths: [UPSTREAM, 'patches/**', '.github/workflows/build.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: doris-build
+  cancel-in-progress: false
+
+jobs:
+  android:
+    name: Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      DORIS_TAG: doris-${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Make room on the runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/node_modules \
+                      /opt/hostedtoolcache/CodeQL /usr/local/.ghcup || true
+          df -h /
+
+      - name: Install host tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y glslang-tools libvulkan-dev
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Eden source at the pinned commit + Doris patches
+        run: |
+          read -r SHA < UPSTREAM
+          git init -q eden
+          cd eden
+          git remote add origin https://github.com/eden-emulator/mirror.git
+          git fetch -q --depth 1 origin "$SHA"
+          git checkout -q FETCH_HEAD
+          git -c user.name="Eden (Doris)" -c user.email=doris@localhost am -3 ../patches/*.patch
+          git log --oneline -n 20 > ../patch-log.txt
+          cat ../patch-log.txt
+
+      - name: Restore downloaded dependencies
+        uses: actions/cache@v4
+        with:
+          path: eden/.cache/cpm
+          key: cpm-${{ hashFiles('UPSTREAM') }}
+          restore-keys: cpm-
+
+      - name: Build the APK
+        env:
+          GIT_TAG_NAME: ${{ env.DORIS_TAG }}
+        run: |
+          cd eden/src/android
+          chmod +x gradlew
+          ./gradlew assembleDorisRelease --no-daemon --stacktrace \
+            -PYUZU_ANDROID_ARGS="-DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache"
+          sccache -s || true
+
+      - name: Collect the APK
+        run: |
+          mkdir -p out
+          APK=$(find eden/src/android/app/build/outputs/apk/doris/release -name '*.apk' | head -n 1)
+          test -n "$APK"
+          cp -v "$APK" "out/Eden-Doris-${{ github.run_number }}.apk"
+          sha256sum out/*.apk | tee out/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Eden-Doris-${{ github.run_number }}
+          path: out/
+          if-no-files-found: error
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "Eden (Doris) build ${{ github.run_number }} — package dev.eden.eden_doris (installs beside every other Eden)."
+            echo
+            echo "Upstream Eden commit: \`$(cat UPSTREAM)\`"
+            echo
+            echo "Doris changes in this build:"
+            echo '```'
+            cat patch-log.txt
+            echo '```'
+          } > notes.md
+          gh release create "$DORIS_TAG" out/*.apk out/SHA256SUMS.txt \
+            --title "Eden (Doris) ${{ github.run_number }}" --notes-file notes.md --target "${{ github.sha }}"

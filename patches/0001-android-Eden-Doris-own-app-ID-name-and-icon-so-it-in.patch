@@ -1,0 +1,228 @@
+From 4417d0f3852021aaa7d6965711115715b6e46a0a Mon Sep 17 00:00:00 2001
+From: "Eden (Doris) build" <doris@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 09:04:53 -0500
+Subject: [PATCH] [android] Eden (Doris): own app ID, name and icon so it
+ installs beside every other Eden
+
+- new 'doris' product flavor: applicationId dev.eden.eden_doris, label 'Eden (Doris)'
+- custom-config intent action is now per application ID (no chooser between Eden apps)
+- original adaptive launcher icon (with a themed-icon layer)
+---
+ src/android/app/build.gradle.kts              | 16 ++++++++-
+ .../res/drawable/ic_doris_background.xml      | 22 ++++++++++++
+ .../res/drawable/ic_doris_foreground.xml      | 34 +++++++++++++++++++
+ .../res/drawable/ic_doris_monochrome.xml      | 34 +++++++++++++++++++
+ .../res/mipmap-anydpi-v26/ic_launcher.xml     |  6 ++++
+ .../mipmap-anydpi-v26/ic_launcher_round.xml   |  6 ++++
+ src/android/app/src/main/AndroidManifest.xml  |  2 +-
+ .../yuzu_emu/utils/CustomSettingsHandler.kt   |  3 +-
+ 8 files changed, 120 insertions(+), 3 deletions(-)
+ create mode 100644 src/android/app/src/doris/res/drawable/ic_doris_background.xml
+ create mode 100644 src/android/app/src/doris/res/drawable/ic_doris_foreground.xml
+ create mode 100644 src/android/app/src/doris/res/drawable/ic_doris_monochrome.xml
+ create mode 100644 src/android/app/src/doris/res/mipmap-anydpi-v26/ic_launcher.xml
+ create mode 100644 src/android/app/src/doris/res/mipmap-anydpi-v26/ic_launcher_round.xml
+
+diff --git a/src/android/app/build.gradle.kts b/src/android/app/build.gradle.kts
+index 69dd6a8e4..c1400e27b 100644
+--- a/src/android/app/build.gradle.kts
++++ b/src/android/app/build.gradle.kts
+@@ -240,6 +240,20 @@ android {
+             }
+         }
+ 
++        // Eden (Doris): personal build. Its own application ID, name and icon, so it installs next to
++        // every other Eden (official, Nightly, PR builds) and only ever updates itself.
++        create("doris") {
++            dimension = "version"
++            minSdk = 33
++            applicationId = "dev.eden.eden_doris"
++            manifestPlaceholders += mapOf("appNameBase" to "Eden (Doris)")
++            resValue("string", "app_name_suffixed", "Eden (Doris)")
++
++            ndk {
++                abiFilters += listOf("arm64-v8a")
++            }
++        }
++
+         create("chromeOS") {
+             dimension = "version"
+             manifestPlaceholders += mapOf("appNameBase" to "Eden ChromeOS")
+@@ -270,7 +284,7 @@ android {
+ 
+         // apply nightly suffix I/A
+         resValue("string", "app_name_suffixed", "$currentName$suffix")
+-        resValue("string", "app_name", "Eden$suffix")
++        resValue("string", "app_name", if (name == "doris") "$currentName$suffix" else "Eden$suffix")
+     }
+ 
+     sourceSets {
+diff --git a/src/android/app/src/doris/res/drawable/ic_doris_background.xml b/src/android/app/src/doris/res/drawable/ic_doris_background.xml
+new file mode 100644
+index 000000000..b88e576d0
+--- /dev/null
++++ b/src/android/app/src/doris/res/drawable/ic_doris_background.xml
+@@ -0,0 +1,22 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- Eden (Doris) launcher icon background: violet to teal. Original artwork for this fork. -->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    xmlns:aapt="http://schemas.android.com/aapt"
++    android:width="108dp"
++    android:height="108dp"
++    android:viewportWidth="108"
++    android:viewportHeight="108">
++    <path android:pathData="M0,0h108v108h-108z">
++        <aapt:attr name="android:fillColor">
++            <gradient
++                android:type="linear"
++                android:startX="0"
++                android:startY="0"
++                android:endX="108"
++                android:endY="108">
++                <item android:offset="0" android:color="#FF2B1A5E" />
++                <item android:offset="1" android:color="#FF0A7C8C" />
++            </gradient>
++        </aapt:attr>
++    </path>
++</vector>
+diff --git a/src/android/app/src/doris/res/drawable/ic_doris_foreground.xml b/src/android/app/src/doris/res/drawable/ic_doris_foreground.xml
+new file mode 100644
+index 000000000..451b1999e
+--- /dev/null
++++ b/src/android/app/src/doris/res/drawable/ic_doris_foreground.xml
+@@ -0,0 +1,34 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- Eden (Doris) launcher icon: a D holding a breaking wave. Original artwork for this fork. -->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="108dp"
++    android:height="108dp"
++    android:viewportWidth="108"
++    android:viewportHeight="108">
++    <group
++        android:pivotX="54"
++        android:pivotY="54"
++        android:scaleX="0.86"
++        android:scaleY="0.86">
++        <path
++            android:pathData="M35,30 L35,78 M35,30 L49,30 A24,24 0,0 1,49 78 L35,78"
++            android:strokeWidth="7"
++            android:strokeColor="#FFFFFFFF"
++            android:strokeLineCap="round"
++            android:strokeLineJoin="round" />
++        <path
++            android:pathData="M42,63 C46,56 52,53 58,55 C63,57 63,63 58,64 C55,64.6 53.5,62 55.5,60.5"
++            android:strokeWidth="4.5"
++            android:strokeColor="#FFFFFFFF"
++            android:strokeLineCap="round"
++            android:strokeLineJoin="round" />
++        <path
++            android:pathData="M42,71 C47,68 52,68 56,70 C60,72 64,72 68,69"
++            android:strokeWidth="3"
++            android:strokeColor="#BFFFFFFF"
++            android:strokeLineCap="round" />
++        <path
++            android:pathData="M61,42 m-2.6,0 a2.6,2.6 0,1 0,5.2 0 a2.6,2.6 0,1 0,-5.2 0"
++            android:fillColor="#FFFFD27A" />
++    </group>
++</vector>
+diff --git a/src/android/app/src/doris/res/drawable/ic_doris_monochrome.xml b/src/android/app/src/doris/res/drawable/ic_doris_monochrome.xml
+new file mode 100644
+index 000000000..20365c7dd
+--- /dev/null
++++ b/src/android/app/src/doris/res/drawable/ic_doris_monochrome.xml
+@@ -0,0 +1,34 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- Eden (Doris) launcher icon: a D holding a breaking wave. Original artwork for this fork. -->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="108dp"
++    android:height="108dp"
++    android:viewportWidth="108"
++    android:viewportHeight="108">
++    <group
++        android:pivotX="54"
++        android:pivotY="54"
++        android:scaleX="0.86"
++        android:scaleY="0.86">
++        <path
++            android:pathData="M35,30 L35,78 M35,30 L49,30 A24,24 0,0 1,49 78 L35,78"
++            android:strokeWidth="7"
++            android:strokeColor="#FFFFFFFF"
++            android:strokeLineCap="round"
++            android:strokeLineJoin="round" />
++        <path
++            android:pathData="M42,63 C46,56 52,53 58,55 C63,57 63,63 58,64 C55,64.6 53.5,62 55.5,60.5"
++            android:strokeWidth="4.5"
++            android:strokeColor="#FFFFFFFF"
++            android:strokeLineCap="round"
++            android:strokeLineJoin="round" />
++        <path
++            android:pathData="M42,71 C47,68 52,68 56,70 C60,72 64,72 68,69"
++            android:strokeWidth="3"
++            android:strokeColor="#BFFFFFFF"
++            android:strokeLineCap="round" />
++        <path
++            android:pathData="M61,42 m-2.6,0 a2.6,2.6 0,1 0,5.2 0 a2.6,2.6 0,1 0,-5.2 0"
++            android:fillColor="#FFFFFFFF" />
++    </group>
++</vector>
+diff --git a/src/android/app/src/doris/res/mipmap-anydpi-v26/ic_launcher.xml b/src/android/app/src/doris/res/mipmap-anydpi-v26/ic_launcher.xml
+new file mode 100644
+index 000000000..a70ae0533
+--- /dev/null
++++ b/src/android/app/src/doris/res/mipmap-anydpi-v26/ic_launcher.xml
+@@ -0,0 +1,6 @@
++<?xml version="1.0" encoding="utf-8"?>
++<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
++    <background android:drawable="@drawable/ic_doris_background" />
++    <foreground android:drawable="@drawable/ic_doris_foreground" />
++    <monochrome android:drawable="@drawable/ic_doris_monochrome" />
++</adaptive-icon>
+diff --git a/src/android/app/src/doris/res/mipmap-anydpi-v26/ic_launcher_round.xml b/src/android/app/src/doris/res/mipmap-anydpi-v26/ic_launcher_round.xml
+new file mode 100644
+index 000000000..a70ae0533
+--- /dev/null
++++ b/src/android/app/src/doris/res/mipmap-anydpi-v26/ic_launcher_round.xml
+@@ -0,0 +1,6 @@
++<?xml version="1.0" encoding="utf-8"?>
++<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
++    <background android:drawable="@drawable/ic_doris_background" />
++    <foreground android:drawable="@drawable/ic_doris_foreground" />
++    <monochrome android:drawable="@drawable/ic_doris_monochrome" />
++</adaptive-icon>
+diff --git a/src/android/app/src/main/AndroidManifest.xml b/src/android/app/src/main/AndroidManifest.xml
+index b899ca07f..964ca2dc5 100644
+--- a/src/android/app/src/main/AndroidManifest.xml
++++ b/src/android/app/src/main/AndroidManifest.xml
+@@ -96,7 +96,7 @@ SPDX-License-Identifier: GPL-3.0-or-later
+                 <data android:mimeType="application/octet-stream" android:scheme="content"/>
+             </intent-filter>
+             <intent-filter>
+-                <action android:name="dev.eden.eden_emulator.LAUNCH_WITH_CUSTOM_CONFIG" />
++                <action android:name="${applicationId}.LAUNCH_WITH_CUSTOM_CONFIG" />
+                 <category android:name="android.intent.category.DEFAULT" />
+             </intent-filter>
+             <meta-data android:name="android.nfc.action.TECH_DISCOVERED" android:resource="@xml/nfc_tech_filter" />
+diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/utils/CustomSettingsHandler.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/utils/CustomSettingsHandler.kt
+index 377313d0a..0931466c8 100644
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/utils/CustomSettingsHandler.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/utils/CustomSettingsHandler.kt
+@@ -17,6 +17,7 @@ import java.io.File
+ import kotlin.coroutines.resume
+ import kotlin.coroutines.suspendCoroutine
+ import android.net.Uri
++import org.yuzu.yuzu_emu.BuildConfig
+ import org.yuzu.yuzu_emu.features.settings.utils.SettingsFile
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.withContext
+@@ -27,7 +28,7 @@ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.CoroutineScope
+ 
+ object CustomSettingsHandler {
+-    const val CUSTOM_CONFIG_ACTION = "dev.eden.eden_emulator.LAUNCH_WITH_CUSTOM_CONFIG"
++    const val CUSTOM_CONFIG_ACTION = BuildConfig.APPLICATION_ID + ".LAUNCH_WITH_CUSTOM_CONFIG"
+     const val EXTRA_TITLE_ID = "title_id"
+     const val EXTRA_CUSTOM_SETTINGS = "custom_settings"
+ 
+-- 
+2.43.0
+
