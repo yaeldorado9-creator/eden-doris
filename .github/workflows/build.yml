@@ -25,7 +25,7 @@ jobs:
       SCCACHE_GHA_ENABLED: "true"
       DORIS_TAG: doris-${{ github.run_number }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Make room on the runner
         run: |
@@ -38,7 +38,7 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y glslang-tools libvulkan-dev
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 17
@@ -48,19 +48,20 @@ jobs:
       - name: Eden source (the PR #4324 build) + Doris patches
         run: |
           val() { awk -v k="$1" '$1 == k { print $2 }' UPSTREAM; }
-          SHA=$(val commit)
+          SHA=$(val commit); SERVER=$(val server); PR_REF=$(val pr_ref)
+          MIRROR=$(val fallback_mirror); BASE=$(val fallback_base)
           git init -q eden
           cd eden
           AM="git -c user.name=Eden-Doris -c user.email=doris@localhost am -3"
-          if git fetch -q --depth 60 "$(val server)" "$(val pr_ref)" && [ "$(git rev-parse FETCH_HEAD)" = "$SHA" ]; then
+          if git fetch -q --depth 60 "$SERVER" "$PR_REF" && [ "$(git rev-parse FETCH_HEAD)" = "$SHA" ]; then
             git checkout -q FETCH_HEAD
             echo "Eden source: PR #4324 build $SHA, made on $(git rev-parse HEAD^)" | tee ../source.txt
           else
             echo "::warning::Eden's server did not give $SHA; using the GitHub mirror + upstream/pr4324.patch"
-            git fetch -q --depth 60 "$(val fallback_mirror)" "$(val fallback_base)"
+            git fetch -q --depth 60 "$MIRROR" "$BASE"
             git checkout -q FETCH_HEAD
             $AM ../upstream/pr4324.patch
-            echo "Eden source: mirror $(val fallback_base) + PR #4324 patch" | tee ../source.txt
+            echo "Eden source: mirror $BASE + PR #4324 patch" | tee ../source.txt
           fi
           $AM ../patches/*.patch
           git log --oneline -n 6 > ../patch-log.txt
