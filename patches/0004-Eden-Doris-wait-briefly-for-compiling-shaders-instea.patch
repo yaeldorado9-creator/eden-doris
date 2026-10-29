@@ -1,0 +1,231 @@
+From d43492b165233d60656784ad6739ac1b7ec95e48 Mon Sep 17 00:00:00 2001
+From: "Eden (Doris) build" <doris@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 10:36:53 -0500
+Subject: [PATCH 4/4] Eden (Doris): wait briefly for compiling shaders instead
+ of hiding the draw
+
+With asynchronous shaders on, Eden drops every draw whose pipeline is still compiling, so new
+areas flicker as objects, terrain and shadows pop in. Doris now waits for the pipeline first,
+from a budget of doris_async_shader_wait_ms (default 8 ms) shared by all draws in a ~33 ms window;
+only if it is still not ready is the draw skipped. 0 restores Eden's behaviour.
+Build completion now wakes every waiter (notify_all), since two threads can wait on it.
+---
+ .../features/settings/model/IntSetting.kt      |  1 +
+ .../settings/model/view/SettingsItem.kt        |  9 +++++++++
+ .../settings/ui/SettingsFragmentPresenter.kt   |  1 +
+ src/android/app/src/main/res/values/arrays.xml | 16 ++++++++++++++++
+ .../app/src/main/res/values/strings.xml        |  7 +++++++
+ src/common/settings.h                          |  5 +++++
+ .../renderer_vulkan/vk_graphics_pipeline.cpp   |  4 ++--
+ .../renderer_vulkan/vk_graphics_pipeline.h     |  8 ++++++++
+ .../renderer_vulkan/vk_pipeline_cache.cpp      | 18 ++++++++++++++++++
+ .../renderer_vulkan/vk_pipeline_cache.h        |  4 ++++
+ 10 files changed, 71 insertions(+), 2 deletions(-)
+
+diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/IntSetting.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/IntSetting.kt
+index 4d07c4fc1..30c817690 100644
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/IntSetting.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/IntSetting.kt
+@@ -33,6 +33,7 @@ enum class IntSetting(override val key: String) : AbstractIntSetting {
+     DORIS_SHADER_LOOP_LIMIT("doris_shader_loop_limit"),
+     DORIS_MHR_FIX("doris_mhr_fix"),
+     DORIS_GPU_BARRIERS("doris_gpu_barriers"),
++    DORIS_ASYNC_SHADER_WAIT("doris_async_shader_wait_ms"),
+     DMA_ACCURACY("dma_accuracy"),
+     GPU_FENCE_BEHAVIOR("gpu_fence_behavior"),
+     FRAME_PACING_MODE("frame_pacing_mode"),
+diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt
+index e5b8616bf..63f24a04c 100644
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt
+@@ -195,6 +195,15 @@ abstract class SettingsItem(
+                     valuesId = R.array.dorisGpuBarriersValues
+                 )
+             )
++            put(
++                SingleChoiceSetting(
++                    IntSetting.DORIS_ASYNC_SHADER_WAIT,
++                    titleId = R.string.doris_async_shader_wait,
++                    descriptionId = R.string.doris_async_shader_wait_description,
++                    choicesId = R.array.dorisAsyncShaderWaitEntries,
++                    valuesId = R.array.dorisAsyncShaderWaitValues
++                )
++            )
+             put(
+                 SingleChoiceSetting(
+                     IntSetting.DORIS_MHR_FIX,
+diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt
+index 701e51cdf..12c42aa62 100644
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt
+@@ -352,6 +352,7 @@ class SettingsFragmentPresenter(
+             add(HeaderSetting(R.string.doris_experiments))
+ 
+             add(IntSetting.DORIS_GPU_BARRIERS.key)
++            add(IntSetting.DORIS_ASYNC_SHADER_WAIT.key)
+             add(IntSetting.DORIS_SHADER_LOOP_LIMIT.key)
+             add(IntSetting.DORIS_MHR_FIX.key)
+ 
+diff --git a/src/android/app/src/main/res/values/arrays.xml b/src/android/app/src/main/res/values/arrays.xml
+index 4aca551e3..d1219244b 100644
+--- a/src/android/app/src/main/res/values/arrays.xml
++++ b/src/android/app/src/main/res/values/arrays.xml
+@@ -659,6 +659,22 @@
+         <item>0</item>
+     </integer-array>
+ 
++    <string-array name="dorisAsyncShaderWaitEntries">
++        <item>@string/doris_wait_8</item>
++        <item>@string/doris_wait_4</item>
++        <item>@string/doris_wait_16</item>
++        <item>@string/doris_wait_33</item>
++        <item>@string/doris_wait_off</item>
++    </string-array>
++
++    <integer-array name="dorisAsyncShaderWaitValues">
++        <item>8</item>
++        <item>4</item>
++        <item>16</item>
++        <item>33</item>
++        <item>0</item>
++    </integer-array>
++
+     <string-array name="dorisShaderLoopLimitEntries">
+         <item>@string/doris_loop_limit_256</item>
+         <item>512</item>
+diff --git a/src/android/app/src/main/res/values/strings.xml b/src/android/app/src/main/res/values/strings.xml
+index 54fb32780..127162b82 100644
+--- a/src/android/app/src/main/res/values/strings.xml
++++ b/src/android/app/src/main/res/values/strings.xml
+@@ -605,6 +605,13 @@
+     <string name="doris_barriers_eden">Eden (as before)</string>
+     <string name="doris_barriers_full">Doris: real barriers</string>
+     <string name="doris_barriers_tiled">Doris: real barriers + tiled-cache barriers</string>
++    <string name="doris_async_shader_wait">Wait for new shaders</string>
++    <string name="doris_async_shader_wait_description">Only matters with asynchronous shaders on. Eden hides anything whose shader is still compiling, so new places flicker as things pop in. Doris first waits up to this long per frame for the shader to finish: fewer pop-ins, at the cost of short pauses while new shaders compile.</string>
++    <string name="doris_wait_off">Don\'t wait (Eden)</string>
++    <string name="doris_wait_4">Up to 4 ms per frame</string>
++    <string name="doris_wait_8">Up to 8 ms per frame</string>
++    <string name="doris_wait_16">Up to 16 ms per frame</string>
++    <string name="doris_wait_33">Up to 33 ms per frame</string>
+     <string name="doris_shader_loop_limit">Shader loop limit</string>
+     <string name="doris_shader_loop_limit_description">How many times a loop inside a game shader may repeat before it is cut short. The PR #4324 build uses 256 (faster, but long loops are cut); Eden normally uses 8192. Takes effect the next time the game starts.</string>
+     <string name="doris_mhr_fix">Monster Hunter Rise record fix</string>
+diff --git a/src/common/settings.h b/src/common/settings.h
+index d5d4a6568..a08fe10dc 100644
+--- a/src/common/settings.h
++++ b/src/common/settings.h
+@@ -600,6 +600,11 @@ struct Values {
+     // 2 = Doris as 1, plus the game's tiled-cache barriers (a no-op in Eden) become full barriers.
+     SwitchableSetting<u32> doris_gpu_barriers{linkage, 1, "doris_gpu_barriers",
+                                               Category::RendererAdvanced};
++    // With asynchronous shaders on, Eden skips every draw whose shader is still compiling, so new
++    // things are invisible for a moment. Doris first waits up to this many milliseconds per frame
++    // (shared by all draws in it) for the shader to finish. 0 = skip right away, as Eden does.
++    SwitchableSetting<u32> doris_async_shader_wait_ms{linkage, 8, "doris_async_shader_wait_ms",
++                                                      Category::RendererAdvanced};
+ 
+     SwitchableSetting<bool> enable_buffer_history{linkage,
+                                                   false,
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index 8b5b0bc9c..592e7e67d 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -318,7 +318,7 @@ GraphicsPipeline::GraphicsPipeline(
+             LOG_CRITICAL(Render_Vulkan, "Graphics pipeline build failed: {}", exception.what());
+             std::scoped_lock lock{build_mutex};
+             is_built = true;
+-            build_condvar.notify_one();
++            build_condvar.notify_all();
+             if (shader_notify) {
+                 shader_notify->MarkShaderComplete();
+             }
+@@ -330,7 +330,7 @@ GraphicsPipeline::GraphicsPipeline(
+ 
+         std::scoped_lock lock{build_mutex};
+         is_built = true;
+-        build_condvar.notify_one();
++        build_condvar.notify_all();
+         if (shader_notify) {
+             shader_notify->MarkShaderComplete();
+         }
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+index b1ac5a3fc..c56d0ee09 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+@@ -7,6 +7,7 @@
+ #pragma once
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <array>
+ #include <atomic>
+ #include <condition_variable>
+@@ -123,6 +124,13 @@ public:
+         return is_built.load(std::memory_order::relaxed);
+     }
+ 
++    /// Eden (Doris): wait up to `timeout` for the pipeline to finish building. True if it is built.
++    bool WaitBuiltFor(std::chrono::microseconds timeout) {
++        std::unique_lock lock{build_mutex};
++        return build_condvar.wait_for(
++            lock, timeout, [this] { return is_built.load(std::memory_order::relaxed); });
++    }
++
+     template <typename Spec>
+     static auto MakeConfigureSpecFunc() {
+         return [](GraphicsPipeline* pl, bool is_indexed) { return pl->ConfigureImpl<Spec>(is_indexed); };
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 6e6120d1b..c4474fd75 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -747,6 +747,24 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const
+     if (draw_state.index_buffer.count <= 6 || draw_state.vertex_buffer.count <= 6) {
+         return pipeline;
+     }
++    // Eden (Doris): before skipping the draw (which leaves the object invisible this frame), give
++    // the shader a little time to finish, from a budget shared by all draws in a ~33 ms window.
++    using namespace std::chrono;
++    const u32 wait_ms{Settings::values.doris_async_shader_wait_ms.GetValue()};
++    if (wait_ms != 0) {
++        const auto now = steady_clock::now();
++        if (now - doris_wait_window_start > milliseconds{33}) {
++            doris_wait_window_start = now;
++            doris_wait_left = milliseconds{wait_ms};
++        }
++        if (doris_wait_left > microseconds::zero()) {
++            const bool built = pipeline->WaitBuiltFor(doris_wait_left);
++            doris_wait_left -= duration_cast<microseconds>(steady_clock::now() - now);
++            if (built) {
++                return pipeline;
++            }
++        }
++    }
+     return nullptr;
+ }
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.h b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+index ce89e981d..e1813e167 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.h
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+@@ -7,6 +7,7 @@
+ #pragma once
+ 
+ #include <array>
++#include <chrono>
+ #include <cstddef>
+ #include <filesystem>
+ #include <memory>
+@@ -154,6 +155,9 @@ private:
+     TextureCache& texture_cache;
+     VideoCore::ShaderNotify& shader_notify;
+     bool use_asynchronous_shaders{};
++    // Eden (Doris): budget for waiting on shaders that are still compiling (see BuiltPipeline).
++    mutable std::chrono::steady_clock::time_point doris_wait_window_start{};
++    mutable std::chrono::microseconds doris_wait_left{};
+     bool use_vulkan_pipeline_cache{};
+ 
+     GraphicsPipelineCacheKey graphics_key{};
+-- 
+2.43.0
+

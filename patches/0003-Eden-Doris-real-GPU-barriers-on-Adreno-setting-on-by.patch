@@ -1,7 +1,7 @@
-From 5d0aa2fab9d516c6b9063d048e921055f3b349f6 Mon Sep 17 00:00:00 2001
+From f23513bcfa1ab9f283f6e54d4deadc27dc5285b7 Mon Sep 17 00:00:00 2001
 From: "Eden (Doris) build" <doris@users.noreply.github.com>
 Date: Thu, 29 Oct 2026 09:40:52 -0500
-Subject: [PATCH 3/3] Eden (Doris): real GPU barriers on Adreno (setting, on by
+Subject: [PATCH 3/4] Eden (Doris): real GPU barriers on Adreno (setting, on by
  default)
 
 Eden turns the game's wait-for-idle into vkCmdSetEvent + vkCmdWaitEvents with TOP_OF_PIPE as the
@@ -37,10 +37,10 @@ index da16941bd..4d07c4fc1 100644
      GPU_FENCE_BEHAVIOR("gpu_fence_behavior"),
      FRAME_PACING_MODE("frame_pacing_mode"),
 diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt
-index 08d1272e3..6c437a495 100644
+index 4e1b9eec7..e5b8616bf 100644
 --- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt
 +++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt
-@@ -187,6 +187,15 @@ abstract class SettingsItem(
+@@ -186,6 +186,15 @@ abstract class SettingsItem(
                      valuesId = R.array.dorisShaderLoopLimitValues
                  )
              )
@@ -57,10 +57,10 @@ index 08d1272e3..6c437a495 100644
                  SingleChoiceSetting(
                      IntSetting.DORIS_MHR_FIX,
 diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt
-index 8454b49b0..c290982c3 100644
+index 182eaf7dc..701e51cdf 100644
 --- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt
 +++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt
-@@ -352,6 +352,7 @@ class SettingsFragmentPresenter(
+@@ -351,6 +351,7 @@ class SettingsFragmentPresenter(
  
              add(HeaderSetting(R.string.doris_experiments))
  
@@ -108,7 +108,7 @@ index e377d6ad1..54fb32780 100644
      <string name="doris_shader_loop_limit_description">How many times a loop inside a game shader may repeat before it is cut short. The PR #4324 build uses 256 (faster, but long loops are cut); Eden normally uses 8192. Takes effect the next time the game starts.</string>
      <string name="doris_mhr_fix">Monster Hunter Rise record fix</string>
 diff --git a/src/common/settings.h b/src/common/settings.h
-index 4af340ee7..510e46557 100644
+index 3038d4815..d5d4a6568 100644
 --- a/src/common/settings.h
 +++ b/src/common/settings.h
 @@ -592,6 +592,14 @@ struct Values {

@@ -1,7 +1,7 @@
-From 897319d280318760e9589865d82842e431d8277b Mon Sep 17 00:00:00 2001
+From a30cd0bb3dc3aaa6e8b630ae2d1a2233d6d3c0f7 Mon Sep 17 00:00:00 2001
 From: "Eden (Doris) build" <doris@users.noreply.github.com>
 Date: Thu, 29 Oct 2026 09:23:41 -0500
-Subject: [PATCH 2/3] Eden (Doris): settings for PR #4324's two changes
+Subject: [PATCH 2/4] Eden (Doris): settings for PR #4324's two changes
  (defaults = PR #4324 behaviour)
 
 - Shader loop limit (256 as in PR #4324; 512 to 8192, or no limit)
@@ -32,10 +32,10 @@ index ea31692fb..da16941bd 100644
      GPU_FENCE_BEHAVIOR("gpu_fence_behavior"),
      FRAME_PACING_MODE("frame_pacing_mode"),
 diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt
-index 6d46b5005..08d1272e3 100644
+index c05539c30..4e1b9eec7 100644
 --- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt
 +++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt
-@@ -178,6 +178,24 @@ abstract class SettingsItem(
+@@ -177,6 +177,24 @@ abstract class SettingsItem(
                      descriptionId = R.string.frame_limit_enable_description
                  )
              )
@@ -61,10 +61,10 @@ index 6d46b5005..08d1272e3 100644
                  SingleChoiceSetting(
                      IntSetting.RENDERER_DYNA_STATE,
 diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt
-index 8e4984efe..8454b49b0 100644
+index 108861491..182eaf7dc 100644
 --- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt
 +++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt
-@@ -350,6 +350,11 @@ class SettingsFragmentPresenter(
+@@ -349,6 +349,11 @@ class SettingsFragmentPresenter(
              add(BooleanSetting.RENDERER_ASYNC_PRESENTATION.key)
              add(SettingsItem.GPU_UNSWIZZLE_COMBINED)
  
@@ -141,7 +141,7 @@ index 7cd9c62ff..e377d6ad1 100644
      <string name="dyna_state">Extended Dynamic State</string>
      <string name="dyna_state_description">Controls the number of features that can be used in ExtendedDynamicState (EDS). The higher value will allow to reduce the amount of pipeline compilations based on the dynamic state supported by driver.</string>
 diff --git a/src/common/settings.h b/src/common/settings.h
-index 60cf87430..4af340ee7 100644
+index 7ac4b1117..3038d4815 100644
 --- a/src/common/settings.h
 +++ b/src/common/settings.h
 @@ -584,6 +584,15 @@ struct Values {

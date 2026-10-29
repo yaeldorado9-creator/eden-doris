@@ -32,6 +32,9 @@ effect the next time the game starts.
   work. On Adreno this lets draws read culling results, indirect draw arguments and vertex data that aren't finished
   yet, so distant terrain, buildings and shadows can drop out for a frame. Doris uses real barriers. "Eden (as before)"
   switches back, for comparison; "+ tiled-cache barriers" also makes the game's tiled-cache barriers real.
+* **Wait for new shaders** (default: up to 8 ms per frame). Only matters with asynchronous shaders on: Eden hides
+  anything whose shader is still compiling, so new places flicker as things pop in. Doris first waits up to this long
+  per frame for the shader to finish. "Don't wait (Eden)" switches back.
 * **Shader loop limit**: how many times a loop inside a game shader may repeat before it is cut short.
   PR #4324 lowered Eden's 8192 to 256. Choices: 256 (PR #4324, default), 512, 1024, 2048, 4096, 8192 (Eden default),
   no limit.
