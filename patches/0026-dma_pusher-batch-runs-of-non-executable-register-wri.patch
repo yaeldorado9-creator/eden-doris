@@ -1,0 +1,109 @@
+From b9bb193b6d5038dbbe41a1fde6ca14382f769799 Mon Sep 17 00:00:00 2001
+From: alvindimas05 <alvin.dimas.praditya@gmail.com>
+Date: Fri, 23 Oct 2026 11:28:52 +0700
+Subject: [PATCH 26/28] [dma_pusher] batch runs of non-executable register
+ writes
+
+(cherry picked from commit fbd10e52d6bb0292116c102466ba2efb0daa0aaf)
+---
+ src/video_core/dma_pusher.cpp             | 21 +++++++++++++++++++++
+ src/video_core/engines/engine_interface.h |  7 +++++++
+ src/video_core/engines/maxwell_3d.cpp     | 18 ++++++++++++++++++
+ src/video_core/engines/maxwell_3d.h       |  2 ++
+ 4 files changed, 48 insertions(+)
+
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index d3a4e4b6e..bc168c629 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -118,6 +118,27 @@ void DmaPusher::ProcessCommands(std::span<const CommandHeader> commands) {
+             dma_state.is_last_call = true;
+             index += max_write;
+         } else if (dma_state.method_count) {
++            auto const& run_header = commands[index];
++            // Coalesce a run of non-executable register writes into one virtual call.
++            if (dma_state.method >= non_puller_methods) {
++                auto subchannel = subchannels[dma_state.subchannel];
++                const u32 method = dma_state.method;
++                const u32 available =
++                    u32(std::min<std::size_t>(dma_state.method_count, commands.size() - index));
++                u32 run = 0;
++                while (run < available && !subchannel->execution_mask[method + run]) {
++                    ++run;
++                }
++                if (run > 1) {
++                    dma_state.dma_word_offset = u32(index * sizeof(u32));
++                    subchannel->PushMethodRun(method, &run_header.argument, run);
++                    dma_state.method = method + run;
++                    dma_state.method_count -= run;
++                    dma_state.is_last_call = dma_state.method_count <= 1;
++                    index += run;
++                    continue;
++                }
++            }
+             auto const command_header = commands[index]; //can copy
+             dma_state.dma_word_offset = u32(index * sizeof(u32));
+             dma_state.is_last_call = dma_state.method_count <= 1;
+diff --git a/src/video_core/engines/engine_interface.h b/src/video_core/engines/engine_interface.h
+index 078463e61..c8593a676 100644
+--- a/src/video_core/engines/engine_interface.h
++++ b/src/video_core/engines/engine_interface.h
+@@ -41,6 +41,13 @@ public:
+         method_sink.emplace_back(method, argument);
+     }
+ 
++    /// Write a run of consecutive non-executable methods starting at the given method index.
++    virtual void PushMethodRun(u32 method, const u32* arguments, u32 count) {
++        for (u32 i = 0; i < count; ++i) {
++            PushMethod(method + i, arguments[i]);
++        }
++    }
++
+     void ConsumeSink(Core::System& system) {
+         if (!method_sink.empty()) {
+             ConsumeSinkImpl(system);
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index ba37a00cb..5c67e0b17 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -298,6 +298,24 @@ void Maxwell3D::PushMethod(u32 method, u32 argument) {
+     }
+ }
+ 
++void Maxwell3D::PushMethodRun(u32 method, const u32* arguments, u32 count) {
++    const auto control = shadow_state.shadow_ram_control;
++    if (control == Regs::ShadowRamControl::Passthrough) [[likely]] {
++        for (u32 i = 0; i < count; ++i) {
++            ProcessDirtyRegisters(method + i, arguments[i]);
++        }
++    } else if (control == Regs::ShadowRamControl::Track || control == Regs::ShadowRamControl::TrackWithFilter) {
++        for (u32 i = 0; i < count; ++i) {
++            shadow_state.reg_array[method + i] = arguments[i];
++            ProcessDirtyRegisters(method + i, arguments[i]);
++        }
++    } else {
++        for (u32 i = 0; i < count; ++i) {
++            method_sink.emplace_back(method + i, arguments[i]);
++        }
++    }
++}
++
+ void Maxwell3D::ConsumeSinkImpl(Core::System& system) {
+     const auto control = shadow_state.shadow_ram_control;
+     if (control == Regs::ShadowRamControl::Track || control == Regs::ShadowRamControl::TrackWithFilter) {
+diff --git a/src/video_core/engines/maxwell_3d.h b/src/video_core/engines/maxwell_3d.h
+index 4ff9c5fb9..42464d503 100644
+--- a/src/video_core/engines/maxwell_3d.h
++++ b/src/video_core/engines/maxwell_3d.h
+@@ -3134,6 +3134,8 @@ public:
+ 
+     void PushMethod(u32 method, u32 argument) override;
+ 
++    void PushMethodRun(u32 method, const u32* arguments, u32 count) override;
++
+     /// Write multiple values to the register identified by method.
+     void CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) override;
+ 
+-- 
+2.43.0
+

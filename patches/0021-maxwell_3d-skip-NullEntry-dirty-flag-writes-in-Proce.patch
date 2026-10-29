@@ -1,0 +1,32 @@
+From 7dbd4f47e3d2e62658850de84ee8b8b09d6e7753 Mon Sep 17 00:00:00 2001
+From: alvindimas05 <alvin.dimas.praditya@gmail.com>
+Date: Fri, 23 Oct 2026 10:34:14 +0700
+Subject: [PATCH 21/28] [maxwell_3d] skip NullEntry dirty flag writes in
+ ProcessDirtyRegisters
+
+(cherry picked from commit e32846a873fd498db8ccfa12a10a3f69ec89db50)
+---
+ src/video_core/engines/maxwell_3d.cpp | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index 82eb3eb78..26d8e2a37 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -312,8 +312,11 @@ void Maxwell3D::ConsumeSinkImpl(Core::System& system) {
+ 
+ void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
+     regs.reg_array[method] = argument;
+-    for (auto const& table : dirty.tables)
+-        dirty.flags[table[method]] = true;
++    for (auto const& table : dirty.tables) {
++        if (const u8 flag = table[method]; flag != 0) {
++            dirty.flags[flag] = true;
++        }
++    }
+ }
+ 
+ void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call) {
+-- 
+2.43.0
+

@@ -1,0 +1,94 @@
+From be74040669e21378bec44bd119396f7e4f974c65 Mon Sep 17 00:00:00 2001
+From: alvindimas05 <alvin.dimas.praditya@gmail.com>
+Date: Fri, 23 Oct 2026 00:03:25 +0700
+Subject: [PATCH 11/28] [maxwell_3d] bypass method_sink queue for non-replay
+ shadow states
+
+(cherry picked from commit f72c3bb86de3aa678e8cb296647b0fb87193701d)
+---
+ src/video_core/dma_pusher.cpp             |  2 +-
+ src/video_core/engines/engine_interface.h |  4 ++++
+ src/video_core/engines/maxwell_3d.cpp     | 12 ++++++++++++
+ src/video_core/engines/maxwell_3d.h       |  2 ++
+ src/video_core/macro.cpp                  |  1 -
+ 5 files changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index 2417659f0..d3a4e4b6e 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -178,7 +178,7 @@ void DmaPusher::CallMethod(u32 argument) {
+     } else {
+         auto subchannel = subchannels[dma_state.subchannel];
+         if (!subchannel->execution_mask[dma_state.method]) {
+-            subchannel->method_sink.emplace_back(dma_state.method, argument);
++            subchannel->PushMethod(dma_state.method, argument);
+         } else {
+             subchannel->ConsumeSink(system);
+             subchannel->current_dma_segment = dma_state.dma_get + dma_state.dma_word_offset;
+diff --git a/src/video_core/engines/engine_interface.h b/src/video_core/engines/engine_interface.h
+index 83dbf1305..078463e61 100644
+--- a/src/video_core/engines/engine_interface.h
++++ b/src/video_core/engines/engine_interface.h
+@@ -37,6 +37,10 @@ public:
+     /// Write multiple values to the register identified by method.
+     virtual void CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) = 0;
+ 
++    virtual void PushMethod(u32 method, u32 argument) {
++        method_sink.emplace_back(method, argument);
++    }
++
+     void ConsumeSink(Core::System& system) {
+         if (!method_sink.empty()) {
+             ConsumeSinkImpl(system);
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index e7da9d913..82eb3eb78 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -281,6 +281,18 @@ u32 Maxwell3D::ProcessShadowRam(u32 method, u32 argument) {
+     return argument;
+ }
+ 
++void Maxwell3D::PushMethod(u32 method, u32 argument) {
++    const auto control = shadow_state.shadow_ram_control;
++    if (control == Regs::ShadowRamControl::Passthrough) [[likely]] {
++        ProcessDirtyRegisters(method, argument);
++    } else if (control == Regs::ShadowRamControl::Track || control == Regs::ShadowRamControl::TrackWithFilter) {
++        shadow_state.reg_array[method] = argument;
++        ProcessDirtyRegisters(method, argument);
++    } else {
++        method_sink.emplace_back(method, argument);
++    }
++}
++
+ void Maxwell3D::ConsumeSinkImpl(Core::System& system) {
+     const auto control = shadow_state.shadow_ram_control;
+     if (control == Regs::ShadowRamControl::Track || control == Regs::ShadowRamControl::TrackWithFilter) {
+diff --git a/src/video_core/engines/maxwell_3d.h b/src/video_core/engines/maxwell_3d.h
+index f09cf24ed..4ff9c5fb9 100644
+--- a/src/video_core/engines/maxwell_3d.h
++++ b/src/video_core/engines/maxwell_3d.h
+@@ -3132,6 +3132,8 @@ public:
+     /// Write the value to the register identified by method.
+     void CallMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call) override;
+ 
++    void PushMethod(u32 method, u32 argument) override;
++
+     /// Write multiple values to the register identified by method.
+     void CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) override;
+ 
+diff --git a/src/video_core/macro.cpp b/src/video_core/macro.cpp
+index 86f528af1..70878aa99 100644
+--- a/src/video_core/macro.cpp
++++ b/src/video_core/macro.cpp
+@@ -136,7 +136,6 @@ void HLE_DrawIndexedIndirect::Execute(Core::System& system, Engines::Maxwell3D&
+     maxwell3d.regs.vertex_id_base = element_base;
+     maxwell3d.regs.global_base_vertex_index = element_base;
+     maxwell3d.regs.global_base_instance_index = base_instance;
+-    maxwell3d.dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
+     if (extended) {
+         maxwell3d.engine_state = Maxwell3D::EngineHint::OnHLEMacro;
+         maxwell3d.SetHLEReplacementAttributeType(0, 0x640, Maxwell3D::HLEReplacementAttributeType::BaseVertex);
+-- 
+2.43.0
+

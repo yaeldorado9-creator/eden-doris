@@ -32,6 +32,9 @@ effect the next time the game starts.
   work. On Adreno this lets draws read culling results, indirect draw arguments and vertex data that aren't finished
   yet, so distant terrain, buildings and shadows can drop out for a frame. Doris uses real barriers. "Eden (as before)"
   switches back, for comparison; "+ tiled-cache barriers" also makes the game's tiled-cache barriers real.
+* **Performance report** (default: off). While a game runs, writes a summary to the log every 10 seconds: frame
+  times, how busy each emulator thread is (and on which core), CPU and GPU clocks, GPU load, battery temperature.
+  Share it with **Share debug logs**.
 * **Wait for new textures** (default: up to 8 ms per frame). Only matters with ASTC Decoding Method on CPU Async:
   Eden draws new textures before they are decoded, so new places flash as textures fill in. Doris waits briefly for
   each new texture and uploads it straight away.
@@ -44,6 +47,15 @@ effect the next time the game starts.
   no limit.
 * **Monster Hunter Rise record fix**: always (PR #4324, default), only in Monster Hunter Rise, or off. The log notes
   every time it rewrites a copy, and in which game.
+
+## Speed-ups from eden-lun
+
+Doris carries 21 of the CPU-side speed-ups that [eden-lun](https://github.com/luneflu/eden-lun) (by alvindimas05)
+made to Eden's GPU emulation: cheaper address translation, fewer redundant cache and LRU updates, faster pipeline
+and descriptor lookups, batched register writes. They are applied unchanged as git commits (with `cherry picked from`
+lines), plus one Doris commit that adapts three of them to this older base and ports a fourth. Left out on purpose:
+"skip dirty cascade on unchanged register writes" (can leave stale state on screen), the flat descriptor-ID lookup
+(needs newer texture-cache code) and the device-memory continuity fix (written for newer code).
 
 ## How it is built
 

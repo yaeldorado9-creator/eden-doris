@@ -1,0 +1,102 @@
+From 0985840de05b9e2736d9882c7424c223c3453771 Mon Sep 17 00:00:00 2001
+From: "Eden (Doris) build" <doris@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 11:28:59 -0500
+Subject: [PATCH 27/28] Eden (Doris): adapt eden-lun speed-ups to this base
+
+- PushImageDescriptors: keep the per-image rescale check (the render targets' scale says nothing
+  about a sampled image; compute passes use the same helper)
+- ForEachImageInRegion single-page fast path: visit each image once, as the full path does
+- DMA pusher run batching: not for IncreaseOnce, where only the first word advances the method
+- port eden-lun 924f5904f: SynchronizeBuffer skips the upload scan when the CPU wrote nothing
+---
+ src/video_core/buffer_cache/buffer_cache.h       | 4 ++++
+ src/video_core/dma_pusher.cpp                    | 3 ++-
+ src/video_core/renderer_vulkan/pipeline_helper.h | 5 ++---
+ src/video_core/texture_cache/texture_cache.h     | 7 +++++++
+ 4 files changed, 15 insertions(+), 4 deletions(-)
+
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 57b05f826..6f3bd92f6 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -1763,6 +1763,10 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
+     u64 total_size_bytes = 0;
+     u64 largest_copy = 0;
+     const DAddr buffer_start = buffer.cpu_addr_cached;
++    // eden-lun 924f5904f: nothing to upload when the CPU wrote nothing in this range.
++    if (!memory_tracker.IsRegionCpuModified(device_addr, size)) {
++        return true;
++    }
+     memory_tracker.ForEachUploadRange(device_addr, size, [&](u64 device_addr_out, u64 range_size) {
+         upload_copies.push_back(BufferCopy{
+             .src_offset = total_size_bytes,
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index bc168c629..bbb6bad36 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -120,7 +120,8 @@ void DmaPusher::ProcessCommands(std::span<const CommandHeader> commands) {
+         } else if (dma_state.method_count) {
+             auto const& run_header = commands[index];
+             // Coalesce a run of non-executable register writes into one virtual call.
+-            if (dma_state.method >= non_puller_methods) {
++            // Eden (Doris): not for IncreaseOnce, where only the first word advances the method.
++            if (!dma_increment_once && dma_state.method >= non_puller_methods) {
+                 auto subchannel = subchannels[dma_state.subchannel];
+                 const u32 method = dma_state.method;
+                 const u32 available =
+diff --git a/src/video_core/renderer_vulkan/pipeline_helper.h b/src/video_core/renderer_vulkan/pipeline_helper.h
+index 71f5b1fee..a6d61a0d3 100644
+--- a/src/video_core/renderer_vulkan/pipeline_helper.h
++++ b/src/video_core/renderer_vulkan/pipeline_helper.h
+@@ -364,7 +364,6 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
+     const u32 num_image_buffers = Shader::NumDescriptors(info.image_buffer_descriptors);
+     views += num_texture_buffers;
+     views += num_image_buffers;
+-    const bool is_rescaling_active = texture_cache.IsRescaling();
+     for (const auto& desc : info.texture_descriptors) {
+         bool is_rescaled{};
+         for (u32 index = 0; index < desc.count; ++index) {
+@@ -379,7 +378,7 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
+             Sampler& sampler{texture_cache.GetSampler(sampler_id)};
+             guest_descriptor_queue.AddSampledImage(vk_image_view,
+                                                    sampler.HandleFor(image_view, desc.is_depth));
+-            const bool element_rescaled{is_rescaling_active && texture_cache.IsRescaling(image_view)};
++            const bool element_rescaled{texture_cache.IsRescaling(image_view)};
+             is_rescaled |= element_rescaled;
+         }
+         rescaling.PushTexture(is_rescaled);
+@@ -393,7 +392,7 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
+             }
+             const VkImageView vk_image_view{image_view.StorageView(desc.type, desc.format)};
+             guest_descriptor_queue.AddImage(vk_image_view);
+-            const bool element_rescaled{is_rescaling_active && texture_cache.IsRescaling(image_view)};
++            const bool element_rescaled{texture_cache.IsRescaling(image_view)};
+             is_rescaled |= element_rescaled;
+         }
+         rescaling.PushImage(is_rescaled);
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 042abbd35..317afc7db 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -2017,11 +2017,18 @@ void TextureCache<P>::ForEachImageInRegion(DAddr cpu_addr, size_t size, Func&& f
+         if (it == page_table.end()) {
+             return;
+         }
++        // Eden (Doris): like the full path, visit each image once even if several of its map
++        // views fall in this page.
++        boost::container::small_vector<ImageId, 16> visited;
+         for (const ImageMapId map_id : it->second) {
+             ImageMapView& map = slot_map_views[map_id];
+             if (!map.Overlaps(cpu_addr, size)) {
+                 continue;
+             }
++            if (std::ranges::find(visited, map.image_id) != visited.end()) {
++                continue;
++            }
++            visited.push_back(map.image_id);
+             Image& image = slot_images[map.image_id];
+             if constexpr (BOOL_BREAK) {
+                 if (func(map.image_id, image)) {
+-- 
+2.43.0
+

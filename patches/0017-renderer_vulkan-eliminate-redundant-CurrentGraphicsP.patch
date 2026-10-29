@@ -1,0 +1,59 @@
+From 36ab8dd8a1fda02f60791cd5e0456a4bc8cb4a22 Mon Sep 17 00:00:00 2001
+From: alvindimas05 <alvin.dimas.praditya@gmail.com>
+Date: Fri, 23 Oct 2026 01:19:33 +0700
+Subject: [PATCH 17/28] [renderer_vulkan] eliminate redundant
+ CurrentGraphicsPipeline call in UpdateDynamicStates
+
+(cherry picked from commit 08e5183a95ebaa3fe5bd107c13eecc2b62b1b787)
+---
+ src/video_core/renderer_vulkan/vk_rasterizer.cpp | 6 +++---
+ src/video_core/renderer_vulkan/vk_rasterizer.h   | 2 +-
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index f6f0a4f2d..13086abe0 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -251,7 +251,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+     if (!pipeline->Configure(is_indexed))
+         return;
+ 
+-    UpdateDynamicStates();
++    UpdateDynamicStates(pipeline->HasDynamicVertexInput());
+ 
+     query_cache.NotifySegment(true);
+     HandleTransformFeedback();
+@@ -1114,7 +1114,7 @@ bool AccelerateDMA::BufferToImage(const Tegra::DMA::ImageCopy& copy_info,
+     return DmaBufferImageCopy<true>(copy_info, buffer_operand, image_operand);
+ }
+ 
+-void RasterizerVulkan::UpdateDynamicStates() {
++void RasterizerVulkan::UpdateDynamicStates(bool has_dynamic_vertex_input) {
+     auto& regs = maxwell3d->regs;
+     auto& flags = maxwell3d->dirty.flags;
+     const auto topology = maxwell3d->draw_manager.draw_state.topology;
+@@ -1192,7 +1192,7 @@ void RasterizerVulkan::UpdateDynamicStates() {
+     }
+ 
+     if (device.IsExtVertexInputDynamicStateSupported()) {
+-        if (auto* gp = pipeline_cache.CurrentGraphicsPipeline(); gp && gp->HasDynamicVertexInput()) {
++        if (has_dynamic_vertex_input) {
+             UpdateVertexInput(regs);
+         }
+     }
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index 13f2d10fd..a1ec9f4f0 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -164,7 +164,7 @@ private:
+ 
+     void FlushWork();
+ 
+-    void UpdateDynamicStates();
++    void UpdateDynamicStates(bool has_dynamic_vertex_input = false);
+ 
+     void HandleTransformFeedback();
+ 
+-- 
+2.43.0
+

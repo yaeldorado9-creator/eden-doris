@@ -1,0 +1,43 @@
+From e41bdc0628dcc5886f2fbc222c85184d75a60920 Mon Sep 17 00:00:00 2001
+From: alvindimas05 <alvin.dimas.praditya@gmail.com>
+Date: Fri, 23 Oct 2026 11:22:08 +0700
+Subject: [PATCH 25/28] [renderer_vulkan] only bind vertex streams referenced
+ by an attribute
+
+(cherry picked from commit 23f7fbc930bb489c5a213fff627a16545c43ac91)
+---
+ src/video_core/renderer_vulkan/vk_rasterizer.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 13086abe0..678444586 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1951,12 +1951,14 @@ void RasterizerVulkan::UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs)
+                                           device.GetMaxVertexInputBindings()));
+ 
+ 
++    u32 used_bindings = 0;
+     for (u32 index = 0; index < max_attributes; ++index) {
+         const Maxwell::VertexAttribute attribute{regs.vertex_attrib_format[index]};
+         const u32 binding{attribute.buffer};
+         if (attribute.constant || binding >= max_bindings) {
+             continue;
+         }
++        used_bindings |= 1u << binding;
+         attributes.push_back({
+             .sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT,
+             .pNext = nullptr,
+@@ -1968,6 +1970,9 @@ void RasterizerVulkan::UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs)
+     }
+ 
+     for (u32 binding = 0; binding < max_bindings; ++binding) {
++        if ((used_bindings & (1u << binding)) == 0) {
++            continue;
++        }
+         const auto& input_binding{regs.vertex_streams[binding]};
+         const bool is_instanced{regs.vertex_stream_instances.IsInstancingEnabled(binding)};
+         bindings.push_back({
+-- 
+2.43.0
+

@@ -1,0 +1,25 @@
+From 8ff061eae559584bbc1cb8f849c335afa5e1048f Mon Sep 17 00:00:00 2001
+From: alvindimas05 <alvin.dimas.praditya@gmail.com>
+Date: Fri, 23 Oct 2026 11:12:02 +0700
+Subject: [PATCH 23/28] [maxwell_3d] reserve macro parameter buffer up front
+
+(cherry picked from commit 5e4809145dd433ae5d440e375881745920bea7df)
+---
+ src/video_core/engines/maxwell_3d.cpp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index 26d8e2a37..3f1c666c1 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -37,6 +37,7 @@ Maxwell3D::Maxwell3D(MemoryManager& memory_manager_)
+ {
+     dirty.flags.flip();
+     InitializeRegisterDefaults();
++    macro_params.reserve(4096);
+     execution_mask.reset();
+     for (size_t i = 0; i < execution_mask.size(); i++)
+         execution_mask[i] = IsMethodExecutable(u32(i));
+-- 
+2.43.0
+

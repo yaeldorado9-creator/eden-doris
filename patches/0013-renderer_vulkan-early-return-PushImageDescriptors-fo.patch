@@ -1,0 +1,53 @@
+From 3d647a3834eb7a06fab4a9d4c639b33eb49abd80 Mon Sep 17 00:00:00 2001
+From: alvindimas05 <alvin.dimas.praditya@gmail.com>
+Date: Fri, 23 Oct 2026 00:27:32 +0700
+Subject: [PATCH 13/28] [renderer_vulkan] early-return PushImageDescriptors for
+ stages without textures
+
+(cherry picked from commit c6a27fae4fdca8f36f3c53679370be96c58b13bd)
+---
+ src/video_core/renderer_vulkan/pipeline_helper.h | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/src/video_core/renderer_vulkan/pipeline_helper.h b/src/video_core/renderer_vulkan/pipeline_helper.h
+index 07de25f18..71f5b1fee 100644
+--- a/src/video_core/renderer_vulkan/pipeline_helper.h
++++ b/src/video_core/renderer_vulkan/pipeline_helper.h
+@@ -355,10 +355,16 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
+                                  const Shader::Info& info, RescalingPushConstant& rescaling,
+                                  const VideoCommon::SamplerId*& samplers,
+                                  const VideoCommon::ImageViewInOut*& views) {
++    if (info.texture_descriptors.empty() && info.image_descriptors.empty()) {
++        if (info.texture_buffer_descriptors.empty() && info.image_buffer_descriptors.empty()) [[likely]] {
++            return;
++        }
++    }
+     const u32 num_texture_buffers = Shader::NumDescriptors(info.texture_buffer_descriptors);
+     const u32 num_image_buffers = Shader::NumDescriptors(info.image_buffer_descriptors);
+     views += num_texture_buffers;
+     views += num_image_buffers;
++    const bool is_rescaling_active = texture_cache.IsRescaling();
+     for (const auto& desc : info.texture_descriptors) {
+         bool is_rescaled{};
+         for (u32 index = 0; index < desc.count; ++index) {
+@@ -373,7 +379,7 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
+             Sampler& sampler{texture_cache.GetSampler(sampler_id)};
+             guest_descriptor_queue.AddSampledImage(vk_image_view,
+                                                    sampler.HandleFor(image_view, desc.is_depth));
+-            const bool element_rescaled{texture_cache.IsRescaling(image_view)};
++            const bool element_rescaled{is_rescaling_active && texture_cache.IsRescaling(image_view)};
+             is_rescaled |= element_rescaled;
+         }
+         rescaling.PushTexture(is_rescaled);
+@@ -387,7 +393,7 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
+             }
+             const VkImageView vk_image_view{image_view.StorageView(desc.type, desc.format)};
+             guest_descriptor_queue.AddImage(vk_image_view);
+-            const bool element_rescaled{texture_cache.IsRescaling(image_view)};
++            const bool element_rescaled{is_rescaling_active && texture_cache.IsRescaling(image_view)};
+             is_rescaled |= element_rescaled;
+         }
+         rescaling.PushImage(is_rescaled);
+-- 
+2.43.0
+

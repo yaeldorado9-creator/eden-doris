@@ -1,0 +1,59 @@
+From aa93116021de85a4fdbf877a7b5eba5dc2f922c4 Mon Sep 17 00:00:00 2001
+From: alvindimas05 <alvin.dimas.praditya@gmail.com>
+Date: Fri, 23 Oct 2026 11:20:18 +0700
+Subject: [PATCH 24/28] [video_core] avoid strict aliasing in descriptor
+ compare and single-word macro insert
+
+(cherry picked from commit e89ab357b1d273756ae3ba040ba8424a7db3c53f)
+---
+ src/video_core/engines/maxwell_3d.cpp           | 6 +++++-
+ src/video_core/texture_cache/descriptor_table.h | 9 +++++++--
+ 2 files changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index 3f1c666c1..ba37a00cb 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -208,7 +208,11 @@ void Maxwell3D::ProcessMacro(Core::System& system, u32 method, const u32* base_s
+         executing_macro = method;
+     }
+ 
+-    macro_params.insert(macro_params.end(), base_start, base_start + amount);
++    if (amount == 1) {
++        macro_params.push_back(base_start[0]);
++    } else {
++        macro_params.insert(macro_params.end(), base_start, base_start + amount);
++    }
+     macro_segments.emplace_back(current_dma_segment, amount);
+     current_macro_dirty |= current_dirty;
+     current_dirty = false;
+diff --git a/src/video_core/texture_cache/descriptor_table.h b/src/video_core/texture_cache/descriptor_table.h
+index 80d25ad55..e9f95ce5e 100644
+--- a/src/video_core/texture_cache/descriptor_table.h
++++ b/src/video_core/texture_cache/descriptor_table.h
+@@ -7,6 +7,9 @@
+ #pragma once
+ 
+ #include <algorithm>
++#include <array>
++#include <cstring>
++#include <type_traits>
+ #include <vector>
+ 
+ #include "common/alignment.h"
+@@ -40,8 +43,10 @@ public:
+         gpu_memory.ReadBlockUnsafe(gpu_addr, std::addressof(result.first), sizeof(T));
+         if ((read_descriptors[index / 64] & (1ULL << (index % 64))) != 0) {
+             if constexpr (sizeof(T) == 32 && alignof(T) >= 8 && std::is_trivially_copyable_v<T>) {
+-                const auto* lhs = reinterpret_cast<const u64*>(std::addressof(result.first));
+-                const auto* rhs = reinterpret_cast<const u64*>(std::addressof(descriptors[index]));
++                std::array<u64, 4> lhs;
++                std::array<u64, 4> rhs;
++                std::memcpy(lhs.data(), std::addressof(result.first), sizeof(lhs));
++                std::memcpy(rhs.data(), std::addressof(descriptors[index]), sizeof(rhs));
+                 result.second = ((lhs[0] ^ rhs[0]) | (lhs[1] ^ rhs[1]) |
+                                  (lhs[2] ^ rhs[2]) | (lhs[3] ^ rhs[3])) != 0;
+             } else {
+-- 
+2.43.0
+

@@ -1,0 +1,52 @@
+From 7c4d2f6a813ba7ebb1c7cf5da56ffb201b1d147d Mon Sep 17 00:00:00 2001
+From: alvindimas05 <alvin.dimas.praditya@gmail.com>
+Date: Fri, 23 Oct 2026 00:11:29 +0700
+Subject: [PATCH 12/28] [renderer_vulkan] memoize last sampler variant in
+ HandleFor
+
+(cherry picked from commit 0ae08024640438802703c666c4625260c95c82a8)
+---
+ src/video_core/renderer_vulkan/vk_texture_cache.cpp | 10 +++++++++-
+ src/video_core/renderer_vulkan/vk_texture_cache.h   |  2 ++
+ 2 files changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index c3f56408b..e2dac0fc6 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -2948,10 +2948,18 @@ VkSampler Sampler::HandleFor(const ImageView& image_view, bool is_depth) {
+         key.srgb_border = false;
+         key.swizzle = {};
+     }
++    if (last_sampler != VK_NULL_HANDLE && key == last_key) [[likely]] {
++        return last_sampler;
++    }
+     if (const VkSampler existing = Find(key); existing != VK_NULL_HANDLE) {
++        last_key = key;
++        last_sampler = existing;
+         return existing;
+     }
+-    return Emplace(key);
++    const VkSampler created = Emplace(key);
++    last_key = key;
++    last_sampler = created;
++    return created;
+ }
+ 
+ Framebuffer::Framebuffer(TextureCacheRuntime& runtime, std::span<ImageView*, NUM_RT> color_buffers,
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.h b/src/video_core/renderer_vulkan/vk_texture_cache.h
+index 1b1e35aa4..f8a8488d5 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.h
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.h
+@@ -562,6 +562,8 @@ private:
+ 
+     CustomBorderColorBudget custom_border_color_budget;
+     std::vector<Variant> variants;
++    VariantKey last_key{};
++    VkSampler last_sampler{VK_NULL_HANDLE};
+ 
+     const Device* device_ptr{nullptr};
+     VkSamplerCreateInfo base_ci{};
+-- 
+2.43.0
+

@@ -1,0 +1,57 @@
+From beff23c0d0128348b7ecca208f7770ec080c712b Mon Sep 17 00:00:00 2001
+From: alvindimas05 <alvin.dimas.praditya@gmail.com>
+Date: Thu, 22 Oct 2026 23:44:11 +0700
+Subject: [PATCH 10/28] [memory_manager] thread-local range cache in
+ GetMemoryLayoutSize
+
+(cherry picked from commit b494a368a38a2b836ae96c3762369ea65d36bc30)
+---
+ src/video_core/memory_manager.cpp | 31 ++++++++++++++++++++++++++++++-
+ 1 file changed, 30 insertions(+), 1 deletion(-)
+
+diff --git a/src/video_core/memory_manager.cpp b/src/video_core/memory_manager.cpp
+index b25f36253..e9cf015cf 100644
+--- a/src/video_core/memory_manager.cpp
++++ b/src/video_core/memory_manager.cpp
+@@ -597,8 +597,37 @@ size_t MemoryManager::MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const {
+ }
+ 
+ size_t MemoryManager::GetMemoryLayoutSize(GPUVAddr gpu_addr, size_t max_size) const {
++    struct RangeEntry {
++        u64 instance{};
++        GPUVAddr start{};
++        GPUVAddr end{};
++        u32 generation{};
++    };
++    static constexpr size_t kRangeEntries = 64;
++    static thread_local std::array<RangeEntry, kRangeEntries> range_cache{};
++    const u32 generation = translation_generation.load(std::memory_order_acquire);
++
++    if ((generation & 1) == 0) {
++        const size_t slot = (gpu_addr >> page_bits) & (kRangeEntries - 1);
++        const auto& entry = range_cache[slot];
++        if (entry.instance == unique_identifier && entry.generation == generation &&
++            gpu_addr >= entry.start && gpu_addr < entry.end) {
++            return static_cast<size_t>(entry.end - gpu_addr);
++        }
++    }
++
+     std::unique_lock<std::mutex> lock(guard);
+-    return kind_map.GetContinuousSizeFrom(gpu_addr);
++    const size_t size = kind_map.GetContinuousSizeFrom(gpu_addr);
++    if ((generation & 1) == 0 && size > 0) {
++        const size_t slot = (gpu_addr >> page_bits) & (kRangeEntries - 1);
++        range_cache[slot] = RangeEntry{
++            .instance = unique_identifier,
++            .start = gpu_addr,
++            .end = gpu_addr + size,
++            .generation = generation,
++        };
++    }
++    return size;
+ }
+ 
+ void MemoryManager::InvalidateRegion(GPUVAddr gpu_addr, size_t size,
+-- 
+2.43.0
+

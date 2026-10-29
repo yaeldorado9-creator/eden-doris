@@ -1,0 +1,104 @@
+From 45c22a29781941119ad2fab990bdd51fe7ecfa79 Mon Sep 17 00:00:00 2001
+From: alvindimas05 <alvin.dimas.praditya@gmail.com>
+Date: Fri, 23 Oct 2026 00:51:18 +0700
+Subject: [PATCH 14/28] [renderer_vulkan] optimize pipeline cache key
+ comparisons and MRU transition lookup
+
+(cherry picked from commit 9d00e9f54ce3cbaa275cfc1459d6fee730570031)
+---
+ .../renderer_vulkan/fixed_pipeline_state.cpp  | 14 +++++++++++-
+ .../renderer_vulkan/vk_graphics_pipeline.h    | 12 ++++++++--
+ .../renderer_vulkan/vk_pipeline_cache.cpp     | 22 +++++++++++++++++--
+ 3 files changed, 43 insertions(+), 5 deletions(-)
+
+diff --git a/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp b/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
+index 0ced89092..9a9c3bd5a 100644
+--- a/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
++++ b/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
+@@ -384,7 +384,19 @@ size_t FixedPipelineState::Hash() const noexcept {
+ }
+ 
+ bool FixedPipelineState::operator==(const FixedPipelineState& rhs) const noexcept {
+-    return std::memcmp(this, &rhs, Size()) == 0;
++    if (this == &rhs) {
++        return true;
++    }
++    if (raw1 != rhs.raw1 || raw2 != rhs.raw2) {
++        return false;
++    }
++    const size_t size = Size();
++    if (size != rhs.Size()) {
++        return false;
++    }
++    return std::memcmp(reinterpret_cast<const char*>(this) + 8,
++                       reinterpret_cast<const char*>(&rhs) + 8,
++                       size - 8) == 0;
+ }
+ 
+ u32 FixedPipelineState::PackComparisonOp(Maxwell::ComparisonOp op) noexcept {
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+index c56d0ee09..2a2021cb3 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+@@ -116,8 +116,16 @@ public:
+             return this;
+         }
+         const auto it{std::find(transition_keys.begin(), transition_keys.end(), current_key)};
+-        return it != transition_keys.end() ? transitions[std::distance(transition_keys.begin(), it)]
+-                                           : nullptr;
++        if (it != transition_keys.end()) {
++            const size_t idx = static_cast<size_t>(std::distance(transition_keys.begin(), it));
++            GraphicsPipeline* const res = transitions[idx];
++            if (idx > 0) {
++                std::swap(transition_keys[idx], transition_keys[0]);
++                std::swap(transitions[idx], transitions[0]);
++            }
++            return res;
++        }
++        return nullptr;
+     }
+ 
+     [[nodiscard]] bool IsBuilt() const noexcept {
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index c4474fd75..d881fb918 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -324,7 +324,9 @@ size_t ComputePipelineCacheKey::Hash() const noexcept {
+ }
+ 
+ bool ComputePipelineCacheKey::operator==(const ComputePipelineCacheKey& rhs) const noexcept {
+-    return std::memcmp(&rhs, this, sizeof *this) == 0;
++    return unique_hash == rhs.unique_hash &&
++           shared_memory_size == rhs.shared_memory_size &&
++           workgroup_size == rhs.workgroup_size;
+ }
+ 
+ size_t GraphicsPipelineCacheKey::Hash() const noexcept {
+@@ -333,7 +335,23 @@ size_t GraphicsPipelineCacheKey::Hash() const noexcept {
+ }
+ 
+ bool GraphicsPipelineCacheKey::operator==(const GraphicsPipelineCacheKey& rhs) const noexcept {
+-    return std::memcmp(&rhs, this, Size()) == 0;
++    if (this == &rhs) {
++        return true;
++    }
++    if (unique_hashes != rhs.unique_hashes) {
++        return false;
++    }
++    if (state.raw1 != rhs.state.raw1 || state.raw2 != rhs.state.raw2) {
++        return false;
++    }
++    const size_t size = Size();
++    if (size != rhs.Size()) {
++        return false;
++    }
++    constexpr size_t header_size = sizeof(unique_hashes) + 8;
++    return std::memcmp(reinterpret_cast<const char*>(this) + header_size,
++                       reinterpret_cast<const char*>(&rhs) + header_size,
++                       size - header_size) == 0;
+ }
+ 
+ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
+-- 
+2.43.0
+

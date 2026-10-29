@@ -1,0 +1,44 @@
+From 71e51c640d7af1ba96503e773256ae366cf59596 Mon Sep 17 00:00:00 2001
+From: alvindimas05 <alvin.dimas.praditya@gmail.com>
+Date: Thu, 22 Oct 2026 23:24:36 +0700
+Subject: [PATCH 09/28] [texture_cache] collapse per-draw LRU touches to once
+ per frame
+
+(cherry picked from commit e566687eae044c893f48bc277f4e8291b4b3fe19)
+---
+ src/video_core/texture_cache/image_base.h    | 2 ++
+ src/video_core/texture_cache/texture_cache.h | 5 ++++-
+ 2 files changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/src/video_core/texture_cache/image_base.h b/src/video_core/texture_cache/image_base.h
+index 79fc8505d..ad1399aee 100644
+--- a/src/video_core/texture_cache/image_base.h
++++ b/src/video_core/texture_cache/image_base.h
+@@ -106,6 +106,8 @@ struct ImageBase {
+ 
+     u64 modification_tick = 0;
+     size_t lru_index = SIZE_MAX;
++    // Frame in which the LRU entry was last touched, so per-draw touches can be collapsed.
++    u64 lru_touch_frame = 0;
+ 
+     std::array<u32, MAX_MIP_LEVELS> mip_level_offsets{};
+ 
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 052d12e08..4e5ffb193 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -2558,7 +2558,10 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool
+     if (is_modification) {
+         MarkModification(image);
+     }
+-    lru_cache.Touch(image.lru_index, frame_tick);
++    if (image.lru_touch_frame != frame_tick) {
++        image.lru_touch_frame = frame_tick;
++        lru_cache.Touch(image.lru_index, frame_tick);
++    }
+ }
+ 
+ template <class P>
+-- 
+2.43.0
+
