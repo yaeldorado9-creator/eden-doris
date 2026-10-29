@@ -1,7 +1,7 @@
 From 5a8e3275ff315f1a623600f58b83ed1451827fcd Mon Sep 17 00:00:00 2001
 From: alvindimas05 <alvin.dimas.praditya@gmail.com>
 Date: Fri, 23 Oct 2026 01:52:33 +0700
-Subject: [PATCH 19/39] [texture_cache] single-page fastpath for
+Subject: [PATCH 19/40] [texture_cache] single-page fastpath for
  ForEachImageInRegion CPU and GPU
 
 (cherry picked from commit aef4efa4c87602987e686639e310084a8a43bc93)

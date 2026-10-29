@@ -1,7 +1,7 @@
 From d43492b165233d60656784ad6739ac1b7ec95e48 Mon Sep 17 00:00:00 2001
 From: "Eden (Doris) build" <doris@users.noreply.github.com>
 Date: Thu, 29 Oct 2026 10:36:53 -0500
-Subject: [PATCH 04/39] Eden (Doris): wait briefly for compiling shaders
+Subject: [PATCH 04/40] Eden (Doris): wait briefly for compiling shaders
  instead of hiding the draw
 
 With asynchronous shaders on, Eden drops every draw whose pipeline is still compiling, so new

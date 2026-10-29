@@ -1,7 +1,7 @@
 From f7347ac4f7473953cab0ea6c66bbac0462de7513 Mon Sep 17 00:00:00 2001
 From: "Eden (Doris) build" <doris@users.noreply.github.com>
 Date: Thu, 29 Oct 2026 17:31:27 -0500
-Subject: [PATCH 36/39] Eden (Doris): back to Eden's submit timing; measuring
+Subject: [PATCH 36/40] Eden (Doris): back to Eden's submit timing; measuring
  threads on efficiency cores
 
 Build 12 handed work to the Vulkan worker every 16 draws and held submits

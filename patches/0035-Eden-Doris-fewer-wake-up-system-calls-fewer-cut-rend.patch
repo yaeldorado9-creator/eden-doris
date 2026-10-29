@@ -1,7 +1,7 @@
 From 3bc5ca115024a3384028f2532cd131077c4882b2 Mon Sep 17 00:00:00 2001
 From: "Eden (Doris) build" <doris@users.noreply.github.com>
 Date: Thu, 29 Oct 2026 14:42:38 -0500
-Subject: [PATCH 35/39] Eden (Doris): fewer wake-up system calls, fewer cut
+Subject: [PATCH 35/40] Eden (Doris): fewer wake-up system calls, fewer cut
  render passes; more report data
 
 Speed:

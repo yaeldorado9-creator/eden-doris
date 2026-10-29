@@ -1,0 +1,814 @@
+From 971c478da7a3e47a498f3b566f8d533f62abab11 Mon Sep 17 00:00:00 2001
+From: "Eden (Doris) build" <doris@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 18:44:19 -0500
+Subject: [PATCH 40/40] Eden (Doris): texture cleanup without GPU waits; fewer
+ worker wake-ups; redundant barriers skipped; hitch report
+
+- Texture cleanup (setting, default Doris; "Eden" = build 15 behaviour): textures the GPU drew
+  into are copied back without waiting for the GPU and removed at a later frame once the copy
+  is done (called off if the texture was used, drawn into or written by the CPU meanwhile);
+  textures stay 300 frames below a 2.2 GiB pressure threshold (Eden: 50 frames below 1.6 GiB,
+  never removing GPU drawings), Eden's rules above it.
+- Work is handed to the Vulkan worker every 16 draws instead of 4 (submit timing unchanged).
+- A full barrier with nothing recorded since the previous one is skipped.
+- Performance report: redundant barriers skipped, removals called off, and the longest
+  hitches of each window with the GPU thread's CPU time, waits and work in that frame.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014Ps8wnhVXtSU7d88gGtyHX
+---
+ .../features/settings/model/IntSetting.kt     |   1 +
+ .../settings/model/view/SettingsItem.kt       |   9 +
+ .../settings/ui/SettingsFragmentPresenter.kt  |   1 +
+ .../app/src/main/res/values/arrays.xml        |  10 +
+ .../app/src/main/res/values/strings.xml       |   4 +
+ src/common/doris_perf.cpp                     | 159 ++++++++++++++-
+ src/common/doris_perf.h                       |   7 +-
+ src/common/settings.h                         |   6 +
+ .../renderer_vulkan/vk_rasterizer.cpp         |  14 +-
+ .../renderer_vulkan/vk_rasterizer.h           |   2 +
+ src/video_core/renderer_vulkan/vk_scheduler.h |   8 +
+ .../renderer_vulkan/vk_texture_cache.cpp      |  18 ++
+ .../renderer_vulkan/vk_texture_cache.h        |   5 +
+ src/video_core/texture_cache/texture_cache.h  | 189 +++++++++++++++++-
+ .../texture_cache/texture_cache_base.h        |  31 +++
+ 15 files changed, 449 insertions(+), 15 deletions(-)
+
+diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/IntSetting.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/IntSetting.kt
+index a25444ab7..6b644d2c8 100644
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/IntSetting.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/IntSetting.kt
+@@ -33,6 +33,7 @@ enum class IntSetting(override val key: String) : AbstractIntSetting {
+     DORIS_SHADER_LOOP_LIMIT("doris_shader_loop_limit"),
+     DORIS_MHR_FIX("doris_mhr_fix"),
+     DORIS_GPU_BARRIERS("doris_gpu_barriers"),
++    DORIS_TEXTURE_CLEANUP("doris_texture_cleanup"),
+     DORIS_CORE_LAYOUT("doris_core_layout"),
+     DORIS_ASYNC_SHADER_WAIT("doris_async_shader_wait_ms"),
+     DORIS_TEXTURE_DECODE_WAIT("doris_texture_decode_wait_ms"),
+diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt
+index 8715530cb..1d142c134 100644
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt
+@@ -218,6 +218,15 @@ abstract class SettingsItem(
+                     valuesId = R.array.dorisGpuBarriersValues
+                 )
+             )
++            put(
++                SingleChoiceSetting(
++                    IntSetting.DORIS_TEXTURE_CLEANUP,
++                    titleId = R.string.doris_texture_cleanup,
++                    descriptionId = R.string.doris_texture_cleanup_description,
++                    choicesId = R.array.dorisTextureCleanupEntries,
++                    valuesId = R.array.dorisTextureCleanupValues
++                )
++            )
+             put(
+                 SingleChoiceSetting(
+                     IntSetting.DORIS_ASYNC_SHADER_WAIT,
+diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt
+index c8cbed485..bccc25fa9 100644
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt
+@@ -355,6 +355,7 @@ class SettingsFragmentPresenter(
+             add(BooleanSetting.DORIS_PROFILER.key)
+             add(IntSetting.DORIS_CORE_LAYOUT.key)
+             add(IntSetting.DORIS_GPU_BARRIERS.key)
++            add(IntSetting.DORIS_TEXTURE_CLEANUP.key)
+             add(IntSetting.DORIS_TEXTURE_DECODE_WAIT.key)
+             add(IntSetting.DORIS_TEXTURE_DECODE_THREADS.key)
+             add(IntSetting.DORIS_ASYNC_SHADER_WAIT.key)
+diff --git a/src/android/app/src/main/res/values/arrays.xml b/src/android/app/src/main/res/values/arrays.xml
+index 96916372e..5d7b52cc4 100644
+--- a/src/android/app/src/main/res/values/arrays.xml
++++ b/src/android/app/src/main/res/values/arrays.xml
+@@ -657,6 +657,16 @@
+         <item>1</item>
+     </integer-array>
+ 
++    <string-array name="dorisTextureCleanupEntries">
++        <item>@string/doris_texture_cleanup_doris</item>
++        <item>@string/doris_texture_cleanup_eden</item>
++    </string-array>
++
++    <integer-array name="dorisTextureCleanupValues">
++        <item>1</item>
++        <item>0</item>
++    </integer-array>
++
+     <string-array name="dorisGpuBarriersEntries">
+         <item>@string/doris_barriers_full</item>
+         <item>@string/doris_barriers_tiled</item>
+diff --git a/src/android/app/src/main/res/values/strings.xml b/src/android/app/src/main/res/values/strings.xml
+index 8e032eb78..65164156c 100644
+--- a/src/android/app/src/main/res/values/strings.xml
++++ b/src/android/app/src/main/res/values/strings.xml
+@@ -608,6 +608,10 @@
+     <string name="doris_core_layout_description">Which CPU cores the heavy emulator threads use. Doris puts the GPU emulation thread, the busiest one, on the fastest core and keeps the other heavy threads on the middle cores, so they never slow each other down. Takes effect the next time the game starts.</string>
+     <string name="doris_cores_doris">Doris: GPU thread on the fastest core</string>
+     <string name="doris_cores_system">Let Android decide (Eden)</string>
++    <string name="doris_texture_cleanup">Texture cleanup</string>
++    <string name="doris_texture_cleanup_description">How old textures are removed from GPU memory. Eden copies each texture the GPU drew into back to game memory and waits for the GPU every time (a hitch), and below 1.6 GB of GPU memory keeps those drawings while removing everything else after 50 frames, so TotK keeps re-uploading textures. Doris copies back without waiting, removes a texture only after its copy is done (and keeps it if it was used meanwhile), and gives every texture 300 frames below 2.2 GB. Takes effect right away.</string>
++    <string name="doris_texture_cleanup_doris">Doris: no waits, fewer re-uploads</string>
++    <string name="doris_texture_cleanup_eden">Eden (as before)</string>
+     <string name="doris_gpu_barriers">GPU barriers</string>
+     <string name="doris_gpu_barriers_description">How the game\'s \"wait until the GPU is done\" points are carried out. Eden\'s way lets later drawing read results that aren\'t finished yet on Adreno, which can make distant terrain, buildings and shadows drop out for a frame. Doris uses real barriers. Takes effect the next time the game starts.</string>
+     <string name="doris_barriers_eden">Eden (as before)</string>
+diff --git a/src/common/doris_perf.cpp b/src/common/doris_perf.cpp
+index bef03391c..b92751400 100644
+--- a/src/common/doris_perf.cpp
++++ b/src/common/doris_perf.cpp
+@@ -10,12 +10,15 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <ctime>
+ #include <fstream>
+ #include <map>
+ #include <mutex>
++#include <optional>
+ #include <sstream>
+ #include <string>
+ #include <thread>
++#include <utility>
+ #include <vector>
+ 
+ #if defined(__linux__) || defined(__ANDROID__)
+@@ -68,6 +71,66 @@ std::array<std::uint64_t, N> TakeAll(std::array<std::atomic<std::uint64_t>, N>&
+     return result;
+ }
+ 
++// Counters and waits only ever grow; readers keep their own previous reading (the report every
++// 10 seconds, the hitch check every frame) and take the difference.
++template <size_t N>
++std::array<std::uint64_t, N> ReadAll(const std::array<std::atomic<std::uint64_t>, N>& values) {
++    std::array<std::uint64_t, N> result{};
++    for (size_t i = 0; i < N; ++i) {
++        result[i] = values[i].load(std::memory_order_relaxed);
++    }
++    return result;
++}
++
++template <size_t N>
++std::array<std::uint64_t, N> Since(const std::array<std::uint64_t, N>& now,
++                                   std::array<std::uint64_t, N>& previous) {
++    std::array<std::uint64_t, N> result{};
++    for (size_t i = 0; i < N; ++i) {
++        result[i] = now[i] - previous[i];
++    }
++    previous = now;
++    return result;
++}
++
++/// A frame that took much longer than it should, and what happened during it.
++struct Hitch {
++    Clock::time_point end;
++    double frame_ms{};
++    /// CPU time the GPU emulation thread used during the frame. Close to frame_ms: that thread
++    /// was the bottleneck. Far below it (and few waits): it sat idle waiting for the game.
++    double gpu_thread_cpu_ms{};
++    std::array<std::uint64_t, static_cast<size_t>(Count::Max)> counts{};
++    std::array<std::uint64_t, static_cast<size_t>(Wait::Max)> waits_ns{};
++};
++constexpr double HITCH_MS = 50.0;
++constexpr size_t MAX_HITCHES = 64;
++constexpr size_t HITCHES_SHOWN = 6;
++/// Guarded by frame_mutex. The longest hitches of the current report window.
++std::vector<Hitch> hitches;
++size_t hitch_count = 0;
++
++/// State of the frame in progress; only the GPU emulation thread touches it (OnGameFrame).
++struct FrameState {
++    bool valid{false};
++    Clock::time_point start;
++    std::uint64_t gpu_thread_cpu_ns{};
++    std::array<std::uint64_t, static_cast<size_t>(Count::Max)> counts{};
++    std::array<std::uint64_t, static_cast<size_t>(Wait::Max)> waits_ns{};
++};
++FrameState frame_state;
++
++std::uint64_t ThreadCpuNs() {
++#if defined(__linux__) || defined(__ANDROID__)
++    timespec now{};
++    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now) == 0) {
++        return static_cast<std::uint64_t>(now.tv_sec) * 1'000'000'000ULL +
++               static_cast<std::uint64_t>(now.tv_nsec);
++    }
++#endif
++    return 0;
++}
++
+ std::string ReadFirstLine(const std::string& path) {
+     std::ifstream file(path);
+     std::string line;
+@@ -251,8 +314,8 @@ void ReportLoop() {
+     const std::vector<int> core_kinds = ReadCoreKinds();
+ #endif
+     // Work done while the game was loading is not part of any frame.
+-    TakeAll(counters);
+-    TakeAll(wait_ns);
++    auto counters_seen = ReadAll(counters);
++    auto waits_seen = ReadAll(wait_ns);
+     TakeAll(gpu_ns);
+     auto previous_time = Clock::now();
+     while (true) {
+@@ -273,14 +336,18 @@ void ReportLoop() {
+             }
+ #endif
+         }
+-        const auto counted = TakeAll(counters);
+-        const auto waited = TakeAll(wait_ns);
++        const auto counted = Since(ReadAll(counters), counters_seen);
++        const auto waited = Since(ReadAll(wait_ns), waits_seen);
+         const auto gpu = TakeAll(gpu_ns);
+         const auto gauges_max = TakeAll(gauge_max);
+         std::vector<Clock::time_point> stamps;
++        std::vector<Hitch> window_hitches;
++        size_t window_hitch_count = 0;
+         {
+             std::scoped_lock lock{frame_mutex};
+             stamps.swap(frames);
++            window_hitches.swap(hitches);
++            window_hitch_count = std::exchange(hitch_count, 0);
+         }
+         const auto now = Clock::now();
+         const double seconds = std::chrono::duration<double>(now - previous_time).count();
+@@ -399,21 +466,52 @@ void ReportLoop() {
+         };
+         LOG_INFO(Frontend,
+                  "Doris perf: per frame {:.0f} worker wake-ups, {:.1f} render passes cut by a "
+-                 "submit, {:.1f} protection changes, {:.1f} wait-for-idles, {:.1f} tiled-cache "
+-                 "barriers | textures: {} uploads ({} over GPU-drawn "
+-                 "contents), garbage collector removed {} ({} copied back first, {} with GPU-drawn "
+-                 "contents lost) | GPU memory {} MiB (max {}), collection from {} MiB, aggressive "
+-                 "from {} MiB",
++                 "submit, {:.1f} protection changes, {:.1f} wait-for-idles ({:.1f} redundant "
++                 "barriers skipped), {:.1f} tiled-cache barriers | textures: {} uploads ({} over "
++                 "GPU-drawn contents), garbage collector removed {} ({} copies back started, {} "
++                 "removals called off, {} with GPU-drawn contents lost) | GPU memory {} MiB (max "
++                 "{}), collection from {} MiB, aggressive from {} MiB",
+                  per_frame(count_of(Count::WorkerWakeups)),
+                  per_frame(count_of(Count::RenderPassSplits)),
+                  per_frame(count_of(Count::ProtectCalls)),
+                  per_frame(count_of(Count::WaitForIdle)),
++                 per_frame(count_of(Count::BarriersSkipped)),
+                  per_frame(count_of(Count::TiledCacheBarriers)), count_of(Count::TextureUploads),
+                  count_of(Count::TextureUploadsOverGpuData), count_of(Count::GcRemoved),
+-                 count_of(Count::GcDownloaded), count_of(Count::GcDroppedGpuData),
++                 count_of(Count::GcDownloaded), count_of(Count::GcCancelled),
++                 count_of(Count::GcDroppedGpuData),
+                  gauge_of(Gauge::TextureCacheMemory),
+                  gauges_max[static_cast<size_t>(Gauge::TextureCacheMemory)],
+                  gauge_of(Gauge::TextureCacheExpected), gauge_of(Gauge::TextureCacheCritical));
++
++        // The longest hitches, in the order they happened.
++        std::ranges::sort(window_hitches,
++                          [](const Hitch& a, const Hitch& b) { return a.frame_ms > b.frame_ms; });
++        if (window_hitches.size() > HITCHES_SHOWN) {
++            window_hitches.resize(HITCHES_SHOWN);
++        }
++        std::ranges::sort(window_hitches,
++                          [](const Hitch& a, const Hitch& b) { return a.end < b.end; });
++        for (const Hitch& hitch : window_hitches) {
++            const auto c = [&](Count counter) { return hitch.counts[static_cast<size_t>(counter)]; };
++            const auto w = [&](Wait kind) {
++                return static_cast<double>(hitch.waits_ns[static_cast<size_t>(kind)]) / 1e6;
++            };
++            LOG_INFO(Frontend,
++                     "Doris hitch: {:.0f} ms frame ({:.1f} s before this line; {} over {:.0f} ms "
++                     "in this window) | GPU thread busy {:.0f} ms, waited for the GPU {:.1f} ms, "
++                     "for presentation {:.1f} ms; Vulkan worker waited for shaders {:.1f} ms | "
++                     "{} new pipelines, {} texture uploads, {} textures removed ({} copies back "
++                     "started), {} draws, {} dispatches, {} render passes, {} submits, {} "
++                     "wait-for-idles, {} protection changes, {} worker wake-ups",
++                     hitch.frame_ms, std::chrono::duration<double>(now - hitch.end).count(),
++                     window_hitch_count, HITCH_MS, hitch.gpu_thread_cpu_ms, w(Wait::GpuFence),
++                     w(Wait::PresentFrame), w(Wait::Shaders), c(Count::NewPipelines),
++                     c(Count::TextureUploads), c(Count::GcRemoved), c(Count::GcDownloaded),
++                     c(Count::Draws), c(Count::Dispatches), c(Count::RenderPasses),
++                     c(Count::Submits), c(Count::WaitForIdle), c(Count::ProtectCalls),
++                     c(Count::WorkerWakeups));
++        }
+     }
+ }
+ 
+@@ -476,12 +574,51 @@ void RegisterThread(const char* label) {
+ 
+ void OnGameFrame() {
+     if (!Settings::values.doris_perf_report.GetValue()) {
++        frame_state.valid = false;
+         return;
+     }
+     std::call_once(start_flag, [] { std::thread(ReportLoop).detach(); });
++    const auto now = Clock::now();
++    const auto counts_now = ReadAll(counters);
++    const auto waits_now = ReadAll(wait_ns);
++    const std::uint64_t cpu_now = ThreadCpuNs();
++    std::optional<Hitch> hitch;
++    if (frame_state.valid) {
++        const double frame_ms =
++            std::chrono::duration<double, std::milli>(now - frame_state.start).count();
++        if (frame_ms >= HITCH_MS) {
++            hitch.emplace();
++            hitch->end = now;
++            hitch->frame_ms = frame_ms;
++            hitch->gpu_thread_cpu_ms =
++                static_cast<double>(cpu_now - std::min(cpu_now, frame_state.gpu_thread_cpu_ns)) /
++                1e6;
++            hitch->counts = Since(counts_now, frame_state.counts);
++            hitch->waits_ns = Since(waits_now, frame_state.waits_ns);
++        }
++    }
++    frame_state.valid = true;
++    frame_state.start = now;
++    frame_state.gpu_thread_cpu_ns = cpu_now;
++    frame_state.counts = counts_now;
++    frame_state.waits_ns = waits_now;
++
+     std::scoped_lock lock{frame_mutex};
+     if (frames.size() < MAX_FRAMES) {
+-        frames.push_back(Clock::now());
++        frames.push_back(now);
++    }
++    if (hitch) {
++        ++hitch_count;
++        if (hitches.size() < MAX_HITCHES) {
++            hitches.push_back(*hitch);
++        } else {
++            // Keep the longest ones.
++            auto shortest = std::ranges::min_element(
++                hitches, [](const Hitch& a, const Hitch& b) { return a.frame_ms < b.frame_ms; });
++            if (shortest->frame_ms < hitch->frame_ms) {
++                *shortest = *hitch;
++            }
++        }
+     }
+ }
+ 
+diff --git a/src/common/doris_perf.h b/src/common/doris_perf.h
+index d771aa070..eaa656013 100644
+--- a/src/common/doris_perf.h
++++ b/src/common/doris_perf.h
+@@ -11,7 +11,8 @@ namespace Doris::Perf {
+ /// Called once for every frame the game renders. When the "Performance report" setting is on,
+ /// the first call starts a low-priority thread that writes a summary to the log every 10 seconds:
+ /// frame times, CPU time per emulator thread (and the core it last ran on), CPU cluster and GPU
+-/// clocks, GPU load and battery temperature, plus the counters and timers below.
++/// clocks, GPU load and battery temperature, plus the counters and timers below, and the longest
++/// hitches (frames over 50 ms) with what happened in each. Called on the GPU emulation thread.
+ void OnGameFrame();
+ 
+ /// True while the "Performance report" setting is on.
+@@ -38,6 +39,10 @@ enum class Count : int {
+     GcDownloaded,
+     /// ... that the GPU had drawn into but could not be copied back (their contents are lost).
+     GcDroppedGpuData,
++    /// Doris cleanup: removals called off because the texture was used or changed meanwhile.
++    GcCancelled,
++    /// Full barriers skipped because nothing was recorded since the previous one.
++    BarriersSkipped,
+     /// Memory protection changes for CPU write tracking.
+     ProtectCalls,
+     /// The game's "wait for idle" GPU commands.
+diff --git a/src/common/settings.h b/src/common/settings.h
+index 4916c1422..1317e0a34 100644
+--- a/src/common/settings.h
++++ b/src/common/settings.h
+@@ -600,6 +600,12 @@ struct Values {
+     // 2 = Doris as 1, plus the game's tiled-cache barriers (a no-op in Eden) become full barriers.
+     SwitchableSetting<u32> doris_gpu_barriers{linkage, 1, "doris_gpu_barriers",
+                                               Category::RendererAdvanced};
++    // Texture cleanup. 0 = Eden's rules (copies back wait for the GPU once per cleanup pass).
++    // 1 = Doris: copies back never wait for the GPU (a texture is removed once its copy is done,
++    // and kept if it was used or changed meanwhile), textures stay 300 frames instead of 50 below
++    // the pressure threshold (2.2 GiB instead of 1.6 GiB), GPU drawings included.
++    SwitchableSetting<u32> doris_texture_cleanup{linkage, 1, "doris_texture_cleanup",
++                                                 Category::RendererAdvanced};
+     // With asynchronous shaders on, Eden skips every draw whose shader is still compiling, so new
+     // things are invisible for a moment. Doris first waits up to this many milliseconds per frame
+     // (shared by all draws in it) for the shader to finish. 0 = skip right away, as Eden does.
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 501a82575..e65aa64d9 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -888,10 +888,18 @@ void RasterizerVulkan::DorisAfterCompute() {
+ 
+ void RasterizerVulkan::DorisFullBarrier() {
+     scheduler.RequestOutsideRenderPassOperationContext();
++    // A full barrier right after another one, with nothing at all recorded in between, changes
++    // nothing: everything before it is already ordered and visible. TotK issues about 130 of
++    // these "wait for idle" points per frame, often back to back.
++    if (scheduler.RecordedCommands() == doris_last_full_barrier) {
++        Doris::Perf::Add(Doris::Perf::Count::BarriersSkipped);
++        return;
++    }
+     scheduler.Record([](vk::CommandBuffer cmdbuf) {
+         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, DORIS_FULL_BARRIER);
+     });
++    doris_last_full_barrier = scheduler.RecordedCommands();
+ }
+ 
+ void RasterizerVulkan::WaitForIdle() {
+@@ -1042,7 +1050,11 @@ void RasterizerVulkan::LoadDiskResources(u64 title_id, std::stop_token stop_load
+ void RasterizerVulkan::FlushWork() {
+ #ifdef __ANDROID__
+     static constexpr u32 DRAWS_TO_DISPATCH = 512;
+-    static constexpr u32 CHECK_MASK = 3;
++    // Eden (Doris): hand recorded work to the Vulkan worker every 16 draws instead of 4. The
++    // worker is usually asleep by then, and waking it is a futex system call: 500 to 780 per
++    // frame in build 15, several milliseconds of the GPU thread. Submits still happen every 512
++    // draws exactly as in Eden, so the GPU starts its work at the same moments.
++    static constexpr u32 CHECK_MASK = 15;
+ #else
+     static constexpr u32 DRAWS_TO_DISPATCH = 4096;
+     static constexpr u32 CHECK_MASK = 7;
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index a1ec9f4f0..ed1aa7933 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -234,6 +234,8 @@ private:
+     boost::container::static_vector<VkSampler, MAX_TEXTURES> sampler_handles;
+ 
+     u32 draw_counter = 0;
++    /// Eden (Doris): RecordedCommands() right after the last full barrier.
++    u64 doris_last_full_barrier = ~u64{0};
+ };
+ 
+ } // namespace Vulkan
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.h b/src/video_core/renderer_vulkan/vk_scheduler.h
+index 57e31674c..60f3aed5d 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.h
++++ b/src/video_core/renderer_vulkan/vk_scheduler.h
+@@ -105,6 +105,7 @@ public:
+     template <typename T>
+         requires std::is_invocable_v<T, vk::CommandBuffer, vk::CommandBuffer>
+     void RecordWithUploadBuffer(T&& command) {
++        ++recorded_commands;
+         if (chunk->Record(command)) {
+             return;
+         }
+@@ -121,6 +122,11 @@ public:
+             });
+     }
+ 
++    /// Eden (Doris): how many commands have been recorded so far (any kind).
++    [[nodiscard]] u64 RecordedCommands() const noexcept {
++        return recorded_commands;
++    }
++
+     /// Returns the current command buffer tick.
+     [[nodiscard]] u64 CurrentTick() const noexcept {
+         return master_semaphore->CurrentTick();
+@@ -334,6 +340,8 @@ private:
+     std::mutex reserve_mutex;
+     std::mutex queue_mutex;
+     std::condition_variable_any event_cv;
++    /// Eden (Doris): commands recorded so far (GPU emulation thread only).
++    u64 recorded_commands = 0;
+     /// Eden (Doris): the worker is asleep waiting for work (guarded by queue_mutex).
+     bool worker_waiting = false;
+     /// Eden (Doris): threads in WaitWorker waiting for the queue to drain (guarded by queue_mutex).
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index e2dac0fc6..36b07911f 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -10,6 +10,7 @@
+ #include <optional>
+ #include <span>
+ #include <memory>
++#include <type_traits>
+ #include <utility>
+ #include <vector>
+ #include <boost/container/small_vector.hpp>
+@@ -982,6 +983,23 @@ StagingBufferRef TextureCacheRuntime::DownloadStagingBuffer(size_t size, bool de
+     return staging_buffer_pool.Request(size, MemoryUsage::Download, deferred);
+ }
+ 
++u64 TextureCacheRuntime::DorisCurrentTick() const {
++    return scheduler.CurrentTick();
++}
++
++bool TextureCacheRuntime::DorisIsTickDone(u64 tick) const {
++    if (scheduler.IsFree(tick)) {
++        return true;
++    }
++    // The known GPU progress is only refreshed when something waits; read the real one.
++    scheduler.GetMasterSemaphore().Refresh();
++    return scheduler.IsFree(tick);
++}
++
++// Eden (Doris): the texture cache keeps these references across frames for its copies back.
++static_assert(std::is_trivially_destructible_v<StagingBufferRef>,
++              "Doris texture cleanup expects a plain staging buffer reference");
++
+ void TextureCacheRuntime::FreeDeferredStagingBuffer(StagingBufferRef& ref) {
+     staging_buffer_pool.FreeDeferred(ref);
+ }
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.h b/src/video_core/renderer_vulkan/vk_texture_cache.h
+index f8a8488d5..0cb3c53d7 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.h
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.h
+@@ -58,6 +58,11 @@ public:
+ 
+     void FreeDeferredStagingBuffer(StagingBufferRef& ref);
+ 
++    /// Eden (Doris): the tick the commands recorded now will complete with.
++    [[nodiscard]] u64 DorisCurrentTick() const;
++    /// Eden (Doris): true once the GPU has passed the tick.
++    [[nodiscard]] bool DorisIsTickDone(u64 tick) const;
++
+     void TickFrame();
+ 
+     void FlushDeferredClear();
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 2b5af1959..757d538ce 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -120,6 +120,20 @@ TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManag
+ 
+ template <class P>
+ void TextureCache<P>::RunGarbageCollector() {
++    if constexpr (DORIS_ASYNC_REMOVAL) {
++        // Finish (or cancel) removals whose copy back to guest memory is done, whichever mode
++        // is selected now.
++        DorisProcessPendingRemovals();
++        if (Settings::values.doris_texture_cleanup.GetValue() != 0) {
++            DorisRunGarbageCollector();
++            return;
++        }
++    }
++    EdenRunGarbageCollector();
++}
++
++template <class P>
++void TextureCache<P>::EdenRunGarbageCollector() {
+     // Eden's collection rules, unchanged. One Doris change: textures that have to be copied back
+     // to guest memory before they are removed are copied together, with a single wait for the GPU
+     // at the end of the pass, instead of one wait per texture (each wait stalls emulation until the
+@@ -158,7 +172,7 @@ void TextureCache<P>::RunGarbageCollector() {
+         if (num_iterations == 0) {
+             return true;
+         }
+-        if (is_pending(image_id)) {
++        if (is_pending(image_id) || DorisIsPendingRemoval(image_id)) {
+             return false;
+         }
+         --num_iterations;
+@@ -242,6 +256,171 @@ void TextureCache<P>::RunGarbageCollector() {
+     }
+ }
+ 
++template <class P>
++void TextureCache<P>::DorisRunGarbageCollector() {
++    // Eden (Doris) texture cleanup. Same rules as Eden's, except:
++    // - Textures the GPU drew into are copied back to guest memory without waiting for the GPU;
++    //   each one is removed only once its copy is done (a later frame), and not at all if it was
++    //   used, drawn into or written by the CPU in the meantime. Eden waited for the GPU to finish
++    //   all queued work for every such copy, a hitch each time (build 15: 63 to 1983 of them
++    //   every 10 seconds).
++    // - Below the pressure threshold, textures must be unused for 300 frames (Eden: 50) before
++    //   they go, GPU drawings included (Eden kept those until there was pressure, so they piled
++    //   up until it started removing everything older than 25 frames: TotK sat just above Eden's
++    //   threshold and re-uploaded 700 to 3500 textures every 10 seconds).
++    // - The pressure threshold is 2.2 GiB (Eden 1.6 GiB of the 4 GiB budget); critical stays.
++    const u64 pressure_threshold = DorisPressureThreshold();
++    constexpr size_t MAX_PENDING_REMOVALS = 64;
++    constexpr size_t MAX_PENDING_BYTES = 128_MiB;
++
++    bool high_priority_mode = false;
++    bool aggressive_mode = false;
++    u64 ticks_to_destroy = 0;
++    size_t num_iterations = 0;
++    const auto Configure = [&](bool allow_aggressive) {
++        high_priority_mode = total_used_memory >= pressure_threshold;
++        aggressive_mode = allow_aggressive && total_used_memory >= critical_memory;
++        ticks_to_destroy = aggressive_mode ? 10ULL : high_priority_mode ? 25ULL : 300ULL;
++        num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : 10);
++    };
++    const auto Cleanup = [&](ImageId image_id) {
++        if (num_iterations == 0) {
++            return true;
++        }
++        if (DorisIsPendingRemoval(image_id)) {
++            return false;
++        }
++        --num_iterations;
++        auto& image = slot_images[image_id];
++        if (True(image.flags & ImageFlagBits::IsDecoding)) {
++            return false;
++        }
++        if (!aggressive_mode && True(image.flags & ImageFlagBits::CostlyLoad)) {
++            return false;
++        }
++        const bool must_download =
++            IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap);
++        if (must_download) {
++            if constexpr (DORIS_ASYNC_REMOVAL) {
++                if (doris_pending_removals.size() >= MAX_PENDING_REMOVALS ||
++                    doris_pending_bytes >= MAX_PENDING_BYTES) {
++                    return false;
++                }
++                Doris::Perf::Add(Doris::Perf::Count::GcDownloaded);
++                auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes, true);
++                const auto copies = FixSmallVectorADL(FullDownloadCopies(image.info));
++                image.DownloadMemory(map, copies);
++                doris_pending_removals.push_back(DorisPendingRemoval{
++                    .image_id = image_id,
++                    .staging = map,
++                    .gpu_tick = runtime.DorisCurrentTick(),
++                    .issue_frame = frame_tick,
++                    .modification_tick = image.modification_tick,
++                    .staging_bytes = image.unswizzled_size_bytes,
++                });
++                doris_pending_bytes += image.unswizzled_size_bytes;
++            }
++            return false;
++        }
++        Doris::Perf::Add(Doris::Perf::Count::GcRemoved);
++        if (True(image.flags & ImageFlagBits::GpuModified)) {
++            Doris::Perf::Add(Doris::Perf::Count::GcDroppedGpuData);
++        }
++        if (True(image.flags & ImageFlagBits::Tracked)) {
++            UntrackImage(image, image_id);
++        }
++        UnregisterImage(image_id);
++        DeleteImage(image_id, image.scale_tick > frame_tick + 5);
++        if (aggressive_mode && total_used_memory < critical_memory) {
++            num_iterations >>= 2;
++            aggressive_mode = false;
++        } else if (high_priority_mode && total_used_memory < pressure_threshold) {
++            num_iterations >>= 1;
++            high_priority_mode = false;
++        }
++        return false;
++    };
++    Configure(false);
++    if (frame_tick >= ticks_to_destroy) {
++        lru_cache.ForEachItemBelow(frame_tick - ticks_to_destroy, Cleanup);
++    }
++    if (total_used_memory >= critical_memory) {
++        Configure(true);
++        if (frame_tick >= ticks_to_destroy) {
++            lru_cache.ForEachItemBelow(frame_tick - ticks_to_destroy, Cleanup);
++        }
++    }
++}
++
++template <class P>
++u64 TextureCache<P>::DorisPressureThreshold() const noexcept {
++    if (!DORIS_ASYNC_REMOVAL || Settings::values.doris_texture_cleanup.GetValue() == 0) {
++        return expected_memory;
++    }
++    constexpr u64 DORIS_EXPECTED_MEMORY = 2_GiB + 200_MiB;
++    const u64 below_critical = critical_memory > 1_GiB ? critical_memory - 1_GiB : 0;
++    return (std::max)(expected_memory, (std::min)(DORIS_EXPECTED_MEMORY, below_critical));
++}
++
++template <class P>
++void TextureCache<P>::DorisProcessPendingRemovals() {
++    if constexpr (DORIS_ASYNC_REMOVAL) {
++        // Entries are in the order their copies were recorded, so the first one whose copy is
++        // still running ends the scan (and the GPU's progress is read at most once).
++        while (!doris_pending_removals.empty() &&
++               runtime.DorisIsTickDone(doris_pending_removals.front().gpu_tick)) {
++            // Take the entry out first: DeleteImage below must not find it.
++            DorisPendingRemoval removal = doris_pending_removals.front();
++            doris_pending_removals.erase(doris_pending_removals.begin());
++            doris_pending_bytes -= (std::min)(doris_pending_bytes, removal.staging_bytes);
++
++            auto& image = slot_images[removal.image_id];
++            // When the copy was recorded the texture had not been used for at least 10 frames, so
++            // any use since then (this frame included) shows up here.
++            const bool used_since = image.lru_touch_frame >= removal.issue_frame;
++            const bool drawn_since = image.modification_tick != removal.modification_tick;
++            const bool written_by_cpu = True(image.flags & ImageFlagBits::CpuModified);
++            if (used_since || drawn_since || written_by_cpu) {
++                // Still in use, or its contents changed: keep it.
++                Doris::Perf::Add(Doris::Perf::Count::GcCancelled);
++                runtime.FreeDeferredStagingBuffer(removal.staging);
++                continue;
++            }
++            const auto copies = FixSmallVectorADL(FullDownloadCopies(image.info));
++            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies,
++                         removal.staging.mapped_span, swizzle_data_buffer);
++            runtime.FreeDeferredStagingBuffer(removal.staging);
++            Doris::Perf::Add(Doris::Perf::Count::GcRemoved);
++            if (True(image.flags & ImageFlagBits::Tracked)) {
++                UntrackImage(image, removal.image_id);
++            }
++            UnregisterImage(removal.image_id);
++            DeleteImage(removal.image_id, image.scale_tick > frame_tick + 5);
++        }
++    }
++}
++
++template <class P>
++void TextureCache<P>::DorisForgetPendingRemoval(ImageId image_id) {
++    if constexpr (DORIS_ASYNC_REMOVAL) {
++        for (auto it = doris_pending_removals.begin(); it != doris_pending_removals.end(); ++it) {
++            if (it->image_id == image_id) {
++                doris_pending_bytes -= (std::min)(doris_pending_bytes, it->staging_bytes);
++                runtime.FreeDeferredStagingBuffer(it->staging);
++                doris_pending_removals.erase(it);
++                return;
++            }
++        }
++    }
++}
++
++template <class P>
++bool TextureCache<P>::DorisIsPendingRemoval(ImageId image_id) const noexcept {
++    return std::ranges::any_of(doris_pending_removals, [image_id](const auto& removal) {
++        return removal.image_id == image_id;
++    });
++}
++
+ template <class P>
+ void TextureCache<P>::TickFrame() {
+     // If we can obtain the memory info, use it instead of the estimate.
+@@ -250,11 +429,15 @@ void TextureCache<P>::TickFrame() {
+     }
+     if (Doris::Perf::Enabled()) {
+         Doris::Perf::SetGauge(Doris::Perf::Gauge::TextureCacheMemory, total_used_memory >> 20);
+-        Doris::Perf::SetGauge(Doris::Perf::Gauge::TextureCacheExpected, expected_memory >> 20);
++        Doris::Perf::SetGauge(Doris::Perf::Gauge::TextureCacheExpected,
++                              DorisPressureThreshold() >> 20);
+         Doris::Perf::SetGauge(Doris::Perf::Gauge::TextureCacheCritical, critical_memory >> 20);
+     }
+     if (total_used_memory > minimum_memory) {
+         RunGarbageCollector();
++    } else if constexpr (DORIS_ASYNC_REMOVAL) {
++        // Removals already under way still finish (and free their staging memory).
++        DorisProcessPendingRemovals();
+     }
+     sentenced_images.Tick();
+     sentenced_framebuffers.Tick();
+@@ -2495,6 +2678,8 @@ void TextureCache<P>::UntrackImage(ImageBase& image, ImageId image_id) {
+ 
+ template <class P>
+ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
++    // Eden (Doris): a texture waiting for its copy back can also be deleted another way.
++    DorisForgetPendingRemoval(image_id);
+     ImageBase& image = slot_images[image_id];
+     if (image.HasScaled()) {
+         total_used_memory -= GetScaledImageSizeBytes(image);
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index 3e1ad0126..b8371aa3f 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -14,6 +14,7 @@
+ #include <mutex>
+ #include <span>
+ #include <type_traits>
++#include <utility>
+ // TODO: find out which don't require stable iters
+ #include <unordered_map>
+ #include <ankerl/unordered_dense.h>
+@@ -384,6 +385,19 @@ private:
+     /// Delete image from the cache
+     void DeleteImage(ImageId image, bool immediate_delete = false);
+ 
++    /// Eden (Doris): Eden's garbage collection (one GPU wait per pass for copies back).
++    void EdenRunGarbageCollector();
++    /// Eden (Doris): Doris texture cleanup (see RunGarbageCollector).
++    void DorisRunGarbageCollector();
++    /// Eden (Doris): finishes removals whose copy back to guest memory is done.
++    void DorisProcessPendingRemovals();
++    /// Eden (Doris): drops a pending removal (the image is being deleted another way).
++    void DorisForgetPendingRemoval(ImageId image_id);
++    /// Eden (Doris): true if the image is waiting for its copy back before removal.
++    [[nodiscard]] bool DorisIsPendingRemoval(ImageId image_id) const noexcept;
++    /// Eden (Doris): memory use above which the garbage collector is under pressure.
++    [[nodiscard]] u64 DorisPressureThreshold() const noexcept;
++
+     /// Remove image views references from the cache
+     void RemoveImageViewReferences(std::span<const ImageViewId> removed_views);
+ 
+@@ -452,6 +466,23 @@ private:
+ 
+     DAddr virtual_invalid_space{};
+ 
++    // Eden (Doris): textures being copied back to guest memory before the garbage collector
++    // removes them, without waiting for the GPU. Only with staging references that are plain data
++    // (Vulkan); other backends keep Eden's synchronous copy.
++    using DorisStagingRef =
++        decltype(std::declval<Runtime&>().DownloadStagingBuffer(size_t{}, bool{}));
++    static constexpr bool DORIS_ASYNC_REMOVAL = std::is_trivially_destructible_v<DorisStagingRef>;
++    struct DorisPendingRemoval {
++        ImageId image_id;
++        std::conditional_t<DORIS_ASYNC_REMOVAL, DorisStagingRef, int> staging;
++        u64 gpu_tick;          // the copy is done once the GPU has passed this tick
++        u64 issue_frame;       // frame_tick when the copy was recorded
++        u64 modification_tick; // the image's modification tick at that point
++        size_t staging_bytes;
++    };
++    std::vector<DorisPendingRemoval> doris_pending_removals;
++    size_t doris_pending_bytes = 0;
++
+     bool has_deleted_images = false;
+     bool is_rescaling = false;
+     u64 total_used_memory = 0;
+-- 
+2.43.0
+

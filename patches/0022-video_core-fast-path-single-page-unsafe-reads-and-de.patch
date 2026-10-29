@@ -1,7 +1,7 @@
 From be468a184189857dbb255d4141c1259e72c11d79 Mon Sep 17 00:00:00 2001
 From: alvindimas05 <alvin.dimas.praditya@gmail.com>
 Date: Fri, 23 Oct 2026 11:10:26 +0700
-Subject: [PATCH 22/39] [video_core] fast path single-page unsafe reads and
+Subject: [PATCH 22/40] [video_core] fast path single-page unsafe reads and
  descriptor compares
 
 (cherry picked from commit f17510e6926d99fb9a4acf67a959432a2218a957)
