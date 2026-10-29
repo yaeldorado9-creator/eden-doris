@@ -62,13 +62,12 @@ effect the next time the game starts.
 
 ## Submitting work to the GPU
 
-* Eden handed recorded commands to its Vulkan worker thread every 4 draws and woke the worker with a condition-variable
-  notify each time; on Android every notify is a futex system call, and the worker made another one per chunk. Doris
-  hands work over every 16 draws and only wakes a thread that is actually asleep (build 11 profile: these calls were
-  about 12% of the GPU emulation thread and 9% of the worker).
-* Eden submitted every 512 draws even in the middle of a render pass. A submit ends the render pass, and on a tiled
-  GPU like Adreno the rest of that pass then has to store and reload all its attachments. Doris waits for a moment
-  when no render pass is open (up to 2048 draws).
+* Eden woke its Vulkan worker thread with a condition-variable notify every time it handed over work (every 4 draws),
+  and the worker made another one per chunk; on Android every notify is a futex system call. Doris only notifies a
+  thread that is actually asleep (build 11 profile: these calls were about 12% of the GPU emulation thread and 9% of
+  the worker). The timing of hand-offs and submits is Eden's own.
+* Build 12 also handed work over every 16 draws and held submits back while a render pass was open. That started the
+  GPU later in each frame and caused hitches, so it was undone in build 13.
 
 ## Frame generation after a hitch
 

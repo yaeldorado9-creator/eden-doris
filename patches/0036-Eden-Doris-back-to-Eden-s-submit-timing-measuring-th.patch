@@ -1,0 +1,80 @@
+From f7347ac4f7473953cab0ea6c66bbac0462de7513 Mon Sep 17 00:00:00 2001
+From: "Eden (Doris) build" <doris@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 17:31:27 -0500
+Subject: [PATCH 36/36] Eden (Doris): back to Eden's submit timing; measuring
+ threads on efficiency cores
+
+Build 12 handed work to the Vulkan worker every 16 draws and held submits
+back (up to 2048 draws) while a render pass was open. In heavy areas that
+starts the GPU later in each frame, so frames miss their slot and the game
+hitches. FlushWork is Eden's again: hand-off every 4 draws, submit every 512.
+(Waking the worker only when it is asleep stays; it changes no timing.)
+
+The performance report and profiler threads now run on the efficiency cores.
+---
+ src/common/doris_perf.cpp                        |  2 ++
+ src/common/doris_profiler.cpp                    |  2 ++
+ src/video_core/renderer_vulkan/vk_rasterizer.cpp | 12 ++----------
+ 3 files changed, 6 insertions(+), 10 deletions(-)
+
+diff --git a/src/common/doris_perf.cpp b/src/common/doris_perf.cpp
+index 2435646b1..bef03391c 100644
+--- a/src/common/doris_perf.cpp
++++ b/src/common/doris_perf.cpp
+@@ -243,6 +243,8 @@ int ReadThreadCpu(int tid) {
+ void ReportLoop() {
+     Common::SetCurrentThreadName("DorisPerf");
+     Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
++    // Eden (Doris): measuring must never take a big core from the emulator.
++    Common::SetCurrentThreadToEfficiencyCores();
+ #ifdef DORIS_PERF_PROCFS
+     const double ticks_per_second = static_cast<double>(sysconf(_SC_CLK_TCK));
+     auto previous_threads = ReadThreads();
+diff --git a/src/common/doris_profiler.cpp b/src/common/doris_profiler.cpp
+index 1f83e1f9f..d142b1f51 100644
+--- a/src/common/doris_profiler.cpp
++++ b/src/common/doris_profiler.cpp
+@@ -156,6 +156,8 @@ struct StackHash {
+ void WriterLoop() {
+     Common::SetCurrentThreadName("DorisProfiler");
+     Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
++    // Eden (Doris): measuring must never take a big core from the emulator.
++    Common::SetCurrentThreadToEfficiencyCores();
+     const auto start = std::chrono::steady_clock::now();
+     // Totals since the profiler started, per thread: address -> count, and stack -> count.
+     std::array<std::unordered_map<uintptr_t, uint64_t>, MAX_THREADS> pc_totals, lr_totals;
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 2471103a2..501a82575 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1042,25 +1042,17 @@ void RasterizerVulkan::LoadDiskResources(u64 title_id, std::stop_token stop_load
+ void RasterizerVulkan::FlushWork() {
+ #ifdef __ANDROID__
+     static constexpr u32 DRAWS_TO_DISPATCH = 512;
+-    // Eden (Doris): hand recorded work to the Vulkan worker every 16 draws, not every 4. Each
+-    // hand-off costs a queue lock and (when the worker sleeps) a wake-up system call; 16 draws
+-    // are still only a fraction of a millisecond of work.
+-    static constexpr u32 CHECK_MASK = 15;
++    static constexpr u32 CHECK_MASK = 3;
+ #else
+     static constexpr u32 DRAWS_TO_DISPATCH = 4096;
+     static constexpr u32 CHECK_MASK = 7;
+ #endif // __ANDROID__
+-    // Eden (Doris): a submission ends the open render pass, and on a tiled GPU (Adreno) the second
+-    // half then has to store and reload every attachment. Wait for a point where no render pass
+-    // is open, up to 4x the usual number of draws.
+-    static constexpr u32 MAX_DRAWS_TO_DISPATCH = DRAWS_TO_DISPATCH * 4;
+ 
+     static_assert(DRAWS_TO_DISPATCH % (CHECK_MASK + 1) == 0);
+     if ((++draw_counter & CHECK_MASK) != CHECK_MASK) {
+         return;
+     }
+-    if (draw_counter < DRAWS_TO_DISPATCH ||
+-        (scheduler.IsRenderPassActive() && draw_counter < MAX_DRAWS_TO_DISPATCH)) {
++    if (draw_counter < DRAWS_TO_DISPATCH) {
+         scheduler.DispatchWork();
+         return;
+     }
+-- 
+2.43.0
+

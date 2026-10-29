@@ -1,7 +1,7 @@
 From aa93116021de85a4fdbf877a7b5eba5dc2f922c4 Mon Sep 17 00:00:00 2001
 From: alvindimas05 <alvin.dimas.praditya@gmail.com>
 Date: Fri, 23 Oct 2026 11:20:18 +0700
-Subject: [PATCH 24/35] [video_core] avoid strict aliasing in descriptor
+Subject: [PATCH 24/36] [video_core] avoid strict aliasing in descriptor
  compare and single-word macro insert
 
 (cherry picked from commit e89ab357b1d273756ae3ba040ba8424a7db3c53f)
