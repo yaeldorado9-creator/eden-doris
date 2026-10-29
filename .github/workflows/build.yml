@@ -91,6 +91,14 @@ jobs:
           test -n "$APK"
           cp -v "$APK" "out/Eden-Doris-${{ github.run_number }}.apk"
           sha256sum out/*.apk | tee out/SHA256SUMS.txt
+          # Unstripped library, for turning Doris profiler offsets into function names.
+          SYM=$(find eden/src/android/app/build/intermediates -name libyuzu-android.so -path '*arm64-v8a*' \
+                  -not -path '*stripped*' | head -n 1)
+          if [ -n "$SYM" ]; then
+            echo "symbols from $SYM"; ls -la "$SYM"
+            readelf -S "$SYM" | grep -E "\.symtab|\.debug_info" || echo "(no .symtab/.debug_info)"
+            (cd "$(dirname "$SYM")" && zip -9 -q "$GITHUB_WORKSPACE/out/libyuzu-android-symbols-${{ github.run_number }}.zip" libyuzu-android.so)
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
@@ -112,5 +120,5 @@ jobs:
             cat patch-log.txt
             echo '```'
           } > notes.md
-          gh release create "$DORIS_TAG" out/*.apk out/SHA256SUMS.txt \
+          gh release create "$DORIS_TAG" out/*.apk out/SHA256SUMS.txt out/*.zip \
             --title "Eden (Doris) ${{ github.run_number }}" --notes-file notes.md --target "${{ github.sha }}"

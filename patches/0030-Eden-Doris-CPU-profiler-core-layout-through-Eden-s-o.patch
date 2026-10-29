@@ -1,0 +1,692 @@
+From 6999cec007d4a33980a5b54b77f13d848cc044cf Mon Sep 17 00:00:00 2001
+From: "Eden (Doris) build" <doris@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 12:39:39 -0500
+Subject: [PATCH 30/30] Eden (Doris): CPU profiler; core layout through Eden's
+ own core groups (off by default)
+
+- doris_profiler (off by default): CPU-time timers sample the GPU thread and VulkanWorker about once
+  per millisecond of their CPU time (never while they sleep); totals of PC and LR, as module+offset,
+  are written to doris_profile.txt in the log folder every 20 seconds
+- core layout now uses Eden's CoreGroup system (new Prime and Middle groups), so its periodic
+  policy refresh keeps the placement instead of undoing it; default changed to off (Android decides)
+---
+ .../features/settings/model/BooleanSetting.kt |   1 +
+ .../settings/model/view/SettingsItem.kt       |   7 +
+ .../settings/ui/SettingsFragmentPresenter.kt  |   1 +
+ .../app/src/main/res/values/arrays.xml        |   4 +-
+ .../app/src/main/res/values/strings.xml       |   2 +
+ src/common/CMakeLists.txt                     |   2 +
+ src/common/doris_cores.cpp                    | 136 +----------
+ src/common/doris_profiler.cpp                 | 222 ++++++++++++++++++
+ src/common/doris_profiler.h                   |  15 ++
+ src/common/settings.h                         |   6 +-
+ src/common/thread.cpp                         |  46 +++-
+ src/common/thread.h                           |   3 +
+ src/video_core/gpu_thread.cpp                 |   2 +
+ .../renderer_vulkan/vk_scheduler.cpp          |   2 +
+ 14 files changed, 319 insertions(+), 130 deletions(-)
+ create mode 100644 src/common/doris_profiler.cpp
+ create mode 100644 src/common/doris_profiler.h
+
+diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/BooleanSetting.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/BooleanSetting.kt
+index eb82dd16e..041e14715 100644
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/BooleanSetting.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/BooleanSetting.kt
+@@ -29,6 +29,7 @@ enum class BooleanSetting(override val key: String) : AbstractBooleanSetting {
+     RENDERER_ASYNCHRONOUS_SHADERS("use_asynchronous_shaders"),
+     RENDERER_REACTIVE_FLUSHING("use_reactive_flushing"),
+     DORIS_PERF_REPORT("doris_perf_report"),
++    DORIS_PROFILER("doris_profiler"),
+     ENABLE_BUFFER_HISTORY("enable_buffer_history"),
+     USE_OPTIMIZED_VERTEX_BUFFERS("use_optimized_vertex_buffers"),
+     ENABLE_GPU_BUFFER_READBACK("enable_gpu_buffer_readback"),
+diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt
+index fc963151e..8715530cb 100644
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt
+@@ -186,6 +186,13 @@ abstract class SettingsItem(
+                     valuesId = R.array.dorisShaderLoopLimitValues
+                 )
+             )
++            put(
++                SwitchSetting(
++                    BooleanSetting.DORIS_PROFILER,
++                    titleId = R.string.doris_profiler,
++                    descriptionId = R.string.doris_profiler_description
++                )
++            )
+             put(
+                 SwitchSetting(
+                     BooleanSetting.DORIS_PERF_REPORT,
+diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt
+index 92423a4e6..c8cbed485 100644
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt
+@@ -352,6 +352,7 @@ class SettingsFragmentPresenter(
+             add(HeaderSetting(R.string.doris_experiments))
+ 
+             add(BooleanSetting.DORIS_PERF_REPORT.key)
++            add(BooleanSetting.DORIS_PROFILER.key)
+             add(IntSetting.DORIS_CORE_LAYOUT.key)
+             add(IntSetting.DORIS_GPU_BARRIERS.key)
+             add(IntSetting.DORIS_TEXTURE_DECODE_WAIT.key)
+diff --git a/src/android/app/src/main/res/values/arrays.xml b/src/android/app/src/main/res/values/arrays.xml
+index a07371cd6..96916372e 100644
+--- a/src/android/app/src/main/res/values/arrays.xml
++++ b/src/android/app/src/main/res/values/arrays.xml
+@@ -648,13 +648,13 @@
+     </integer-array>
+ 
+     <string-array name="dorisCoreLayoutEntries">
+-        <item>@string/doris_cores_doris</item>
+         <item>@string/doris_cores_system</item>
++        <item>@string/doris_cores_doris</item>
+     </string-array>
+ 
+     <integer-array name="dorisCoreLayoutValues">
+-        <item>1</item>
+         <item>0</item>
++        <item>1</item>
+     </integer-array>
+ 
+     <string-array name="dorisGpuBarriersEntries">
+diff --git a/src/android/app/src/main/res/values/strings.xml b/src/android/app/src/main/res/values/strings.xml
+index 2ecc59a48..8e032eb78 100644
+--- a/src/android/app/src/main/res/values/strings.xml
++++ b/src/android/app/src/main/res/values/strings.xml
+@@ -602,6 +602,8 @@
+     <string name="doris_experiments">Eden (Doris) experiments</string>
+     <string name="doris_perf_report">Performance report</string>
+     <string name="doris_perf_report_description">While a game runs, writes a short summary to the log every 10 seconds: frame times, how busy each emulator thread is, CPU and GPU clocks, GPU load and battery temperature. Share it with Share debug logs.</string>
++    <string name="doris_profiler">CPU profiler</string>
++    <string name="doris_profiler_description">For Doris development. Records where the graphics thread and the Vulkan worker spend their CPU time and saves it to doris_profile.txt in the log folder every 20 seconds. Costs a little performance while on. Takes effect the next time the game starts.</string>
+     <string name="doris_core_layout">Core layout</string>
+     <string name="doris_core_layout_description">Which CPU cores the heavy emulator threads use. Doris puts the GPU emulation thread, the busiest one, on the fastest core and keeps the other heavy threads on the middle cores, so they never slow each other down. Takes effect the next time the game starts.</string>
+     <string name="doris_cores_doris">Doris: GPU thread on the fastest core</string>
+diff --git a/src/common/CMakeLists.txt b/src/common/CMakeLists.txt
+index 6e8e3698c..cb6b65388 100644
+--- a/src/common/CMakeLists.txt
++++ b/src/common/CMakeLists.txt
+@@ -103,6 +103,8 @@ add_library(
+     doris_cores.h
+     doris_perf.cpp
+     doris_perf.h
++    doris_profiler.cpp
++    doris_profiler.h
+     settings.cpp
+     settings.h
+     settings_common.cpp
+diff --git a/src/common/doris_cores.cpp b/src/common/doris_cores.cpp
+index 7eec1a8e7..056b29856 100644
+--- a/src/common/doris_cores.cpp
++++ b/src/common/doris_cores.cpp
+@@ -3,143 +3,27 @@
+ 
+ #include "common/doris_cores.h"
+ 
+-#include <algorithm>
+-#include <cstdlib>
+-#include <fstream>
+-#include <mutex>
+-#include <sstream>
+-#include <string>
+-#include <vector>
+-
+-#if defined(__linux__) || defined(__ANDROID__)
+-#include <sched.h>
+-#define DORIS_CORES_AFFINITY 1
+-#endif
+-
+-#include <fmt/format.h>
++#include <atomic>
+ 
+ #include "common/logging.h"
+ #include "common/settings.h"
++#include "common/thread.h"
+ 
+ namespace Doris::Cores {
+-namespace {
+-
+-struct Layout {
+-    std::vector<int> gpu;    // cores for Role::Gpu
+-    std::vector<int> worker; // cores for Role::Worker
+-    bool valid{};
+-};
+-
+-std::string ReadFirstLine(const std::string& path) {
+-    std::ifstream file(path);
+-    std::string line;
+-    if (file) {
+-        std::getline(file, line);
+-    }
+-    return line;
+-}
+-
+-/// "0 1 2" or "0-2" or "0-2,4" -> {0,1,2,(4)}
+-std::vector<int> ParseCpuList(std::string text) {
+-    std::replace(text.begin(), text.end(), ',', ' ');
+-    std::vector<int> cpus;
+-    std::istringstream stream(text);
+-    for (std::string token; stream >> token;) {
+-        const size_t dash = token.find('-');
+-        if (dash == std::string::npos) {
+-            cpus.push_back(std::atoi(token.c_str()));
+-        } else {
+-            const int first = std::atoi(token.substr(0, dash).c_str());
+-            const int last = std::atoi(token.substr(dash + 1).c_str());
+-            for (int cpu = first; cpu <= last; ++cpu) {
+-                cpus.push_back(cpu);
+-            }
+-        }
+-    }
+-    return cpus;
+-}
+-
+-std::string Describe(const std::vector<int>& cpus) {
+-    std::string out;
+-    for (const int cpu : cpus) {
+-        out += fmt::format("{}{}", out.empty() ? "" : ",", cpu);
+-    }
+-    return out;
+-}
+-
+-/// Groups the cores into clusters by maximum frequency (from cpufreq policies). With three or
+-/// more clusters (prime / middle / little, as on Snapdragon 8 Gen 2) the GPU thread gets the
+-/// fastest cluster and the workers get the middle ones. With two clusters, both roles share the
+-/// big cluster. With one, there is nothing to do.
+-Layout DetectLayout() {
+-    struct Cluster {
+-        long long max_freq{};
+-        std::vector<int> cpus;
+-    };
+-    std::vector<Cluster> clusters;
+-    for (int policy = 0; policy < 16; ++policy) {
+-        const std::string base = fmt::format("/sys/devices/system/cpu/cpufreq/policy{}/", policy);
+-        const std::string related = ReadFirstLine(base + "related_cpus");
+-        if (related.empty()) {
+-            continue;
+-        }
+-        Cluster cluster;
+-        cluster.max_freq = std::atoll(ReadFirstLine(base + "cpuinfo_max_freq").c_str());
+-        cluster.cpus = ParseCpuList(related);
+-        if (!cluster.cpus.empty()) {
+-            clusters.push_back(std::move(cluster));
+-        }
+-    }
+-    Layout layout;
+-    if (clusters.size() < 2) {
+-        return layout;
+-    }
+-    std::ranges::sort(clusters, [](const Cluster& a, const Cluster& b) {
+-        return a.max_freq > b.max_freq;
+-    });
+-    if (clusters.size() >= 3) {
+-        layout.gpu = clusters.front().cpus;
+-        for (size_t i = 1; i + 1 < clusters.size(); ++i) {
+-            layout.worker.insert(layout.worker.end(), clusters[i].cpus.begin(),
+-                                 clusters[i].cpus.end());
+-        }
+-    } else {
+-        layout.gpu = clusters.front().cpus;
+-        layout.worker = clusters.front().cpus;
+-    }
+-    layout.valid = !layout.gpu.empty() && !layout.worker.empty();
+-    if (layout.valid) {
+-        LOG_INFO(Frontend, "Doris cores: GPU thread on cpu {}, other emulator threads on cpu {}",
+-                 Describe(layout.gpu), Describe(layout.worker));
+-    }
+-    return layout;
+-}
+-
+-} // Anonymous namespace
+ 
+ void PinCurrentThread(Role role) {
+-#ifdef DORIS_CORES_AFFINITY
+     if (Settings::values.doris_core_layout.GetValue() == 0) {
+         return;
+     }
+-    static std::once_flag detect_flag;
+-    static Layout layout;
+-    std::call_once(detect_flag, [] { layout = DetectLayout(); });
+-    if (!layout.valid) {
+-        return;
+-    }
+-    const std::vector<int>& cpus = role == Role::Gpu ? layout.gpu : layout.worker;
+-    cpu_set_t set;
+-    CPU_ZERO(&set);
+-    for (const int cpu : cpus) {
+-        CPU_SET(cpu, &set);
+-    }
+-    if (sched_setaffinity(0, sizeof(set), &set) != 0) {
+-        LOG_WARNING(Frontend, "Doris cores: could not pin thread to cpu {}", Describe(cpus));
++    // Goes through Eden's own core groups, so its periodic policy refresh keeps the placement
++    // instead of undoing it.
++    Common::SetCurrentThreadToDorisCores(role == Role::Gpu);
++    static std::atomic<unsigned> logged{0};
++    const unsigned bit = 1u << static_cast<unsigned>(role);
++    if ((logged.fetch_or(bit) & bit) == 0) {
++        LOG_INFO(Frontend, "Doris cores: {} threads placed on the {} cores",
++                 role == Role::Gpu ? "GPU" : "other emulator", role == Role::Gpu ? "prime" : "middle");
+     }
+-#else
+-    (void)role;
+-#endif
+ }
+ 
+ } // namespace Doris::Cores
+diff --git a/src/common/doris_profiler.cpp b/src/common/doris_profiler.cpp
+new file mode 100644
+index 000000000..e91d5a8b0
+--- /dev/null
++++ b/src/common/doris_profiler.cpp
+@@ -0,0 +1,222 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden (Doris)
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#include "common/doris_profiler.h"
++
++#if (defined(__linux__) || defined(__ANDROID__)) && defined(__aarch64__)
++#define DORIS_PROFILER_ENABLED 1
++#endif
++
++#ifdef DORIS_PROFILER_ENABLED
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <cstring>
++#include <ctime>
++#include <fstream>
++#include <map>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <unordered_map>
++#include <vector>
++
++#include <dlfcn.h>
++#include <pthread.h>
++#include <signal.h>
++#include <sys/syscall.h>
++#include <time.h>
++#include <ucontext.h>
++#include <unistd.h>
++
++#include <fmt/format.h>
++
++#include "common/fs/path_util.h"
++#include "common/logging.h"
++#include "common/settings.h"
++#include "common/thread.h"
++
++namespace Doris::Profiler {
++namespace {
++
++constexpr int MAX_THREADS = 8;
++constexpr uint32_t CAPACITY = 1u << 15;             // samples per buffer
++constexpr long PERIOD_NS = 1'000'000;                // 1 ms of the thread's CPU time
++constexpr auto WRITE_INTERVAL = std::chrono::seconds{20};
++
++struct Sample {
++    uintptr_t pc;
++    uintptr_t lr;
++};
++
++struct Slot {
++    char label[32]{};
++    std::atomic<uint32_t> active{0};                 // buffer the signal handler writes to
++    std::array<std::atomic<uint32_t>, 2> count{};
++    std::array<std::array<Sample, CAPACITY>, 2> samples{};
++};
++
++std::array<Slot, MAX_THREADS> slots;
++std::atomic<int> slot_count{0};
++std::once_flag start_flag;
++
++void Handler(int, siginfo_t* info, void* raw_context) {
++    const int index = info->si_value.sival_int;
++    if (index < 0 || index >= MAX_THREADS) {
++        return;
++    }
++    const auto* context = static_cast<const ucontext_t*>(raw_context);
++    Slot& slot = slots[index];
++    const uint32_t buffer = slot.active.load(std::memory_order_relaxed) & 1;
++    const uint32_t position = slot.count[buffer].fetch_add(1, std::memory_order_relaxed);
++    if (position < CAPACITY) {
++        slot.samples[buffer][position] = {static_cast<uintptr_t>(context->uc_mcontext.pc),
++                                          static_cast<uintptr_t>(context->uc_mcontext.regs[30])};
++    }
++}
++
++struct Location {
++    std::string module;
++    uintptr_t offset;
++};
++
++Location Resolve(uintptr_t address, std::unordered_map<uintptr_t, Location>& cache) {
++    if (const auto it = cache.find(address); it != cache.end()) {
++        return it->second;
++    }
++    Location location{"?", address};
++    Dl_info info{};
++    if (address != 0 && dladdr(reinterpret_cast<void*>(address), &info) != 0 &&
++        info.dli_fname != nullptr) {
++        const std::string path = info.dli_fname;
++        location.module = path.substr(path.find_last_of('/') + 1);
++        location.offset = address - reinterpret_cast<uintptr_t>(info.dli_fbase);
++    }
++    cache.emplace(address, location);
++    return location;
++}
++
++void WriterLoop() {
++    Common::SetCurrentThreadName("DorisProfiler");
++    Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
++    const auto start = std::chrono::steady_clock::now();
++    // Totals since the profiler started, per thread: address -> count.
++    std::array<std::unordered_map<uintptr_t, uint64_t>, MAX_THREADS> pc_totals, lr_totals;
++    std::array<uint64_t, MAX_THREADS> sample_totals{};
++    std::unordered_map<uintptr_t, Location> cache;
++    const std::string path =
++        Common::FS::GetEdenPathString(Common::FS::EdenPath::LogDir) + "/doris_profile.txt";
++
++    while (true) {
++        std::this_thread::sleep_for(WRITE_INTERVAL);
++        const int threads = slot_count.load();
++        for (int index = 0; index < threads; ++index) {
++            Slot& slot = slots[index];
++            const uint32_t old = slot.active.fetch_xor(1) & 1;
++            std::this_thread::sleep_for(std::chrono::milliseconds{2});
++            const uint32_t taken = std::min(slot.count[old].load(), CAPACITY);
++            for (uint32_t i = 0; i < taken; ++i) {
++                ++pc_totals[index][slot.samples[old][i].pc];
++                ++lr_totals[index][slot.samples[old][i].lr];
++            }
++            sample_totals[index] += taken;
++            slot.count[old].store(0);
++        }
++
++        std::ofstream file(path, std::ios::trunc);
++        if (!file) {
++            LOG_WARNING(Frontend, "Doris profiler: could not write {}", path);
++            continue;
++        }
++        const auto seconds =
++            std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() -
++                                                             start)
++                .count();
++        file << fmt::format("# Doris profile: {} s, one sample per ms of CPU time\n", seconds);
++        for (int index = 0; index < threads; ++index) {
++            const auto write_table = [&](const char* kind,
++                                         const std::unordered_map<uintptr_t, uint64_t>& totals) {
++                // Fold addresses into module + offset, then sort by count.
++                std::map<std::pair<std::string, uintptr_t>, uint64_t> folded;
++                for (const auto& [address, count] : totals) {
++                    const Location location = Resolve(address, cache);
++                    folded[{location.module, location.offset}] += count;
++                }
++                std::vector<std::pair<uint64_t, std::pair<std::string, uintptr_t>>> rows;
++                rows.reserve(folded.size());
++                for (const auto& [key, count] : folded) {
++                    rows.emplace_back(count, key);
++                }
++                std::ranges::sort(rows, [](const auto& a, const auto& b) { return a.first > b.first; });
++                file << fmt::format("[{} {}] samples {}\n", slots[index].label, kind,
++                                    sample_totals[index]);
++                for (size_t i = 0; i < rows.size() && i < 4000; ++i) {
++                    file << fmt::format("{} {:#x} {}\n", rows[i].second.first, rows[i].second.second,
++                                        rows[i].first);
++                }
++            };
++            write_table("pc", pc_totals[index]);
++            write_table("lr", lr_totals[index]);
++        }
++        LOG_INFO(Frontend, "Doris profiler: wrote {} ({} s)", path, seconds);
++    }
++}
++
++} // Anonymous namespace
++
++void RegisterCurrentThread(const char* label) {
++    if (!Settings::values.doris_profiler.GetValue()) {
++        return;
++    }
++    std::call_once(start_flag, [] {
++        struct sigaction action {};
++        action.sa_sigaction = Handler;
++        action.sa_flags = SA_SIGINFO | SA_RESTART;
++        sigemptyset(&action.sa_mask);
++        sigaction(SIGPROF, &action, nullptr);
++        std::thread(WriterLoop).detach();
++    });
++    const int index = slot_count.fetch_add(1);
++    if (index >= MAX_THREADS) {
++        return;
++    }
++    std::snprintf(slots[index].label, sizeof(slots[index].label), "%s", label);
++
++    clockid_t clock{};
++    if (pthread_getcpuclockid(pthread_self(), &clock) != 0) {
++        LOG_WARNING(Frontend, "Doris profiler: no CPU clock for {}", label);
++        return;
++    }
++    sigevent event{};
++    event.sigev_notify = SIGEV_THREAD_ID;
++    event.sigev_signo = SIGPROF;
++    event.sigev_value.sival_int = index;
++#ifdef sigev_notify_thread_id
++    event.sigev_notify_thread_id = static_cast<pid_t>(syscall(SYS_gettid));
++#else
++    event._sigev_un._tid = static_cast<pid_t>(syscall(SYS_gettid));
++#endif
++    timer_t timer{};
++    if (timer_create(clock, &event, &timer) != 0) {
++        LOG_WARNING(Frontend, "Doris profiler: could not create the timer for {}", label);
++        return;
++    }
++    itimerspec spec{};
++    spec.it_interval.tv_nsec = PERIOD_NS;
++    spec.it_value.tv_nsec = PERIOD_NS;
++    timer_settime(timer, 0, &spec, nullptr);
++    LOG_INFO(Frontend, "Doris profiler: sampling thread {}", label);
++}
++
++} // namespace Doris::Profiler
++
++#else
++
++namespace Doris::Profiler {
++void RegisterCurrentThread(const char*) {}
++} // namespace Doris::Profiler
++
++#endif
+diff --git a/src/common/doris_profiler.h b/src/common/doris_profiler.h
+new file mode 100644
+index 000000000..69215f115
+--- /dev/null
++++ b/src/common/doris_profiler.h
+@@ -0,0 +1,15 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden (Doris)
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++namespace Doris::Profiler {
++
++/// Starts sampling the calling thread, if the "CPU profiler" setting is on: about once per
++/// millisecond of CPU time the thread uses (never while it sleeps), its program counter and return
++/// address are recorded. Every 20 seconds the totals so far are written to doris_profile.txt in the
++/// log folder, as module + offset, for symbolizing against the build's unstripped library.
++/// Only for host threads (GPU, Vulkan worker); never for threads that run guest code.
++void RegisterCurrentThread(const char* label);
++
++} // namespace Doris::Profiler
+diff --git a/src/common/settings.h b/src/common/settings.h
+index 8d7144dca..4916c1422 100644
+--- a/src/common/settings.h
++++ b/src/common/settings.h
+@@ -617,8 +617,12 @@ struct Values {
+     // Which cores the heavy emulator threads run on. 0 = let Android decide (Eden),
+     // 1 = Doris: the GPU emulation thread on the fastest core (prime), the other heavy threads on
+     // the middle cores, so they never compete with it. Read when a game starts.
+-    SwitchableSetting<u32> doris_core_layout{linkage, 1, "doris_core_layout",
++    SwitchableSetting<u32> doris_core_layout{linkage, 0, "doris_core_layout",
+                                              Category::RendererAdvanced};
++    // Samples where the GPU thread and the Vulkan worker spend their CPU time and writes the totals
++    // to doris_profile.txt in the log folder every 20 seconds. Read when a game starts.
++    SwitchableSetting<bool> doris_profiler{linkage, false, "doris_profiler",
++                                           Category::RendererAdvanced};
+     // Writes a performance summary to the log every 10 seconds while a game runs.
+     SwitchableSetting<bool> doris_perf_report{linkage, false, "doris_perf_report",
+                                               Category::RendererAdvanced};
+diff --git a/src/common/thread.cpp b/src/common/thread.cpp
+index 7b4dec3dc..f6f94c4b2 100644
+--- a/src/common/thread.cpp
++++ b/src/common/thread.cpp
+@@ -105,6 +105,10 @@ enum class CoreGroup {
+     Unrestricted,
+     Performance,
+     Efficiency,
++    // Eden (Doris): the fastest performance cores (prime) and the other performance cores (middle).
++    // When they can't be told apart, both behave like Performance.
++    Prime,
++    Middle,
+ };
+ 
+ struct ThreadPolicy {
+@@ -125,6 +129,8 @@ struct CpuTopologyState {
+     cpu_set_t allowed{};
+     cpu_set_t performance{};
+     cpu_set_t efficiency{};
++    cpu_set_t prime{};
++    cpu_set_t middle{};
+     bool separated = false;
+     bool initialized = false;
+ 
+@@ -243,6 +249,8 @@ void ComputeTopologyLocked(CpuTopologyState& state) {
+     CPU_ZERO(&state.allowed);
+     CPU_ZERO(&state.performance);
+     CPU_ZERO(&state.efficiency);
++    CPU_ZERO(&state.prime);
++    CPU_ZERO(&state.middle);
+ 
+     if (sched_getaffinity(getpid(), sizeof(state.allowed), &state.allowed) != 0) {
+         LOG_WARNING(Common, "Could not query process CPU affinity: {}",
+@@ -295,6 +303,20 @@ void ComputeTopologyLocked(CpuTopologyState& state) {
+         return;
+     }
+ 
++    // Eden (Doris): split the performance cores into the fastest ones and the rest.
++    for (const auto& core : cores) {
++        if (core.weight == fastest && CPU_ISSET(core.cpu, &state.performance)) {
++            CPU_SET(core.cpu, &state.prime);
++        }
++    }
++    for (s32 cpu = 0; cpu < total; ++cpu) {
++        if (CPU_ISSET(cpu, &state.performance) && !CPU_ISSET(cpu, &state.prime)) {
++            CPU_SET(cpu, &state.middle);
++        }
++    }
++    LOG_INFO(Common, "CPU topology: {} prime cores, {} middle cores", CPU_COUNT(&state.prime),
++             CPU_COUNT(&state.middle));
++
+     for (s32 cpu = 0; cpu < total; ++cpu) {
+         if (CPU_ISSET(cpu, &state.allowed) && !CPU_ISSET(cpu, &state.performance)) {
+             CPU_SET(cpu, &state.efficiency);
+@@ -333,7 +355,21 @@ bool ApplyCoreGroupLocked(CpuTopologyState& state, pid_t tid, CoreGroup group,
+     const bool restrict_group = group != CoreGroup::Unrestricted && state.separated;
+     const cpu_set_t* mask = &state.allowed;
+     if (restrict_group) {
+-        mask = group == CoreGroup::Performance ? &state.performance : &state.efficiency;
++        const bool tiers = CPU_COUNT(&state.prime) > 0 && CPU_COUNT(&state.middle) > 0;
++        switch (group) {
++        case CoreGroup::Efficiency:
++            mask = &state.efficiency;
++            break;
++        case CoreGroup::Prime:
++            mask = tiers ? &state.prime : &state.performance;
++            break;
++        case CoreGroup::Middle:
++            mask = tiers ? &state.middle : &state.performance;
++            break;
++        default:
++            mask = &state.performance;
++            break;
++        }
+     }
+     if (CPU_COUNT(mask) == 0) {
+         return false;
+@@ -559,6 +595,14 @@ void SetCurrentThreadToEfficiencyCores() {
+ #endif
+ }
+ 
++void SetCurrentThreadToDorisCores(bool fastest) {
++#if defined(__ANDROID__)
++    SetCurrentThreadCoreGroup(fastest ? CoreGroup::Prime : CoreGroup::Middle);
++#else
++    (void)fastest;
++#endif
++}
++
+ void SetCurrentThreadToBackgroundWork() {
+ #if defined(__ANDROID__)
+     ADPF::AddCurrentThread(ADPF::Session::Background);
+diff --git a/src/common/thread.h b/src/common/thread.h
+index 4a3629593..a372c8ecb 100644
+--- a/src/common/thread.h
++++ b/src/common/thread.h
+@@ -108,6 +108,9 @@ enum class ThreadPlacement : u32 {
+ void SetCurrentThreadPriority(ThreadPriority new_priority);
+ void SetCurrentThreadName(const char* name);
+ void SetCurrentThreadToPerformanceCores();
++/// Eden (Doris): keep the calling thread on the fastest cores (prime) or on the other performance
++/// cores (middle). Recorded like the other core groups, so it survives policy refreshes.
++void SetCurrentThreadToDorisCores(bool fastest);
+ void SetCurrentThreadToEfficiencyCores();
+ void SetCurrentThreadToBackgroundWork();
+ void SetCurrentThreadToAllCores();
+diff --git a/src/video_core/gpu_thread.cpp b/src/video_core/gpu_thread.cpp
+index 1f488e45f..31355b803 100644
+--- a/src/video_core/gpu_thread.cpp
++++ b/src/video_core/gpu_thread.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include "common/doris_profiler.h"
+ #include "common/doris_cores.h"
+ #include "common/assert.h"
+ #include "common/scope_exit.h"
+@@ -33,6 +34,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
+         Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
+         Common::SetCurrentThreadToPerformanceCores();
+         Doris::Cores::PinCurrentThread(Doris::Cores::Role::Gpu);
++        Doris::Profiler::RegisterCurrentThread("GPU");
+         system.RegisterHostThread();
+ 
+         auto current_context = context.Acquire();
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index 70f04c3d2..dc188124d 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <fmt/format.h>
+ 
++#include "common/doris_profiler.h"
+ #include "common/doris_cores.h"
+ #include "video_core/renderer_vulkan/vk_query_cache.h"
+ 
+@@ -273,6 +274,7 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
+     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
+     Common::SetCurrentThreadToPerformanceCores();
+     Doris::Cores::PinCurrentThread(Doris::Cores::Role::Worker);
++    Doris::Profiler::RegisterCurrentThread("VulkanWorker");
+ 
+     const auto TryPopQueue{[this](auto& work) -> bool {
+         if (work_queue.empty()) {
+-- 
+2.43.0
+
