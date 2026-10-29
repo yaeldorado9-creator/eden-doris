@@ -57,6 +57,13 @@ effect the next time the game starts.
 * **Monster Hunter Rise record fix**: always (PR #4324, default), only in Monster Hunter Rise, or off. The log notes
   every time it rewrites a copy, and in which game.
 
+## Frame generation after a hitch
+
+Eden's frame generation pacer stops generating frames for 1 second after any frame that takes longer than 100 ms
+(a shader compile, a loading hitch). With a fixed multiplier, that turned every hitch into a second of half-rate
+output. Doris resumes after about 100 ms in fixed-multiplier mode (generation still waits for two steady frames in a
+row); the target-rate mode is unchanged.
+
 ## Speed-ups from eden-lun
 
 Doris carries 20 of the CPU-side speed-ups that [eden-lun](https://github.com/luneflu/eden-lun) (by alvindimas05)

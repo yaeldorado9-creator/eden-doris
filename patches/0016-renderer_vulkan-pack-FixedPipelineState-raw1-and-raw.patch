@@ -1,7 +1,7 @@
 From 0ff8a04d1bddaf9c21eb46de82a7b0c4431a750d Mon Sep 17 00:00:00 2001
 From: alvindimas05 <alvin.dimas.praditya@gmail.com>
 Date: Fri, 23 Oct 2026 01:12:42 +0700
-Subject: [PATCH 16/33] [renderer_vulkan] pack FixedPipelineState raw1 and raw2
+Subject: [PATCH 16/34] [renderer_vulkan] pack FixedPipelineState raw1 and raw2
  in single register-evaluated expressions
 
 (cherry picked from commit 1ef9a13c40bf50be9afa3a31a031b3a109e6426f)

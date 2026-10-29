@@ -1,0 +1,47 @@
+From ea79673bcd1cd1b944d1553ca2bf84ba46f6c76c Mon Sep 17 00:00:00 2001
+From: "Eden (Doris) build" <doris@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 14:02:19 -0500
+Subject: [PATCH 34/34] Eden (Doris): frame generation resumes about 100 ms
+ after a hitch, not 1 s
+
+Any frame that takes over 100 ms (a shader compile, a loading hitch) makes the
+frame generation pacer stabilize: no generated frames until the pause is over.
+That pause is 1 second, so with frame generation at a fixed multiplier every
+hitch became a full second of half-rate output, which looks like a stutter.
+With a fixed multiplier there is nothing to re-measure or probe, so resume
+after 100 ms (frame generation still needs two steady frames in a row before
+it generates again). The target-rate mode keeps the 1 second.
+---
+ .../renderer_vulkan/present/frame_gen_pacer.cpp          | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/src/video_core/renderer_vulkan/present/frame_gen_pacer.cpp b/src/video_core/renderer_vulkan/present/frame_gen_pacer.cpp
+index 78a8c83b5..603f1af54 100644
+--- a/src/video_core/renderer_vulkan/present/frame_gen_pacer.cpp
++++ b/src/video_core/renderer_vulkan/present/frame_gen_pacer.cpp
+@@ -27,6 +27,11 @@ constexpr f32 CREDIT_EPSILON = 1.0e-4f;
+ constexpr u32 MAX_PROBE_FAILURES = 4;
+ 
+ constexpr auto STABILIZATION_DURATION = std::chrono::seconds(1);
++// Eden (Doris): with a fixed multiplier there is nothing to measure or probe after a hitch, so
++// pausing generation for a whole second only turns every shader-compile or loading hitch into a
++// second of half-rate output (a visible stutter). Resume after a few frames instead; frame
++// generation still needs two steady frames in a row before it generates again.
++constexpr auto FIXED_MULTIPLIER_STABILIZATION_DURATION = std::chrono::milliseconds(100);
+ constexpr auto PROBE_DURATION = std::chrono::seconds(1);
+ constexpr auto DEFICIT_DURATION = std::chrono::seconds(1);
+ constexpr auto PROBE_STEP_DELAY = std::chrono::milliseconds(250);
+@@ -214,7 +219,9 @@ void FrameGenPacer::DeferEvaluations(Clock::duration amount) {
+ }
+ 
+ void FrameGenPacer::Stabilize(Clock::time_point now) {
+-    stable_until = now + STABILIZATION_DURATION;
++    const bool fixed_multiplier = Settings::values.frame_gen_target_rate.GetValue() == 0;
++    stable_until = now + (fixed_multiplier ? Clock::duration{FIXED_MULTIPLIER_STABILIZATION_DURATION}
++                                           : Clock::duration{STABILIZATION_DURATION});
+     probe_until.reset();
+     deficit_since.reset();
+     smoothed_interval = 0.0f;
+-- 
+2.43.0
+
