@@ -32,6 +32,9 @@ effect the next time the game starts.
   work. On Adreno this lets draws read culling results, indirect draw arguments and vertex data that aren't finished
   yet, so distant terrain, buildings and shadows can drop out for a frame. Doris uses real barriers. "Eden (as before)"
   switches back, for comparison; "+ tiled-cache barriers" also makes the game's tiled-cache barriers real.
+* **Core layout** (default: Doris). Puts Eden's GPU emulation thread, the busiest one, on the fastest CPU core (the
+  prime core on Snapdragon 8 Gen 2) and the other heavy emulator threads on the middle cores. "Let Android decide
+  (Eden)" switches back.
 * **Performance report** (default: off). While a game runs, writes a summary to the log every 10 seconds: frame
   times, how busy each emulator thread is (and on which core), CPU and GPU clocks, GPU load, battery temperature.
   Share it with **Share debug logs**.

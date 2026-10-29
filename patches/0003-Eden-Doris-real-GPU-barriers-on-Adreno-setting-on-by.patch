@@ -1,7 +1,7 @@
 From f23513bcfa1ab9f283f6e54d4deadc27dc5285b7 Mon Sep 17 00:00:00 2001
 From: "Eden (Doris) build" <doris@users.noreply.github.com>
 Date: Thu, 29 Oct 2026 09:40:52 -0500
-Subject: [PATCH 03/28] Eden (Doris): real GPU barriers on Adreno (setting, on
+Subject: [PATCH 03/29] Eden (Doris): real GPU barriers on Adreno (setting, on
  by default)
 
 Eden turns the game's wait-for-idle into vkCmdSetEvent + vkCmdWaitEvents with TOP_OF_PIPE as the

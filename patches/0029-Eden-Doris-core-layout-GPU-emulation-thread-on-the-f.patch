@@ -1,0 +1,441 @@
+From 1810ff4d7d40dde830a93eb3fd4dec5112fda00d Mon Sep 17 00:00:00 2001
+From: "Eden (Doris) build" <doris@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 12:05:36 -0500
+Subject: [PATCH 29/29] Eden (Doris): core layout - GPU emulation thread on the
+ fastest core (setting, on by default)
+
+The performance report from a Thor at ClusterTune's Medium underclock showed Eden's GPU thread as the
+busiest thread (up to ~75% of a core) mostly running on the A715 middle cores while the X3 prime core
+sat idle. Doris now pins the GPU thread to the fastest cpufreq cluster and the other heavy emulator
+threads (emulated CPU cores, VulkanWorker, VulkanPresent, GPUFencingThread, HostTiming) to the middle
+clusters, so they don't compete with it. On two-cluster CPUs both share the big cluster; on one
+cluster nothing changes. doris_core_layout 0 restores Eden's behaviour.
+---
+ .../features/settings/model/IntSetting.kt     |   1 +
+ .../settings/model/view/SettingsItem.kt       |   9 ++
+ .../settings/ui/SettingsFragmentPresenter.kt  |   1 +
+ .../app/src/main/res/values/arrays.xml        |  10 ++
+ .../app/src/main/res/values/strings.xml       |   4 +
+ src/common/CMakeLists.txt                     |   2 +
+ src/common/doris_cores.cpp                    | 145 ++++++++++++++++++
+ src/common/doris_cores.h                      |  20 +++
+ src/common/settings.h                         |   5 +
+ src/core/core_timing.cpp                      |   2 +
+ src/core/cpu_manager.cpp                      |   2 +
+ src/video_core/fence_manager.h                |   2 +
+ src/video_core/gpu_thread.cpp                 |   2 +
+ .../renderer_vulkan/vk_present_manager.cpp    |   2 +
+ .../renderer_vulkan/vk_scheduler.cpp          |   2 +
+ 15 files changed, 209 insertions(+)
+ create mode 100644 src/common/doris_cores.cpp
+ create mode 100644 src/common/doris_cores.h
+
+diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/IntSetting.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/IntSetting.kt
+index b53a5ec37..a25444ab7 100644
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/IntSetting.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/IntSetting.kt
+@@ -33,6 +33,7 @@ enum class IntSetting(override val key: String) : AbstractIntSetting {
+     DORIS_SHADER_LOOP_LIMIT("doris_shader_loop_limit"),
+     DORIS_MHR_FIX("doris_mhr_fix"),
+     DORIS_GPU_BARRIERS("doris_gpu_barriers"),
++    DORIS_CORE_LAYOUT("doris_core_layout"),
+     DORIS_ASYNC_SHADER_WAIT("doris_async_shader_wait_ms"),
+     DORIS_TEXTURE_DECODE_WAIT("doris_texture_decode_wait_ms"),
+     DORIS_TEXTURE_DECODE_THREADS("doris_texture_decode_threads"),
+diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt
+index f56a65b37..fc963151e 100644
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt
+@@ -193,6 +193,15 @@ abstract class SettingsItem(
+                     descriptionId = R.string.doris_perf_report_description
+                 )
+             )
++            put(
++                SingleChoiceSetting(
++                    IntSetting.DORIS_CORE_LAYOUT,
++                    titleId = R.string.doris_core_layout,
++                    descriptionId = R.string.doris_core_layout_description,
++                    choicesId = R.array.dorisCoreLayoutEntries,
++                    valuesId = R.array.dorisCoreLayoutValues
++                )
++            )
+             put(
+                 SingleChoiceSetting(
+                     IntSetting.DORIS_GPU_BARRIERS,
+diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt
+index 8e8848daf..92423a4e6 100644
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt
+@@ -352,6 +352,7 @@ class SettingsFragmentPresenter(
+             add(HeaderSetting(R.string.doris_experiments))
+ 
+             add(BooleanSetting.DORIS_PERF_REPORT.key)
++            add(IntSetting.DORIS_CORE_LAYOUT.key)
+             add(IntSetting.DORIS_GPU_BARRIERS.key)
+             add(IntSetting.DORIS_TEXTURE_DECODE_WAIT.key)
+             add(IntSetting.DORIS_TEXTURE_DECODE_THREADS.key)
+diff --git a/src/android/app/src/main/res/values/arrays.xml b/src/android/app/src/main/res/values/arrays.xml
+index f5b45badf..a07371cd6 100644
+--- a/src/android/app/src/main/res/values/arrays.xml
++++ b/src/android/app/src/main/res/values/arrays.xml
+@@ -647,6 +647,16 @@
+         <item>1</item>
+     </integer-array>
+ 
++    <string-array name="dorisCoreLayoutEntries">
++        <item>@string/doris_cores_doris</item>
++        <item>@string/doris_cores_system</item>
++    </string-array>
++
++    <integer-array name="dorisCoreLayoutValues">
++        <item>1</item>
++        <item>0</item>
++    </integer-array>
++
+     <string-array name="dorisGpuBarriersEntries">
+         <item>@string/doris_barriers_full</item>
+         <item>@string/doris_barriers_tiled</item>
+diff --git a/src/android/app/src/main/res/values/strings.xml b/src/android/app/src/main/res/values/strings.xml
+index d1b37432b..2ecc59a48 100644
+--- a/src/android/app/src/main/res/values/strings.xml
++++ b/src/android/app/src/main/res/values/strings.xml
+@@ -602,6 +602,10 @@
+     <string name="doris_experiments">Eden (Doris) experiments</string>
+     <string name="doris_perf_report">Performance report</string>
+     <string name="doris_perf_report_description">While a game runs, writes a short summary to the log every 10 seconds: frame times, how busy each emulator thread is, CPU and GPU clocks, GPU load and battery temperature. Share it with Share debug logs.</string>
++    <string name="doris_core_layout">Core layout</string>
++    <string name="doris_core_layout_description">Which CPU cores the heavy emulator threads use. Doris puts the GPU emulation thread, the busiest one, on the fastest core and keeps the other heavy threads on the middle cores, so they never slow each other down. Takes effect the next time the game starts.</string>
++    <string name="doris_cores_doris">Doris: GPU thread on the fastest core</string>
++    <string name="doris_cores_system">Let Android decide (Eden)</string>
+     <string name="doris_gpu_barriers">GPU barriers</string>
+     <string name="doris_gpu_barriers_description">How the game\'s \"wait until the GPU is done\" points are carried out. Eden\'s way lets later drawing read results that aren\'t finished yet on Adreno, which can make distant terrain, buildings and shadows drop out for a frame. Doris uses real barriers. Takes effect the next time the game starts.</string>
+     <string name="doris_barriers_eden">Eden (as before)</string>
+diff --git a/src/common/CMakeLists.txt b/src/common/CMakeLists.txt
+index c1c793825..6e8e3698c 100644
+--- a/src/common/CMakeLists.txt
++++ b/src/common/CMakeLists.txt
+@@ -99,6 +99,8 @@ add_library(
+     scm_rev.h
+     scope_exit.h
+     scratch_buffer.h
++    doris_cores.cpp
++    doris_cores.h
+     doris_perf.cpp
+     doris_perf.h
+     settings.cpp
+diff --git a/src/common/doris_cores.cpp b/src/common/doris_cores.cpp
+new file mode 100644
+index 000000000..7eec1a8e7
+--- /dev/null
++++ b/src/common/doris_cores.cpp
+@@ -0,0 +1,145 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden (Doris)
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#include "common/doris_cores.h"
++
++#include <algorithm>
++#include <cstdlib>
++#include <fstream>
++#include <mutex>
++#include <sstream>
++#include <string>
++#include <vector>
++
++#if defined(__linux__) || defined(__ANDROID__)
++#include <sched.h>
++#define DORIS_CORES_AFFINITY 1
++#endif
++
++#include <fmt/format.h>
++
++#include "common/logging.h"
++#include "common/settings.h"
++
++namespace Doris::Cores {
++namespace {
++
++struct Layout {
++    std::vector<int> gpu;    // cores for Role::Gpu
++    std::vector<int> worker; // cores for Role::Worker
++    bool valid{};
++};
++
++std::string ReadFirstLine(const std::string& path) {
++    std::ifstream file(path);
++    std::string line;
++    if (file) {
++        std::getline(file, line);
++    }
++    return line;
++}
++
++/// "0 1 2" or "0-2" or "0-2,4" -> {0,1,2,(4)}
++std::vector<int> ParseCpuList(std::string text) {
++    std::replace(text.begin(), text.end(), ',', ' ');
++    std::vector<int> cpus;
++    std::istringstream stream(text);
++    for (std::string token; stream >> token;) {
++        const size_t dash = token.find('-');
++        if (dash == std::string::npos) {
++            cpus.push_back(std::atoi(token.c_str()));
++        } else {
++            const int first = std::atoi(token.substr(0, dash).c_str());
++            const int last = std::atoi(token.substr(dash + 1).c_str());
++            for (int cpu = first; cpu <= last; ++cpu) {
++                cpus.push_back(cpu);
++            }
++        }
++    }
++    return cpus;
++}
++
++std::string Describe(const std::vector<int>& cpus) {
++    std::string out;
++    for (const int cpu : cpus) {
++        out += fmt::format("{}{}", out.empty() ? "" : ",", cpu);
++    }
++    return out;
++}
++
++/// Groups the cores into clusters by maximum frequency (from cpufreq policies). With three or
++/// more clusters (prime / middle / little, as on Snapdragon 8 Gen 2) the GPU thread gets the
++/// fastest cluster and the workers get the middle ones. With two clusters, both roles share the
++/// big cluster. With one, there is nothing to do.
++Layout DetectLayout() {
++    struct Cluster {
++        long long max_freq{};
++        std::vector<int> cpus;
++    };
++    std::vector<Cluster> clusters;
++    for (int policy = 0; policy < 16; ++policy) {
++        const std::string base = fmt::format("/sys/devices/system/cpu/cpufreq/policy{}/", policy);
++        const std::string related = ReadFirstLine(base + "related_cpus");
++        if (related.empty()) {
++            continue;
++        }
++        Cluster cluster;
++        cluster.max_freq = std::atoll(ReadFirstLine(base + "cpuinfo_max_freq").c_str());
++        cluster.cpus = ParseCpuList(related);
++        if (!cluster.cpus.empty()) {
++            clusters.push_back(std::move(cluster));
++        }
++    }
++    Layout layout;
++    if (clusters.size() < 2) {
++        return layout;
++    }
++    std::ranges::sort(clusters, [](const Cluster& a, const Cluster& b) {
++        return a.max_freq > b.max_freq;
++    });
++    if (clusters.size() >= 3) {
++        layout.gpu = clusters.front().cpus;
++        for (size_t i = 1; i + 1 < clusters.size(); ++i) {
++            layout.worker.insert(layout.worker.end(), clusters[i].cpus.begin(),
++                                 clusters[i].cpus.end());
++        }
++    } else {
++        layout.gpu = clusters.front().cpus;
++        layout.worker = clusters.front().cpus;
++    }
++    layout.valid = !layout.gpu.empty() && !layout.worker.empty();
++    if (layout.valid) {
++        LOG_INFO(Frontend, "Doris cores: GPU thread on cpu {}, other emulator threads on cpu {}",
++                 Describe(layout.gpu), Describe(layout.worker));
++    }
++    return layout;
++}
++
++} // Anonymous namespace
++
++void PinCurrentThread(Role role) {
++#ifdef DORIS_CORES_AFFINITY
++    if (Settings::values.doris_core_layout.GetValue() == 0) {
++        return;
++    }
++    static std::once_flag detect_flag;
++    static Layout layout;
++    std::call_once(detect_flag, [] { layout = DetectLayout(); });
++    if (!layout.valid) {
++        return;
++    }
++    const std::vector<int>& cpus = role == Role::Gpu ? layout.gpu : layout.worker;
++    cpu_set_t set;
++    CPU_ZERO(&set);
++    for (const int cpu : cpus) {
++        CPU_SET(cpu, &set);
++    }
++    if (sched_setaffinity(0, sizeof(set), &set) != 0) {
++        LOG_WARNING(Frontend, "Doris cores: could not pin thread to cpu {}", Describe(cpus));
++    }
++#else
++    (void)role;
++#endif
++}
++
++} // namespace Doris::Cores
+diff --git a/src/common/doris_cores.h b/src/common/doris_cores.h
+new file mode 100644
+index 000000000..a24867a77
+--- /dev/null
++++ b/src/common/doris_cores.h
+@@ -0,0 +1,20 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden (Doris)
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++namespace Doris::Cores {
++
++enum class Role {
++    /// Eden's main GPU emulation thread: the busiest single thread, gets the fastest core.
++    Gpu,
++    /// Other heavy emulator threads (emulated CPU cores, Vulkan worker, presentation, fences,
++    /// timing): the remaining big cores, so they don't share the fastest one with the GPU thread.
++    Worker,
++};
++
++/// Pins the calling thread according to the "Core layout" setting. Does nothing when the setting
++/// is off, on a single-cluster CPU, or on platforms without sched_setaffinity.
++void PinCurrentThread(Role role);
++
++} // namespace Doris::Cores
+diff --git a/src/common/settings.h b/src/common/settings.h
+index 3901e8631..8d7144dca 100644
+--- a/src/common/settings.h
++++ b/src/common/settings.h
+@@ -614,6 +614,11 @@ struct Values {
+     // Background threads for "CPU Async" texture decoding (Eden uses 1). Read when a game starts.
+     SwitchableSetting<u32> doris_texture_decode_threads{linkage, 2, "doris_texture_decode_threads",
+                                                         Category::RendererAdvanced};
++    // Which cores the heavy emulator threads run on. 0 = let Android decide (Eden),
++    // 1 = Doris: the GPU emulation thread on the fastest core (prime), the other heavy threads on
++    // the middle cores, so they never compete with it. Read when a game starts.
++    SwitchableSetting<u32> doris_core_layout{linkage, 1, "doris_core_layout",
++                                             Category::RendererAdvanced};
+     // Writes a performance summary to the log every 10 seconds while a game runs.
+     SwitchableSetting<bool> doris_perf_report{linkage, false, "doris_perf_report",
+                                               Category::RendererAdvanced};
+diff --git a/src/core/core_timing.cpp b/src/core/core_timing.cpp
+index d2ee6769c..337f22fe3 100644
+--- a/src/core/core_timing.cpp
++++ b/src/core/core_timing.cpp
+@@ -8,6 +8,7 @@
+ #include <mutex>
+ #include <string>
+ #include <tuple>
++#include "common/doris_cores.h"
+ #include "common/cpu_features.h"
+ #include "common/cpu_features.h"
+ 
+@@ -75,6 +76,7 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
+             Common::SetCurrentThreadName("HostTiming");
+             Common::SetCurrentThreadPriority(Common::ThreadPriority::VeryHigh);
+             Common::SetCurrentThreadToPerformanceCores();
++            Doris::Cores::PinCurrentThread(Doris::Cores::Role::Worker);
+             on_thread_init();
+             has_started = true;
+ 
+diff --git a/src/core/cpu_manager.cpp b/src/core/cpu_manager.cpp
+index 23d5ac3df..38ff20083 100644
+--- a/src/core/cpu_manager.cpp
++++ b/src/core/cpu_manager.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include "common/doris_cores.h"
+ #include "common/fiber.h"
+ #include "common/scope_exit.h"
+ #include "common/thread.h"
+@@ -175,6 +176,7 @@ void CpuManager::RunThread(std::stop_token token, std::size_t core) {
+     Common::SetCurrentThreadName(name.c_str());
+     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
+     Common::SetCurrentThreadToPerformanceCores();
++    Doris::Cores::PinCurrentThread(Doris::Cores::Role::Worker);
+     auto& data = core_data[core];
+     data.host_context = Common::Fiber::ThreadToFiber();
+ 
+diff --git a/src/video_core/fence_manager.h b/src/video_core/fence_manager.h
+index 885c71402..9a4b34f4b 100644
+--- a/src/video_core/fence_manager.h
++++ b/src/video_core/fence_manager.h
+@@ -15,6 +15,7 @@
+ #include <thread>
+ #include <queue>
+ 
++#include "common/doris_cores.h"
+ #include "common/common_types.h"
+ #include "common/settings.h"
+ #include "common/thread.h"
+@@ -196,6 +197,7 @@ private:
+         Common::SetCurrentThreadName("GPUFencingThread");
+         Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
+         Common::SetCurrentThreadToPerformanceCores();
++        Doris::Cores::PinCurrentThread(Doris::Cores::Role::Worker);
+ 
+         TFence current_fence;
+         std::deque<std::function<void()>> current_operations;
+diff --git a/src/video_core/gpu_thread.cpp b/src/video_core/gpu_thread.cpp
+index 2acf9ac45..1f488e45f 100644
+--- a/src/video_core/gpu_thread.cpp
++++ b/src/video_core/gpu_thread.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include "common/doris_cores.h"
+ #include "common/assert.h"
+ #include "common/scope_exit.h"
+ #include "common/settings.h"
+@@ -31,6 +32,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
+         Common::SetCurrentThreadName("GPU");
+         Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
+         Common::SetCurrentThreadToPerformanceCores();
++        Doris::Cores::PinCurrentThread(Doris::Cores::Role::Gpu);
+         system.RegisterHostThread();
+ 
+         auto current_context = context.Acquire();
+diff --git a/src/video_core/renderer_vulkan/vk_present_manager.cpp b/src/video_core/renderer_vulkan/vk_present_manager.cpp
+index 523e6d02c..9df769c09 100644
+--- a/src/video_core/renderer_vulkan/vk_present_manager.cpp
++++ b/src/video_core/renderer_vulkan/vk_present_manager.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include "common/doris_cores.h"
+ #include "common/settings.h"
+ #include "common/thread.h"
+ #include "core/frontend/emu_window.h"
+@@ -325,6 +326,7 @@ void PresentManager::PresentThread(std::stop_token token) {
+     Common::SetCurrentThreadName("VulkanPresent");
+     Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
+     Common::SetCurrentThreadToPerformanceCores();
++    Doris::Cores::PinCurrentThread(Doris::Cores::Role::Worker);
+     while (!token.stop_requested()) {
+         std::unique_lock lock{queue_mutex};
+         // Wait for presentation frames
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index 92dcd2011..70f04c3d2 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <fmt/format.h>
+ 
++#include "common/doris_cores.h"
+ #include "video_core/renderer_vulkan/vk_query_cache.h"
+ 
+ #include "common/settings.h"
+@@ -271,6 +272,7 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
+     Common::SetCurrentThreadName("VulkanWorker");
+     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
+     Common::SetCurrentThreadToPerformanceCores();
++    Doris::Cores::PinCurrentThread(Doris::Cores::Role::Worker);
+ 
+     const auto TryPopQueue{[this](auto& work) -> bool {
+         if (work_queue.empty()) {
+-- 
+2.43.0
+
