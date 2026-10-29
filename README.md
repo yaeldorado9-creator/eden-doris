@@ -24,14 +24,19 @@ Doris starts from exactly the build Yael plays on: Eden PR #4324
 (`c3bdfd14c5-xbzk/mhr-flicker-slow-evidences`, late-August 2026 Eden plus one experimental commit), not from newer
 Eden. With its default settings Doris behaves like that build; fixes are added on top.
 
-PR #4324 changes two things in every game, and Doris makes both adjustable under
-**Settings → Advanced graphics → Eden (Doris) experiments** (globally or per game):
+Doris's own settings are under **Settings → Graphics → Eden (Doris) experiments** (globally or per game). Each one takes
+effect the next time the game starts.
 
+* **GPU barriers** (default: Doris: real barriers). Eden turns the game's "wait until the GPU is done" points into a
+  Vulkan event wait that guarantees neither ordering nor visibility of earlier writes, and puts no barrier after compute
+  work. On Adreno this lets draws read culling results, indirect draw arguments and vertex data that aren't finished
+  yet, so distant terrain, buildings and shadows can drop out for a frame. Doris uses real barriers. "Eden (as before)"
+  switches back, for comparison; "+ tiled-cache barriers" also makes the game's tiled-cache barriers real.
 * **Shader loop limit**: how many times a loop inside a game shader may repeat before it is cut short.
-  PR #4324 lowered Eden's 8192 to 256. Choices: 256 (PR #4324), 512, 1024, 2048, 4096, 8192 (Eden default), no limit.
-  Takes effect the next time the game starts.
-* **Monster Hunter Rise record fix**: always (PR #4324), only in Monster Hunter Rise, or off. The log notes every time
-  it rewrites a copy, and in which game.
+  PR #4324 lowered Eden's 8192 to 256. Choices: 256 (PR #4324, default), 512, 1024, 2048, 4096, 8192 (Eden default),
+  no limit.
+* **Monster Hunter Rise record fix**: always (PR #4324, default), only in Monster Hunter Rise, or off. The log notes
+  every time it rewrites a copy, and in which game.
 
 ## How it is built
 

@@ -1,0 +1,235 @@
+From 5d0aa2fab9d516c6b9063d048e921055f3b349f6 Mon Sep 17 00:00:00 2001
+From: "Eden (Doris) build" <doris@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 09:40:52 -0500
+Subject: [PATCH 3/3] Eden (Doris): real GPU barriers on Adreno (setting, on by
+ default)
+
+Eden turns the game's wait-for-idle into vkCmdSetEvent + vkCmdWaitEvents with TOP_OF_PIPE as the
+destination and no memory barrier, which gives neither ordering nor visibility, and puts no barrier
+after compute dispatches. On Adreno (Turnip and Qualcomm) later draws can then read culling results,
+indirect arguments and vertex data that are not finished yet, so things drop out for a frame.
+
+- doris_gpu_barriers 1 (default): wait-for-idle is a full memory barrier; every dispatch is followed
+  by a compute -> all-commands barrier
+- 2: also turns the game's tiled-cache barriers (a no-op in Eden) into full barriers
+- 0: Eden's behaviour, for comparison
+---
+ .../features/settings/model/IntSetting.kt     |  1 +
+ .../settings/model/view/SettingsItem.kt       |  9 +++
+ .../settings/ui/SettingsFragmentPresenter.kt  |  1 +
+ .../app/src/main/res/values/arrays.xml        | 12 ++++
+ .../app/src/main/res/values/strings.xml       |  5 ++
+ src/common/settings.h                         |  8 +++
+ .../renderer_vulkan/vk_rasterizer.cpp         | 55 +++++++++++++++++++
+ .../renderer_vulkan/vk_rasterizer.h           |  5 ++
+ 8 files changed, 96 insertions(+)
+
+diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/IntSetting.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/IntSetting.kt
+index da16941bd..4d07c4fc1 100644
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/IntSetting.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/IntSetting.kt
+@@ -32,6 +32,7 @@ enum class IntSetting(override val key: String) : AbstractIntSetting {
+     RENDERER_DYNA_STATE("dyna_state"),
+     DORIS_SHADER_LOOP_LIMIT("doris_shader_loop_limit"),
+     DORIS_MHR_FIX("doris_mhr_fix"),
++    DORIS_GPU_BARRIERS("doris_gpu_barriers"),
+     DMA_ACCURACY("dma_accuracy"),
+     GPU_FENCE_BEHAVIOR("gpu_fence_behavior"),
+     FRAME_PACING_MODE("frame_pacing_mode"),
+diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt
+index 08d1272e3..6c437a495 100644
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt
+@@ -187,6 +187,15 @@ abstract class SettingsItem(
+                     valuesId = R.array.dorisShaderLoopLimitValues
+                 )
+             )
++            put(
++                SingleChoiceSetting(
++                    IntSetting.DORIS_GPU_BARRIERS,
++                    titleId = R.string.doris_gpu_barriers,
++                    descriptionId = R.string.doris_gpu_barriers_description,
++                    choicesId = R.array.dorisGpuBarriersEntries,
++                    valuesId = R.array.dorisGpuBarriersValues
++                )
++            )
+             put(
+                 SingleChoiceSetting(
+                     IntSetting.DORIS_MHR_FIX,
+diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt
+index 8454b49b0..c290982c3 100644
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt
+@@ -352,6 +352,7 @@ class SettingsFragmentPresenter(
+ 
+             add(HeaderSetting(R.string.doris_experiments))
+ 
++            add(IntSetting.DORIS_GPU_BARRIERS.key)
+             add(IntSetting.DORIS_SHADER_LOOP_LIMIT.key)
+             add(IntSetting.DORIS_MHR_FIX.key)
+ 
+diff --git a/src/android/app/src/main/res/values/arrays.xml b/src/android/app/src/main/res/values/arrays.xml
+index e2b6da980..4aca551e3 100644
+--- a/src/android/app/src/main/res/values/arrays.xml
++++ b/src/android/app/src/main/res/values/arrays.xml
+@@ -647,6 +647,18 @@
+         <item>1</item>
+     </integer-array>
+ 
++    <string-array name="dorisGpuBarriersEntries">
++        <item>@string/doris_barriers_full</item>
++        <item>@string/doris_barriers_tiled</item>
++        <item>@string/doris_barriers_eden</item>
++    </string-array>
++
++    <integer-array name="dorisGpuBarriersValues">
++        <item>1</item>
++        <item>2</item>
++        <item>0</item>
++    </integer-array>
++
+     <string-array name="dorisShaderLoopLimitEntries">
+         <item>@string/doris_loop_limit_256</item>
+         <item>512</item>
+diff --git a/src/android/app/src/main/res/values/strings.xml b/src/android/app/src/main/res/values/strings.xml
+index e377d6ad1..54fb32780 100644
+--- a/src/android/app/src/main/res/values/strings.xml
++++ b/src/android/app/src/main/res/values/strings.xml
+@@ -600,6 +600,11 @@
+ 
+     <string name="extensions">Extensions</string>
+     <string name="doris_experiments">Eden (Doris) experiments</string>
++    <string name="doris_gpu_barriers">GPU barriers</string>
++    <string name="doris_gpu_barriers_description">How the game\'s \"wait until the GPU is done\" points are carried out. Eden\'s way lets later drawing read results that aren\'t finished yet on Adreno, which can make distant terrain, buildings and shadows drop out for a frame. Doris uses real barriers. Takes effect the next time the game starts.</string>
++    <string name="doris_barriers_eden">Eden (as before)</string>
++    <string name="doris_barriers_full">Doris: real barriers</string>
++    <string name="doris_barriers_tiled">Doris: real barriers + tiled-cache barriers</string>
+     <string name="doris_shader_loop_limit">Shader loop limit</string>
+     <string name="doris_shader_loop_limit_description">How many times a loop inside a game shader may repeat before it is cut short. The PR #4324 build uses 256 (faster, but long loops are cut); Eden normally uses 8192. Takes effect the next time the game starts.</string>
+     <string name="doris_mhr_fix">Monster Hunter Rise record fix</string>
+diff --git a/src/common/settings.h b/src/common/settings.h
+index 4af340ee7..510e46557 100644
+--- a/src/common/settings.h
++++ b/src/common/settings.h
+@@ -592,6 +592,14 @@ struct Values {
+     // PR #4324's Monster Hunter Rise record fix: 0 = off, 1 = only in Monster Hunter Rise,
+     // 2 = always, in every game (as the PR #4324 build does).
+     SwitchableSetting<u32> doris_mhr_fix{linkage, 2, "doris_mhr_fix", Category::RendererAdvanced};
++    // How the game's GPU barriers are carried out on Vulkan.
++    // 0 = Eden as before (wait-for-idle is an event wait with no memory barrier; nothing makes
++    //     compute results visible to later draws),
++    // 1 = Doris: wait-for-idle is a full memory barrier, and every compute dispatch is followed
++    //     by a barrier that makes its writes visible to draws, indirect arguments and copies,
++    // 2 = Doris as 1, plus the game's tiled-cache barriers (a no-op in Eden) become full barriers.
++    SwitchableSetting<u32> doris_gpu_barriers{linkage, 1, "doris_gpu_barriers",
++                                              Category::RendererAdvanced};
+ 
+     SwitchableSetting<bool> enable_buffer_history{linkage,
+                                                   false,
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 3b0fea2fe..9429e4d7a 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -612,6 +612,7 @@ void RasterizerVulkan::DispatchCompute() {
+             }
+             cmdbuf.DispatchIndirect(indirect_buffer, indirect_offset);
+         });
++        DorisAfterCompute();
+         return;
+     }
+     const std::array<u32, 3> dim{qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z};
+@@ -634,6 +635,7 @@ void RasterizerVulkan::DispatchCompute() {
+         }
+         cmdbuf.Dispatch(dim[0], dim[1], dim[2]);
+     });
++    DorisAfterCompute();
+ 
+     // Log compute dispatch
+     if (GPU::Logging::IsActive() &&
+@@ -849,7 +851,57 @@ void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,
+     InvalidateRegion(addr, size, which);
+ }
+ 
++namespace {
++// Eden (Doris): a barrier that makes every earlier write visible to every later command.
++constexpr VkMemoryBarrier DORIS_FULL_BARRIER{
++    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++    .pNext = nullptr,
++    .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
++    .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
++};
++} // Anonymous namespace
++
++void RasterizerVulkan::DorisAfterCompute() {
++    if (Settings::values.doris_gpu_barriers.GetValue() == 0) {
++        return;
++    }
++    // Eden (Doris): make what the compute shader wrote (culling results, indirect draw arguments,
++    // vertex and instance data, images) visible to whatever runs next. Eden only had a barrier
++    // before a dispatch, so draws right after it could read stale data on Adreno.
++    static constexpr VkMemoryBarrier AFTER_COMPUTE{
++        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++        .pNext = nullptr,
++        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
++        .dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_INDEX_READ_BIT |
++                         VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT |
++                         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
++                         VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
++    };
++    scheduler.Record([](vk::CommandBuffer cmdbuf) {
++        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, AFTER_COMPUTE);
++    });
++}
++
++void RasterizerVulkan::DorisFullBarrier() {
++    scheduler.RequestOutsideRenderPassOperationContext();
++    scheduler.Record([](vk::CommandBuffer cmdbuf) {
++        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, DORIS_FULL_BARRIER);
++    });
++}
++
+ void RasterizerVulkan::WaitForIdle() {
++    if (Settings::values.doris_gpu_barriers.GetValue() != 0) {
++        // Eden (Doris): the event wait below has TOP_OF_PIPE as its destination and no memory
++        // barrier, so Vulkan guarantees neither ordering nor visibility of earlier writes. On
++        // Adreno (Turnip and Qualcomm) that lets later draws read stale data written before the
++        // game's barrier. Use a real full barrier instead.
++        query_cache.NotifyWFI();
++        DorisFullBarrier();
++        fence_manager.SignalOrdering();
++        return;
++    }
+     // Everything but wait pixel operations. This intentionally includes FRAGMENT_SHADER_BIT because
+     // fragment shaders can still write storage buffers.
+     VkPipelineStageFlags flags =
+@@ -879,6 +931,9 @@ void RasterizerVulkan::FragmentBarrier() {
+ 
+ void RasterizerVulkan::TiledCacheBarrier() {
+     // TODO: Implementing tiled barriers requires rewriting a good chunk of the Vulkan backend
++    if (Settings::values.doris_gpu_barriers.GetValue() >= 2) {
++        DorisFullBarrier();
++    }
+ }
+ 
+ void RasterizerVulkan::FlushCommands() {
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index 7470aa4f1..13f2d10fd 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -120,6 +120,11 @@ public:
+     void WaitForIdle() override;
+     void FragmentBarrier() override;
+     void TiledCacheBarrier() override;
++
++    /// Eden (Doris): full memory barrier outside the render pass.
++    void DorisFullBarrier();
++    /// Eden (Doris): barrier after a compute dispatch, unless doris_gpu_barriers is 0.
++    void DorisAfterCompute();
+     void FlushCommands() override;
+     void TickFrame() override;
+     bool AccelerateConditionalRendering() override;
+-- 
+2.43.0
+
