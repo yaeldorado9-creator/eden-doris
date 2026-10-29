@@ -1,7 +1,7 @@
 From 122fa16005408ef30e9c83557f8d1ab7b78e468f Mon Sep 17 00:00:00 2001
 From: "Eden (Doris) build" <doris@users.noreply.github.com>
 Date: Thu, 29 Oct 2026 10:41:53 -0500
-Subject: [PATCH 05/30] Eden (Doris): stop new CPU Async textures from flashing
+Subject: [PATCH 05/33] Eden (Doris): stop new CPU Async textures from flashing
  in
 
 With ASTC decoding on CPU Async, Eden draws a new texture before its decode is done and only uploads

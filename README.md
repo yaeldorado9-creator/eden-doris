@@ -35,12 +35,15 @@ effect the next time the game starts.
 * **Core layout** (default: Let Android decide). "Doris" puts Eden's GPU emulation thread, the busiest one, on the
   fastest CPU core (the prime core on Snapdragon 8 Gen 2) and the other heavy emulator threads on the middle cores,
   through Eden's own core groups. The prime core is also the hottest, so this is off by default.
-* **CPU profiler** (default: off, for development). Samples where the GPU thread and the Vulkan worker spend their CPU
-  time and writes the totals to `doris_profile.txt` in the log folder every 20 seconds. Each release includes
-  `libyuzu-android-symbols-<n>.zip` to turn the offsets into function names.
+* **CPU profiler** (default: on for now, while the speed-up work needs data). Samples where the GPU thread and the
+  Vulkan worker spend their CPU time and writes the totals to `doris_profile.txt` in the log folder every 20 seconds.
+  Each release includes `libyuzu-android-symbols-<n>.zip` to turn the offsets into function names.
 * **Performance report** (default: off). While a game runs, writes a summary to the log every 10 seconds: frame
-  times, how busy each emulator thread is (and on which core), CPU and GPU clocks, GPU load, battery temperature.
-  Share it with **Share debug logs**.
+  times, how busy each emulator thread is (and on which core), CPU and GPU clocks, GPU load, battery temperature;
+  per frame, the draws, dispatches, render passes and submits, new pipelines, how long the GPU thread waited for
+  presentation and GPU fences and the Vulkan worker for shader builds, and the GPU time of the whole frame, of frame
+  generation and of output scaling (GPU timestamps); and how often the GPU thread and the Vulkan worker ran on prime,
+  middle or little cores. Share it with **Share debug logs**.
 * **Wait for new textures** (default: up to 8 ms per frame). Only matters with ASTC Decoding Method on CPU Async:
   Eden draws new textures before they are decoded, so new places flash as textures fill in. Doris waits briefly for
   each new texture and uploads it straight away.
@@ -56,12 +59,18 @@ effect the next time the game starts.
 
 ## Speed-ups from eden-lun
 
-Doris carries 21 of the CPU-side speed-ups that [eden-lun](https://github.com/luneflu/eden-lun) (by alvindimas05)
+Doris carries 20 of the CPU-side speed-ups that [eden-lun](https://github.com/luneflu/eden-lun) (by alvindimas05)
 made to Eden's GPU emulation: cheaper address translation, fewer redundant cache and LRU updates, faster pipeline
 and descriptor lookups, batched register writes. They are applied unchanged as git commits (with `cherry picked from`
-lines), plus one Doris commit that adapts three of them to this older base and ports a fourth. Left out on purpose:
-"skip dirty cascade on unchanged register writes" (can leave stale state on screen), the flat descriptor-ID lookup
-(needs newer texture-cache code) and the device-memory continuity fix (written for newer code).
+lines), plus one Doris commit that adapts three of them to this older base and ports a fourth, and a port of
+eden-lun's device-memory continuity fix adapted to this base (a stale run could read or write memory that no longer
+backs a range).
+
+Left out on purpose: "skip dirty cascade on unchanged register writes" (can leave stale state on screen) and the flat
+descriptor-ID lookup (needs newer texture-cache code). "Decouple vertex buffer dirty from vertex input" was carried
+from build 6 to 9 and is undone from build 10: it made a vertex stream that is switched on (or changes stride) without
+its address being rewritten keep its old, often empty, binding, so objects (water most visibly) vanished for a moment.
+With dynamic vertex input off, as on Adreno, it never saved any time.
 
 ## How it is built
 

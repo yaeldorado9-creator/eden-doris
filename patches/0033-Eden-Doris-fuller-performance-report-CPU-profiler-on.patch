@@ -1,0 +1,989 @@
+From 4db1348ab1eb51e16872a433fc83443c7a1219bb Mon Sep 17 00:00:00 2001
+From: "Eden (Doris) build" <doris@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 13:58:11 -0500
+Subject: [PATCH 33/33] Eden (Doris): fuller performance report; CPU profiler
+ on for now
+
+The 10-second performance report now also says, per game frame:
+- how many draws, compute dispatches, render passes and submits there were,
+  and how many new pipelines had to be built;
+- how long the GPU emulation thread waited for a free presentation frame and
+  for GPU fences, and how long the Vulkan worker waited for shader builds;
+- how much GPU time the frame took in all, and how much of it went to frame
+  generation and to scaling the image to the screen (GPU timestamps);
+- how often the GPU emulation thread and the Vulkan worker sat on prime,
+  middle or little cores.
+
+The CPU profiler is on by default while the speed-up work needs data.
+---
+ src/common/doris_perf.cpp                     | 203 +++++++++++++++++-
+ src/common/doris_perf.h                       |  67 +++++-
+ src/common/settings.h                         |   5 +-
+ src/video_core/CMakeLists.txt                 |   2 +
+ src/video_core/gpu_thread.cpp                 |   2 +
+ .../renderer_vulkan/present/frame_gen.cpp     |   5 +
+ .../renderer_vulkan/renderer_vulkan.cpp       |   9 +
+ .../renderer_vulkan/vk_compute_pipeline.cpp   |   2 +
+ .../renderer_vulkan/vk_doris_gpu_timer.cpp    | 152 +++++++++++++
+ .../renderer_vulkan/vk_doris_gpu_timer.h      |  66 ++++++
+ .../renderer_vulkan/vk_graphics_pipeline.cpp  |   2 +
+ .../renderer_vulkan/vk_pipeline_cache.cpp     |   3 +
+ .../renderer_vulkan/vk_present_manager.cpp    |   2 +
+ .../renderer_vulkan/vk_rasterizer.cpp         |   3 +
+ .../renderer_vulkan/vk_scheduler.cpp          |   9 +-
+ src/video_core/renderer_vulkan/vk_scheduler.h |  11 +
+ .../vulkan_common/vulkan_wrapper.cpp          |   1 +
+ src/video_core/vulkan_common/vulkan_wrapper.h |   6 +
+ 18 files changed, 545 insertions(+), 5 deletions(-)
+ create mode 100644 src/video_core/renderer_vulkan/vk_doris_gpu_timer.cpp
+ create mode 100644 src/video_core/renderer_vulkan/vk_doris_gpu_timer.h
+
+diff --git a/src/common/doris_perf.cpp b/src/common/doris_perf.cpp
+index b670b35ff..c5cb0d6fc 100644
+--- a/src/common/doris_perf.cpp
++++ b/src/common/doris_perf.cpp
+@@ -4,8 +4,12 @@
+ #include "common/doris_perf.h"
+ 
+ #include <algorithm>
++#include <array>
++#include <atomic>
+ #include <chrono>
+ #include <cstdio>
++#include <cstdlib>
++#include <cstring>
+ #include <fstream>
+ #include <map>
+ #include <mutex>
+@@ -16,6 +20,7 @@
+ 
+ #if defined(__linux__) || defined(__ANDROID__)
+ #include <dirent.h>
++#include <sys/syscall.h>
+ #include <unistd.h>
+ #define DORIS_PERF_PROCFS 1
+ #endif
+@@ -38,6 +43,29 @@ std::mutex frame_mutex;
+ std::vector<Clock::time_point> frames;
+ std::once_flag start_flag;
+ 
++std::array<std::atomic<std::uint64_t>, static_cast<size_t>(Count::Max)> counters{};
++std::array<std::atomic<std::uint64_t>, static_cast<size_t>(Wait::Max)> wait_ns{};
++std::array<std::atomic<std::uint64_t>, static_cast<size_t>(GpuPart::Max)> gpu_ns{};
++
++thread_local bool is_gpu_thread = false;
++
++struct RegisteredThread {
++    char label[16]{};
++    std::atomic<int> tid{0};
++};
++constexpr size_t MAX_REGISTERED = 4;
++std::array<RegisteredThread, MAX_REGISTERED> registered{};
++std::atomic<size_t> registered_count{0};
++
++template <size_t N>
++std::array<std::uint64_t, N> TakeAll(std::array<std::atomic<std::uint64_t>, N>& values) {
++    std::array<std::uint64_t, N> result{};
++    for (size_t i = 0; i < N; ++i) {
++        result[i] = values[i].exchange(0, std::memory_order_relaxed);
++    }
++    return result;
++}
++
+ std::string ReadFirstLine(const std::string& path) {
+     std::ifstream file(path);
+     std::string line;
+@@ -141,6 +169,73 @@ std::string ReadBatteryTemperature() {
+     }
+     return fmt::format("{:.1f} C", std::atof(raw.c_str()) / 10.0);
+ }
++
++/// Kind of every CPU: 0 little, 1 middle, 2 prime (by each cluster's highest clock).
++std::vector<int> ReadCoreKinds() {
++    struct Cluster {
++        std::vector<int> cpus;
++        long long max_khz{};
++    };
++    std::vector<Cluster> clusters;
++    for (int policy = 0; policy < 16; ++policy) {
++        const std::string base = fmt::format("/sys/devices/system/cpu/cpufreq/policy{}/", policy);
++        const std::string max = ReadFirstLine(base + "cpuinfo_max_freq");
++        if (max.empty()) {
++            continue;
++        }
++        Cluster cluster;
++        cluster.max_khz = std::atoll(max.c_str());
++        std::istringstream list(ReadFirstLine(base + "related_cpus"));
++        for (std::string item; list >> item;) {
++            const size_t dash = item.find('-');
++            if (dash == std::string::npos) {
++                cluster.cpus.push_back(std::atoi(item.c_str()));
++            } else {
++                for (int cpu = std::atoi(item.substr(0, dash).c_str());
++                     cpu <= std::atoi(item.substr(dash + 1).c_str()); ++cpu) {
++                    cluster.cpus.push_back(cpu);
++                }
++            }
++        }
++        clusters.push_back(std::move(cluster));
++    }
++    std::vector<int> kinds(64, 1);
++    if (clusters.size() < 2) {
++        return kinds;
++    }
++    long long lowest = clusters.front().max_khz;
++    long long highest = clusters.front().max_khz;
++    for (const auto& cluster : clusters) {
++        lowest = std::min(lowest, cluster.max_khz);
++        highest = std::max(highest, cluster.max_khz);
++    }
++    for (const auto& cluster : clusters) {
++        const int kind = cluster.max_khz == highest ? 2 : (cluster.max_khz == lowest ? 0 : 1);
++        for (const int cpu : cluster.cpus) {
++            if (cpu >= 0 && cpu < static_cast<int>(kinds.size())) {
++                kinds[cpu] = kind;
++            }
++        }
++    }
++    return kinds;
++}
++
++/// The CPU a thread of this process last ran on, or -1.
++int ReadThreadCpu(int tid) {
++    const std::string stat = ReadFirstLine(fmt::format("/proc/self/task/{}/stat", tid));
++    const size_t close = stat.rfind(')');
++    if (close == std::string::npos || close + 2 >= stat.size()) {
++        return -1;
++    }
++    std::istringstream rest(stat.substr(close + 2));
++    std::string field;
++    for (int index = 0; index <= 36 && (rest >> field); ++index) {
++        if (index == 36) {
++            return std::atoi(field.c_str());
++        }
++    }
++    return -1;
++}
+ #endif
+ 
+ void ReportLoop() {
+@@ -149,10 +244,34 @@ void ReportLoop() {
+ #ifdef DORIS_PERF_PROCFS
+     const double ticks_per_second = static_cast<double>(sysconf(_SC_CLK_TCK));
+     auto previous_threads = ReadThreads();
++    const std::vector<int> core_kinds = ReadCoreKinds();
+ #endif
++    // Work done while the game was loading is not part of any frame.
++    TakeAll(counters);
++    TakeAll(wait_ns);
++    TakeAll(gpu_ns);
+     auto previous_time = Clock::now();
+     while (true) {
+-        std::this_thread::sleep_for(REPORT_INTERVAL);
++        // Sample which kind of core the registered threads are on, ten times a second.
++        std::array<std::array<int, 3>, MAX_REGISTERED> placement{};
++        constexpr auto SAMPLE_INTERVAL = std::chrono::milliseconds{100};
++        for (auto waited = Clock::duration{}; waited < REPORT_INTERVAL;
++             waited += SAMPLE_INTERVAL) {
++            std::this_thread::sleep_for(SAMPLE_INTERVAL);
++#ifdef DORIS_PERF_PROCFS
++            const size_t count = std::min(registered_count.load(), MAX_REGISTERED);
++            for (size_t i = 0; i < count; ++i) {
++                const int tid = registered[i].tid.load(std::memory_order_relaxed);
++                const int cpu = tid != 0 ? ReadThreadCpu(tid) : -1;
++                if (cpu >= 0 && cpu < static_cast<int>(core_kinds.size())) {
++                    ++placement[i][core_kinds[cpu]];
++                }
++            }
++#endif
++        }
++        const auto counted = TakeAll(counters);
++        const auto waited = TakeAll(wait_ns);
++        const auto gpu = TakeAll(gpu_ns);
+         std::vector<Clock::time_point> stamps;
+         {
+             std::scoped_lock lock{frame_mutex};
+@@ -231,11 +350,93 @@ void ReportLoop() {
+         LOG_INFO(Frontend, "Doris perf: clusters {} | GPU {} | battery {}", ReadClusters(),
+                  ReadGpu(), ReadBatteryTemperature());
+ #endif
++        const double frame_count = static_cast<double>(stamps.size());
++        const auto per_frame = [&](std::uint64_t value) {
++            return static_cast<double>(value) / frame_count;
++        };
++        const auto ms_per_frame = [&](std::uint64_t ns) {
++            return static_cast<double>(ns) / 1e6 / frame_count;
++        };
++        LOG_INFO(Frontend,
++                 "Doris perf: per frame {:.0f} draws, {:.0f} dispatches, {:.0f} render passes, "
++                 "{:.1f} submits | new pipelines {} | held up per frame: GPU thread by presentation "
++                 "{:.1f} ms and GPU fences {:.1f} ms, Vulkan worker by shader builds {:.1f} ms",
++                 per_frame(counted[static_cast<size_t>(Count::Draws)]),
++                 per_frame(counted[static_cast<size_t>(Count::Dispatches)]),
++                 per_frame(counted[static_cast<size_t>(Count::RenderPasses)]),
++                 per_frame(counted[static_cast<size_t>(Count::Submits)]),
++                 counted[static_cast<size_t>(Count::NewPipelines)],
++                 ms_per_frame(waited[static_cast<size_t>(Wait::PresentFrame)]),
++                 ms_per_frame(waited[static_cast<size_t>(Wait::GpuFence)]),
++                 ms_per_frame(waited[static_cast<size_t>(Wait::Shaders)]));
++        std::string cores;
++        const size_t registered_threads = std::min(registered_count.load(), MAX_REGISTERED);
++        for (size_t i = 0; i < registered_threads; ++i) {
++            const auto& [little, middle, prime] = placement[i];
++            const int samples = std::max(1, little + middle + prime);
++            cores += fmt::format("{}{} prime {}% / middle {}% / little {}%",
++                                 cores.empty() ? "" : ", ", registered[i].label,
++                                 prime * 100 / samples, middle * 100 / samples,
++                                 little * 100 / samples);
++        }
++        LOG_INFO(Frontend,
++                 "Doris perf: GPU work per frame {:.1f} ms (frame generation {:.1f} ms, output "
++                 "scaling {:.1f} ms) | cores: {}",
++                 ms_per_frame(gpu[static_cast<size_t>(GpuPart::Total)]),
++                 ms_per_frame(gpu[static_cast<size_t>(GpuPart::FrameGen)]),
++                 ms_per_frame(gpu[static_cast<size_t>(GpuPart::Output)]),
++                 cores.empty() ? "n/a" : cores);
+     }
+ }
+ 
+ } // Anonymous namespace
+ 
++bool Enabled() {
++    return Settings::values.doris_perf_report.GetValue();
++}
++
++void Add(Count counter, std::uint64_t amount) {
++    if (!Enabled()) {
++        return;
++    }
++    counters[static_cast<size_t>(counter)].fetch_add(amount, std::memory_order_relaxed);
++}
++
++ScopedWait::ScopedWait(Wait kind_, bool any_thread)
++    : kind{kind_}, active{(any_thread || is_gpu_thread) && Enabled()} {
++    if (active) {
++        start = Clock::now();
++    }
++}
++
++ScopedWait::~ScopedWait() {
++    if (!active) {
++        return;
++    }
++    const auto ns =
++        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count();
++    wait_ns[static_cast<size_t>(kind)].fetch_add(static_cast<std::uint64_t>(ns),
++                                                std::memory_order_relaxed);
++}
++
++void AddGpuTime(GpuPart part, std::uint64_t nanoseconds) {
++    gpu_ns[static_cast<size_t>(part)].fetch_add(nanoseconds, std::memory_order_relaxed);
++}
++
++void RegisterThread(const char* label) {
++    if (std::strcmp(label, "GPU") == 0) {
++        is_gpu_thread = true;
++    }
++#ifdef DORIS_PERF_PROCFS
++    const size_t index = registered_count.fetch_add(1);
++    if (index >= MAX_REGISTERED) {
++        return;
++    }
++    std::snprintf(registered[index].label, sizeof(registered[index].label), "%s", label);
++    registered[index].tid.store(static_cast<int>(syscall(SYS_gettid)));
++#endif
++}
++
+ void OnGameFrame() {
+     if (!Settings::values.doris_perf_report.GetValue()) {
+         return;
+diff --git a/src/common/doris_perf.h b/src/common/doris_perf.h
+index ab0ee7063..d0ff1f0d1 100644
+--- a/src/common/doris_perf.h
++++ b/src/common/doris_perf.h
+@@ -3,12 +3,77 @@
+ 
+ #pragma once
+ 
++#include <chrono>
++#include <cstdint>
++
+ namespace Doris::Perf {
+ 
+ /// Called once for every frame the game renders. When the "Performance report" setting is on,
+ /// the first call starts a low-priority thread that writes a summary to the log every 10 seconds:
+ /// frame times, CPU time per emulator thread (and the core it last ran on), CPU cluster and GPU
+-/// clocks, GPU load and battery temperature.
++/// clocks, GPU load and battery temperature, plus the counters and timers below.
+ void OnGameFrame();
+ 
++/// True while the "Performance report" setting is on.
++bool Enabled();
++
++/// Work counted per game frame.
++enum class Count : int {
++    Draws,
++    Dispatches,
++    RenderPasses,
++    Submits,
++    NewPipelines,
++    Max,
++};
++
++/// Adds to a counter. Cheap (one relaxed atomic add); does nothing while the report is off.
++void Add(Count counter, std::uint64_t amount = 1);
++
++/// Places where the GPU emulation thread can be held up.
++enum class Wait : int {
++    /// Waiting for a free presentation frame (the display or frame generation is behind).
++    PresentFrame,
++    /// Vulkan worker waiting for a shader/pipeline the frame needs to finish building (the GPU
++    /// gets no new work meanwhile).
++    Shaders,
++    /// Waiting for the GPU to reach a point (fences, synchronization with the game).
++    GpuFence,
++    Max,
++};
++
++/// Measures wall time spent in a scope: on the GPU emulation thread only, or on any thread when
++/// any_thread is true.
++class ScopedWait {
++public:
++    explicit ScopedWait(Wait kind, bool any_thread = false);
++    ~ScopedWait();
++
++    ScopedWait(const ScopedWait&) = delete;
++    ScopedWait& operator=(const ScopedWait&) = delete;
++
++private:
++    Wait kind;
++    bool active;
++    std::chrono::steady_clock::time_point start;
++};
++
++/// Parts of the GPU's own work, measured with GPU timestamps.
++enum class GpuPart : int {
++    /// Every command buffer (all GPU work).
++    Total,
++    /// Scaling the game's image to the screen (FSR etc.).
++    Output,
++    /// Frame generation (Lossless Scaling).
++    FrameGen,
++    Max,
++};
++
++/// Adds measured GPU time.
++void AddGpuTime(GpuPart part, std::uint64_t nanoseconds);
++
++/// Remembers the calling thread (GPU emulation thread or Vulkan worker) so the report can say
++/// which kind of core it mostly ran on.
++void RegisterThread(const char* label);
++
+ } // namespace Doris::Perf
+diff --git a/src/common/settings.h b/src/common/settings.h
+index 4916c1422..b8aae59ae 100644
+--- a/src/common/settings.h
++++ b/src/common/settings.h
+@@ -620,8 +620,9 @@ struct Values {
+     SwitchableSetting<u32> doris_core_layout{linkage, 0, "doris_core_layout",
+                                              Category::RendererAdvanced};
+     // Samples where the GPU thread and the Vulkan worker spend their CPU time and writes the totals
+-    // to doris_profile.txt in the log folder every 20 seconds. Read when a game starts.
+-    SwitchableSetting<bool> doris_profiler{linkage, false, "doris_profiler",
++    // to doris_profile.txt in the log folder every 20 seconds. Read when a game starts. On by
++    // default while the speed-up work needs data from real play sessions.
++    SwitchableSetting<bool> doris_profiler{linkage, true, "doris_profiler",
+                                            Category::RendererAdvanced};
+     // Writes a performance summary to the log every 10 seconds while a game runs.
+     SwitchableSetting<bool> doris_perf_report{linkage, false, "doris_perf_report",
+diff --git a/src/video_core/CMakeLists.txt b/src/video_core/CMakeLists.txt
+index c86849837..3557b78a2 100644
+--- a/src/video_core/CMakeLists.txt
++++ b/src/video_core/CMakeLists.txt
+@@ -166,6 +166,8 @@ add_library(video_core STATIC
+     renderer_vulkan/vk_fence_manager.h
+     renderer_vulkan/vk_graphics_pipeline.cpp
+     renderer_vulkan/vk_graphics_pipeline.h
++    renderer_vulkan/vk_doris_gpu_timer.cpp
++    renderer_vulkan/vk_doris_gpu_timer.h
+     renderer_vulkan/vk_master_semaphore.cpp
+     renderer_vulkan/vk_master_semaphore.h
+     renderer_vulkan/vk_pipeline_cache.cpp
+diff --git a/src/video_core/gpu_thread.cpp b/src/video_core/gpu_thread.cpp
+index 31355b803..76bd83ab9 100644
+--- a/src/video_core/gpu_thread.cpp
++++ b/src/video_core/gpu_thread.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include "common/doris_perf.h"
+ #include "common/doris_profiler.h"
+ #include "common/doris_cores.h"
+ #include "common/assert.h"
+@@ -35,6 +36,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
+         Common::SetCurrentThreadToPerformanceCores();
+         Doris::Cores::PinCurrentThread(Doris::Cores::Role::Gpu);
+         Doris::Profiler::RegisterCurrentThread("GPU");
++        Doris::Perf::RegisterThread("GPU");
+         system.RegisterHostThread();
+ 
+         auto current_context = context.Acquire();
+diff --git a/src/video_core/renderer_vulkan/present/frame_gen.cpp b/src/video_core/renderer_vulkan/present/frame_gen.cpp
+index b0d16819e..045d7110d 100644
+--- a/src/video_core/renderer_vulkan/present/frame_gen.cpp
++++ b/src/video_core/renderer_vulkan/present/frame_gen.cpp
+@@ -8,6 +8,7 @@
+ #include "common/fs/file.h"
+ #include "common/fs/fs.h"
+ #include "common/fs/path_util.h"
++#include "common/doris_perf.h"
+ #include "common/settings.h"
+ #include "video_core/renderer_vulkan/present/frame_gen.h"
+ #include "video_core/renderer_vulkan/present/util.h"
+@@ -241,10 +242,12 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
+     scheduler.RequestOutsideRenderPassOperationContext();
+     scheduler.Record([this, source = *frame->image, extent, count,
+                       dispatch = warm](vk::CommandBuffer cmdbuf) {
++        scheduler.GpuTimer().BeginRegion(cmdbuf, Doris::Perf::GpuPart::FrameGen);
+         CopyPresentedFrame(cmdbuf, source, chain->Input(count), extent);
+         if (dispatch) {
+             chain->DispatchShared(cmdbuf, count);
+         }
++        scheduler.GpuTimer().EndRegion(cmdbuf, Doris::Perf::GpuPart::FrameGen);
+     });
+ 
+     const bool dump_requested = generated && Settings::values.frame_gen_dump_flow.GetValue();
+@@ -279,8 +282,10 @@ void FrameGen::GenerateInto(const Device& device, Frame* destination, size_t gen
+     scheduler.Record([this, count = last_count, generation_count = last_generations, generation,
+                       target = destination->index, image = *destination->image,
+                       extent](vk::CommandBuffer cmdbuf) {
++        scheduler.GpuTimer().BeginRegion(cmdbuf, Doris::Perf::GpuPart::FrameGen);
+         chain->DispatchGeneration(cmdbuf, count, generation_count, generation, target, image,
+                                   extent);
++        scheduler.GpuTimer().EndRegion(cmdbuf, Doris::Perf::GpuPart::FrameGen);
+     });
+ }
+ 
+diff --git a/src/video_core/renderer_vulkan/renderer_vulkan.cpp b/src/video_core/renderer_vulkan/renderer_vulkan.cpp
+index 6290e79d9..d29a7b0d3 100644
+--- a/src/video_core/renderer_vulkan/renderer_vulkan.cpp
++++ b/src/video_core/renderer_vulkan/renderer_vulkan.cpp
+@@ -17,6 +17,7 @@
+ #include "common/logging.h"
+ #include <ranges>
+ #include "common/scope_exit.h"
++#include "common/doris_perf.h"
+ #include "common/settings.h"
+ #include "core/core_timing.h"
+ #include "core/frontend/graphics_context.h"
+@@ -209,9 +210,17 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
+     Frame* frame = present_manager.GetRenderFrame();
+ 
+     scheduler.RequestOutsideRenderPassOperationContext();
++    // Eden (Doris): time the output pass (scaling the game's image to the screen).
++    scheduler.Record([this](vk::CommandBuffer cmdbuf) {
++        scheduler.GpuTimer().BeginRegion(cmdbuf, Doris::Perf::GpuPart::Output);
++    });
+     blit_swapchain.DrawToFrame(device, rasterizer, frame, framebuffers,
+                                render_window.GetFramebufferLayout(), swapchain.GetImageCount(),
+                                swapchain.GetImageViewFormat());
++    scheduler.RequestOutsideRenderPassOperationContext();
++    scheduler.Record([this](vk::CommandBuffer cmdbuf) {
++        scheduler.GpuTimer().EndRegion(cmdbuf, Doris::Perf::GpuPart::Output);
++    });
+ 
+ #ifdef HAS_LSFG
+     void(frame_gen.WantedGenerations(present_manager.MaxExtraFrames()));
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+index 29356cfce..a4e17c44f 100644
+--- a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+@@ -23,6 +23,7 @@
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+ #include "video_core/gpu_logging/gpu_logging.h"
+ #include "common/logging.h"
++#include "common/doris_perf.h"
+ #include "common/settings.h"
+ 
+ namespace Vulkan {
+@@ -261,6 +262,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
+     if (!is_built.load(std::memory_order::relaxed)) {
+         // Wait for the pipeline to be built
+         scheduler.Record([this](vk::CommandBuffer) {
++            const Doris::Perf::ScopedWait doris_wait{Doris::Perf::Wait::Shaders, true};
+             std::unique_lock lock{build_mutex};
+             build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
+         });
+diff --git a/src/video_core/renderer_vulkan/vk_doris_gpu_timer.cpp b/src/video_core/renderer_vulkan/vk_doris_gpu_timer.cpp
+new file mode 100644
+index 000000000..c93022458
+--- /dev/null
++++ b/src/video_core/renderer_vulkan/vk_doris_gpu_timer.cpp
+@@ -0,0 +1,152 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden (Doris)
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#include "video_core/renderer_vulkan/vk_doris_gpu_timer.h"
++
++#include "common/logging.h"
++#include "video_core/vulkan_common/vulkan_device.h"
++
++namespace Vulkan {
++
++DorisGpuTimer::DorisGpuTimer(const Device& device_) : device{device_} {
++    region_pairs.fill(PAIRS);
++    if (!device.IsHostQueryResetSupported()) {
++        LOG_INFO(Render_Vulkan, "Doris GPU timer: off (no host query reset)");
++        return;
++    }
++    const auto physical = device.GetPhysical();
++    const auto families = physical.GetQueueFamilyProperties();
++    const u32 family = device.GetGraphicsFamily();
++    if (family >= families.size() || families[family].timestampValidBits == 0) {
++        LOG_INFO(Render_Vulkan, "Doris GPU timer: off (no timestamps on the graphics queue)");
++        return;
++    }
++    const u32 valid_bits = families[family].timestampValidBits;
++    tick_mask = valid_bits >= 64 ? ~std::uint64_t{0} : ((std::uint64_t{1} << valid_bits) - 1);
++    ns_per_tick = static_cast<double>(physical.GetProperties().limits.timestampPeriod);
++    if (ns_per_tick <= 0.0) {
++        LOG_INFO(Render_Vulkan, "Doris GPU timer: off (no timestamp period)");
++        return;
++    }
++    pool = device.GetLogical().CreateQueryPool(VkQueryPoolCreateInfo{
++        .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
++        .pNext = nullptr,
++        .flags = 0,
++        .queryType = VK_QUERY_TYPE_TIMESTAMP,
++        .queryCount = PAIRS * 2,
++        .pipelineStatistics = 0,
++    });
++    device.GetLogical().ResetQueryPool(*pool, 0, PAIRS * 2);
++    supported = true;
++    LOG_INFO(Render_Vulkan, "Doris GPU timer: on ({} valid bits, {:.2f} ns per tick)", valid_bits,
++             ns_per_tick);
++}
++
++DorisGpuTimer::~DorisGpuTimer() = default;
++
++std::uint32_t DorisGpuTimer::AcquirePair(Doris::Perf::GpuPart part) {
++    if (pending > PAIRS / 2) {
++        Collect();
++    }
++    for (std::uint32_t tried = 0; tried < PAIRS; ++tried) {
++        const std::uint32_t index = next_pair;
++        next_pair = (next_pair + 1) % PAIRS;
++        if (pairs[index].state == PairState::Free) {
++            pairs[index] = Pair{PairState::Recording, part};
++            return index;
++        }
++    }
++    return PAIRS;
++}
++
++void DorisGpuTimer::Collect() {
++    for (std::uint32_t index = 0; index < PAIRS && pending > 0; ++index) {
++        Pair& pair = pairs[index];
++        if (pair.state != PairState::Pending) {
++            continue;
++        }
++        std::array<std::uint64_t, 2> ticks{};
++        const VkResult result = device.GetLogical().GetQueryResults(
++            *pool, index * 2, 2, sizeof(ticks), ticks.data(), sizeof(std::uint64_t),
++            VK_QUERY_RESULT_64_BIT);
++        if (result == VK_NOT_READY) {
++            continue;
++        }
++        if (result == VK_SUCCESS) {
++            const std::uint64_t begin = ticks[0] & tick_mask;
++            const std::uint64_t end = ticks[1] & tick_mask;
++            const std::uint64_t elapsed = (end - begin) & tick_mask;
++            const double ns = static_cast<double>(elapsed) * ns_per_tick;
++            // Ignore nonsense (wrapped counters, results from before a GPU reset).
++            if (ns < 1e9) {
++                Doris::Perf::AddGpuTime(pair.part, static_cast<std::uint64_t>(ns));
++            }
++        }
++        device.GetLogical().ResetQueryPool(*pool, index * 2, 2);
++        pair.state = PairState::Free;
++        --pending;
++    }
++}
++
++void DorisGpuTimer::BeginCommandBuffer(vk::CommandBuffer cmdbuf) {
++    command_buffer_pair = PAIRS;
++    if (!supported) {
++        return;
++    }
++    if (pending > 0) {
++        Collect();
++    }
++    if (!Doris::Perf::Enabled()) {
++        return;
++    }
++    command_buffer_pair = AcquirePair(Doris::Perf::GpuPart::Total);
++    if (command_buffer_pair < PAIRS) {
++        cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, *pool, command_buffer_pair * 2);
++    }
++}
++
++void DorisGpuTimer::EndCommandBuffer(vk::CommandBuffer cmdbuf) {
++    if (command_buffer_pair >= PAIRS) {
++        return;
++    }
++    // A region still open when the command buffer ends is closed here (its start was already
++    // written, so the queries can't simply be handed out again without a reset).
++    for (auto& region : region_pairs) {
++        if (region < PAIRS) {
++            cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *pool, region * 2 + 1);
++            pairs[region].state = PairState::Pending;
++            ++pending;
++            region = PAIRS;
++        }
++    }
++    cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *pool,
++                          command_buffer_pair * 2 + 1);
++    pairs[command_buffer_pair].state = PairState::Pending;
++    ++pending;
++    command_buffer_pair = PAIRS;
++}
++
++void DorisGpuTimer::BeginRegion(vk::CommandBuffer cmdbuf, Doris::Perf::GpuPart part) {
++    auto& region = region_pairs[static_cast<size_t>(part)];
++    if (command_buffer_pair >= PAIRS || region < PAIRS) {
++        return;
++    }
++    region = AcquirePair(part);
++    if (region < PAIRS) {
++        // Bottom of pipe: the region starts once the work recorded before it has finished.
++        cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *pool, region * 2);
++    }
++}
++
++void DorisGpuTimer::EndRegion(vk::CommandBuffer cmdbuf, Doris::Perf::GpuPart part) {
++    auto& region = region_pairs[static_cast<size_t>(part)];
++    if (region >= PAIRS) {
++        return;
++    }
++    cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *pool, region * 2 + 1);
++    pairs[region].state = PairState::Pending;
++    ++pending;
++    region = PAIRS;
++}
++
++} // namespace Vulkan
+diff --git a/src/video_core/renderer_vulkan/vk_doris_gpu_timer.h b/src/video_core/renderer_vulkan/vk_doris_gpu_timer.h
+new file mode 100644
+index 000000000..c47c749e5
+--- /dev/null
++++ b/src/video_core/renderer_vulkan/vk_doris_gpu_timer.h
+@@ -0,0 +1,66 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden (Doris)
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <array>
++#include <cstdint>
++
++#include "common/doris_perf.h"
++#include "video_core/vulkan_common/vulkan_wrapper.h"
++
++namespace Vulkan {
++
++class Device;
++
++/// Eden (Doris): measures how long the GPU spends on each command buffer, and on marked parts of
++/// the work (frame generation, output scaling), with GPU timestamps. The results go to the
++/// performance report. Everything here runs on the Vulkan worker thread, where command buffers
++/// are recorded, so it needs no locking. Does nothing while the performance report is off or when
++/// the device can't write timestamps.
++class DorisGpuTimer {
++public:
++    explicit DorisGpuTimer(const Device& device);
++    ~DorisGpuTimer();
++
++    DorisGpuTimer(const DorisGpuTimer&) = delete;
++    DorisGpuTimer& operator=(const DorisGpuTimer&) = delete;
++
++    /// Right after a command buffer begins.
++    void BeginCommandBuffer(vk::CommandBuffer cmdbuf);
++    /// Right before a command buffer ends.
++    void EndCommandBuffer(vk::CommandBuffer cmdbuf);
++
++    /// Around a part of the work. Regions of one part must not nest.
++    void BeginRegion(vk::CommandBuffer cmdbuf, Doris::Perf::GpuPart part);
++    void EndRegion(vk::CommandBuffer cmdbuf, Doris::Perf::GpuPart part);
++
++private:
++    static constexpr std::uint32_t PAIRS = 128;
++
++    enum class PairState : std::uint8_t { Free, Recording, Pending };
++
++    struct Pair {
++        PairState state{PairState::Free};
++        Doris::Perf::GpuPart part{};
++    };
++
++    /// Returns a free pair (reset and ready to be written), or PAIRS if none is free.
++    std::uint32_t AcquirePair(Doris::Perf::GpuPart part);
++    /// Reads every finished pair, adds its time to the report, and frees it.
++    void Collect();
++
++    const Device& device;
++    vk::QueryPool pool;
++    double ns_per_tick{1.0};
++    std::uint64_t tick_mask{~std::uint64_t{0}};
++    bool supported{false};
++
++    std::array<Pair, PAIRS> pairs{};
++    std::uint32_t next_pair{0};
++    std::uint32_t pending{0};
++    std::uint32_t command_buffer_pair{PAIRS};
++    std::array<std::uint32_t, static_cast<size_t>(Doris::Perf::GpuPart::Max)> region_pairs{};
++};
++
++} // namespace Vulkan
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index 592e7e67d..4db3979ab 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -28,6 +28,7 @@
+ #include "video_core/texture_cache/texture_cache.h"
+ #include "video_core/vulkan_common/vulkan_device.h"
+ #include "video_core/gpu_logging/gpu_logging.h"
++#include "common/doris_perf.h"
+ #include "common/settings.h"
+ 
+ #if defined(_MSC_VER) && defined(NDEBUG)
+@@ -599,6 +600,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+     if (!is_built.load(std::memory_order::relaxed)) {
+         // Wait for the pipeline to be built
+         scheduler.Record([this](vk::CommandBuffer) {
++            const Doris::Perf::ScopedWait doris_wait{Doris::Perf::Wait::Shaders, true};
+             std::unique_lock lock{build_mutex};
+             build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
+         });
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index d881fb918..8619c52a1 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -15,6 +15,7 @@
+ #include <bit>
+ #include <numeric>
+ #include "common/cityhash.h"
++#include "common/doris_perf.h"
+ #include "common/fs/fs.h"
+ #include "common/fs/path_util.h"
+ #include "common/thread_worker.h"
+@@ -908,6 +909,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+ }
+ 
+ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
++    Doris::Perf::Add(Doris::Perf::Count::NewPipelines);
+     GraphicsEnvironments environments;
+     GetGraphicsEnvironments(environments, graphics_key.unique_hashes);
+ 
+@@ -932,6 +934,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
+ 
+ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
+     const ComputePipelineCacheKey& key, const ShaderInfo* shader) {
++    Doris::Perf::Add(Doris::Perf::Count::NewPipelines);
+     const GPUVAddr program_base{kepler_compute->regs.code_loc.Address()};
+     const auto& qmd{kepler_compute->launch_description};
+     ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start};
+diff --git a/src/video_core/renderer_vulkan/vk_present_manager.cpp b/src/video_core/renderer_vulkan/vk_present_manager.cpp
+index 9df769c09..1f4cb100c 100644
+--- a/src/video_core/renderer_vulkan/vk_present_manager.cpp
++++ b/src/video_core/renderer_vulkan/vk_present_manager.cpp
+@@ -5,6 +5,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include "common/doris_cores.h"
++#include "common/doris_perf.h"
+ #include "common/settings.h"
+ #include "common/thread.h"
+ #include "core/frontend/emu_window.h"
+@@ -172,6 +173,7 @@ PresentManager::PresentManager(const vk::Instance& instance_,
+ PresentManager::~PresentManager() = default;
+ 
+ Frame* PresentManager::GetRenderFrame() {
++    const Doris::Perf::ScopedWait doris_wait{Doris::Perf::Wait::PresentFrame};
+ 
+     // Wait for free presentation frames
+     std::unique_lock lock{free_mutex};
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index fbc664915..c85daebd5 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -14,6 +14,7 @@
+ #include "video_core/renderer_vulkan/renderer_vulkan.h"
+ 
+ #include "common/assert.h"
++#include "common/doris_perf.h"
+ #include "common/logging.h"
+ #include "common/scope_exit.h"
+ #include "common/settings.h"
+@@ -241,6 +242,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+     FlushWork();
+     gpu_memory->FlushCaching();
+ 
++    Doris::Perf::Add(Doris::Perf::Count::Draws);
+     GraphicsPipeline* const pipeline{pipeline_cache.CurrentGraphicsPipeline()};
+     if (!pipeline) {
+         return;
+@@ -583,6 +585,7 @@ void RasterizerVulkan::Clear(u32 layer_count) {
+ }
+ 
+ void RasterizerVulkan::DispatchCompute() {
++    Doris::Perf::Add(Doris::Perf::Count::Dispatches);
+     FlushWork();
+     gpu_memory->FlushCaching();
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index dc188124d..195a598d1 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <fmt/format.h>
+ 
++#include "common/doris_perf.h"
+ #include "common/doris_profiler.h"
+ #include "common/doris_cores.h"
+ #include "video_core/renderer_vulkan/vk_query_cache.h"
+@@ -47,7 +48,8 @@ void Scheduler::CommandChunk::ExecuteAll(vk::CommandBuffer cmdbuf,
+ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
+     : device{device_}, state_tracker{state_tracker_},
+       master_semaphore{std::make_unique<MasterSemaphore>(device)},
+-      command_pool{std::make_unique<CommandPool>(*master_semaphore, device)} {
++      command_pool{std::make_unique<CommandPool>(*master_semaphore, device)},
++      gpu_timer{std::make_unique<DorisGpuTimer>(device)} {
+ 
+     AcquireNewChunk();
+     AllocateWorkerCommandBuffer();
+@@ -99,6 +101,7 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
+                                     const VkClearValue* clear_values, u32 clear_value_count) {
+     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
+     const VkExtent2D render_area = framebuffer->RenderArea();
++    Doris::Perf::Add(Doris::Perf::Count::RenderPasses);
+     state.renderpass = renderpass;
+     state.framebuffer = framebuffer_handle;
+     state.render_area = render_area;
+@@ -275,6 +278,7 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
+     Common::SetCurrentThreadToPerformanceCores();
+     Doris::Cores::PinCurrentThread(Doris::Cores::Role::Worker);
+     Doris::Profiler::RegisterCurrentThread("VulkanWorker");
++    Doris::Perf::RegisterThread("VulkanWorker");
+ 
+     const auto TryPopQueue{[this](auto& work) -> bool {
+         if (work_queue.empty()) {
+@@ -334,6 +338,7 @@ void Scheduler::AllocateWorkerCommandBuffer() {
+         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+         .pInheritanceInfo = nullptr,
+     });
++    gpu_timer->BeginCommandBuffer(current_cmdbuf);
+     current_upload_cmdbuf = vk::CommandBuffer(command_pool->Commit(), device.GetDispatchLoader());
+     current_upload_cmdbuf.Begin({
+         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+@@ -348,6 +353,7 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
+     InvalidateState();
+ 
+     const u64 signal_value = master_semaphore->NextTick();
++    Doris::Perf::Add(Doris::Perf::Count::Submits);
+     RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value,
+                             this](vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) {
+         static constexpr VkMemoryBarrier WRITE_BARRIER{
+@@ -358,6 +364,7 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
+         };
+         upload_cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, WRITE_BARRIER);
+         upload_cmdbuf.End();
++        gpu_timer->EndCommandBuffer(cmdbuf);
+         cmdbuf.End();
+ 
+         if (on_submit) {
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.h b/src/video_core/renderer_vulkan/vk_scheduler.h
+index d4bc8d0ec..e85fba089 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.h
++++ b/src/video_core/renderer_vulkan/vk_scheduler.h
+@@ -16,8 +16,10 @@
+ 
+ #include "common/alignment.h"
+ #include "common/common_types.h"
++#include "common/doris_perf.h"
+ #include "common/polyfill_thread.h"
+ #include "common/settings.h"
++#include "video_core/renderer_vulkan/vk_doris_gpu_timer.h"
+ #include "video_core/renderer_vulkan/vk_master_semaphore.h"
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+ 
+@@ -132,6 +134,8 @@ public:
+     /// Waits for the given GPU tick, optionally pacing frames.
+     void Wait(u64 tick, double target_fps = 0.0) {
+         if (tick > 0) {
++            // Eden (Doris): time the GPU emulation thread spends waiting for the GPU.
++            const Doris::Perf::ScopedWait doris_wait{Doris::Perf::Wait::GpuFence};
+             if (tick >= master_semaphore->CurrentTick()) {
+                 Flush();
+             }
+@@ -169,6 +173,12 @@ public:
+         return *master_semaphore;
+     }
+ 
++    /// Eden (Doris): GPU timestamps for the performance report. Only use it from recorded
++    /// commands (it lives on the worker thread).
++    [[nodiscard]] DorisGpuTimer& GpuTimer() noexcept {
++        return *gpu_timer;
++    }
++
+     std::mutex submit_mutex;
+ 
+ private:
+@@ -300,6 +310,7 @@ private:
+ 
+     std::unique_ptr<MasterSemaphore> master_semaphore;
+     std::unique_ptr<CommandPool> command_pool;
++    std::unique_ptr<DorisGpuTimer> gpu_timer;
+ 
+     VideoCommon::QueryCacheBase<QueryCacheParams>* query_cache = nullptr;
+ 
+diff --git a/src/video_core/vulkan_common/vulkan_wrapper.cpp b/src/video_core/vulkan_common/vulkan_wrapper.cpp
+index 09fcf2eaa..cffe86f97 100644
+--- a/src/video_core/vulkan_common/vulkan_wrapper.cpp
++++ b/src/video_core/vulkan_common/vulkan_wrapper.cpp
+@@ -166,6 +166,7 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
+     X(vkCmdSetColorBlendEnableEXT);
+     X(vkCmdSetColorBlendEquationEXT);
+     X(vkCmdResetQueryPool);
++    X(vkCmdWriteTimestamp);
+     X(vkCmdResolveImage);
+     X(vkCreateBuffer);
+     X(vkCreateBufferView);
+diff --git a/src/video_core/vulkan_common/vulkan_wrapper.h b/src/video_core/vulkan_common/vulkan_wrapper.h
+index dd9a3a21d..c1cfb90c7 100644
+--- a/src/video_core/vulkan_common/vulkan_wrapper.h
++++ b/src/video_core/vulkan_common/vulkan_wrapper.h
+@@ -243,6 +243,7 @@ struct DeviceDispatch : InstanceDispatch {
+     PFN_vkCmdPushConstants vkCmdPushConstants{};
+     PFN_vkCmdPushDescriptorSetWithTemplateKHR vkCmdPushDescriptorSetWithTemplateKHR{};
+     PFN_vkCmdResetQueryPool vkCmdResetQueryPool{};
++    PFN_vkCmdWriteTimestamp vkCmdWriteTimestamp{};
+     PFN_vkCmdResolveImage vkCmdResolveImage{};
+     PFN_vkCmdSetBlendConstants vkCmdSetBlendConstants{};
+     PFN_vkCmdSetCullModeEXT vkCmdSetCullModeEXT{};
+@@ -1240,6 +1241,11 @@ public:
+         dld->vkCmdResetQueryPool(handle, query_pool, first, count);
+     }
+ 
++    void WriteTimestamp(VkPipelineStageFlagBits stage, VkQueryPool query_pool,
++                        u32 query) const noexcept {
++        dld->vkCmdWriteTimestamp(handle, stage, query_pool, query);
++    }
++
+     void BindDescriptorSets(VkPipelineBindPoint bind_point, VkPipelineLayout layout, u32 first,
+                             Span<VkDescriptorSet> sets, Span<u32> dynamic_offsets) const noexcept {
+         dld->vkCmdBindDescriptorSets(handle, bind_point, layout, first, sets.size(), sets.data(),
+-- 
+2.43.0
+

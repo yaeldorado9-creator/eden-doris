@@ -1,0 +1,120 @@
+From 126ac55e520484c2cc091c2da392dc991df10cbd Mon Sep 17 00:00:00 2001
+From: "Eden (Doris) build" <doris@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 13:39:17 -0500
+Subject: [PATCH 32/33] Eden (Doris): never follow a stale continuity run in
+ device memory
+
+A continuity run recorded when a mapping was made can outlive a later unmap or
+remap of its tail pages, so WalkBlock and GetSpan could read or write memory
+that no longer backs the range (wrong vertex/texture data, or writes landing in
+another mapping). Unmap now resets the run of the pages it frees, and both
+walkers only trust a run whose last page is still physically contiguous with
+its first; otherwise they go page by page (or fall back to a copy).
+
+After eden-lun 814e51a11, adapted to this base (here the tracker stores the run
+length, not length - 1).
+---
+ src/core/device_memory_manager.h   |  1 +
+ src/core/device_memory_manager.inc | 42 +++++++++++++++++++++++++++---
+ 2 files changed, 39 insertions(+), 4 deletions(-)
+
+diff --git a/src/core/device_memory_manager.h b/src/core/device_memory_manager.h
+index 3d97fdcc5..2c9c90c0d 100644
+--- a/src/core/device_memory_manager.h
++++ b/src/core/device_memory_manager.h
+@@ -62,6 +62,7 @@ public:
+     void Unmap(DAddr address, size_t size);
+ 
+     void TrackContinuityImpl(DAddr address, VAddr virtual_address, size_t size, Asid asid);
++    bool IsRunStillContinuous(std::size_t page_index, std::size_t span_bytes) const;
+     void TrackContinuity(DAddr address, VAddr virtual_address, size_t size, Asid asid) {
+         std::scoped_lock lk(mapping_guard);
+         TrackContinuityImpl(address, virtual_address, size, asid);
+diff --git a/src/core/device_memory_manager.inc b/src/core/device_memory_manager.inc
+index 9866f3a4f..7fc46cdcd 100644
+--- a/src/core/device_memory_manager.inc
++++ b/src/core/device_memory_manager.inc
+@@ -259,6 +259,8 @@ void DeviceMemoryManager<Traits>::Unmap(DAddr address, size_t size) {
+         auto phys_addr = tracked_entries[start_page_d + i].compressed_physical_ptr;
+         tracked_entries[start_page_d + i].compressed_physical_ptr = 0;
+         tracked_entries[start_page_d + i].cpu_backing_address = 0;
++        // Eden (Doris): an unmapped page is never part of a continuous run.
++        tracked_entries[start_page_d + i].continuity_tracker = 1;
+         if (phys_addr != 0) [[likely]] {
+             const u32 base_dev = compressed_device_addr[phys_addr - 1U];
+             if ((base_dev >> MULTI_FLAG_BITS) == 0) [[likely]] {
+@@ -299,11 +301,29 @@ void DeviceMemoryManager<Traits>::TrackContinuityImpl(DAddr address, VAddr virtu
+         tracked_entries[start_page_d + index].continuity_tracker = static_cast<u32>(page_count);
+     }
+ }
++template <typename Traits>
++bool DeviceMemoryManager<Traits>::IsRunStillContinuous(std::size_t page_index,
++                                                      std::size_t span_bytes) const {
++    // Eden (Doris): see WalkBlock. The first and last page of the span must still be backed by
++    // physically contiguous memory for a direct pointer to be valid.
++    const u32 first = tracked_entries[page_index].compressed_physical_ptr;
++    if (first == 0) {
++        return false;
++    }
++    if (span_bytes <= page_size) {
++        return true;
++    }
++    const std::size_t last_offset = (span_bytes - 1) >> page_bits;
++    return tracked_entries[page_index + last_offset].compressed_physical_ptr ==
++           first + static_cast<u32>(last_offset);
++}
++
+ template <typename Traits>
+ u8* DeviceMemoryManager<Traits>::GetSpan(const DAddr src_addr, const std::size_t size) {
+     size_t page_index = src_addr >> page_bits;
+     size_t subbits = src_addr & page_mask;
+-    if ((static_cast<size_t>(tracked_entries[page_index].continuity_tracker) << page_bits) >= size + subbits) {
++    if ((static_cast<size_t>(tracked_entries[page_index].continuity_tracker) << page_bits) >= size + subbits &&
++        IsRunStillContinuous(page_index, size + subbits)) {
+         return GetPointer<u8>(src_addr);
+     }
+     return nullptr;
+@@ -313,7 +333,8 @@ template <typename Traits>
+ const u8* DeviceMemoryManager<Traits>::GetSpan(const DAddr src_addr, const std::size_t size) const {
+     size_t page_index = src_addr >> page_bits;
+     size_t subbits = src_addr & page_mask;
+-    if ((static_cast<size_t>(tracked_entries[page_index].continuity_tracker) << page_bits) >= size + subbits) {
++    if ((static_cast<size_t>(tracked_entries[page_index].continuity_tracker) << page_bits) >= size + subbits &&
++        IsRunStillContinuous(page_index, size + subbits)) {
+         return GetPointer<u8>(src_addr);
+     }
+     return nullptr;
+@@ -383,7 +404,21 @@ void DeviceMemoryManager<Traits>::WalkBlock(DAddr addr, std::size_t size, auto o
+     std::size_t page_index = addr >> Memory::YUZU_PAGEBITS;
+     std::size_t page_offset = addr & Memory::YUZU_PAGEMASK;
+     while (remaining_size) {
+-        const size_t next_pages = std::size_t(tracked_entries[page_index].continuity_tracker);
++        // Eden (Doris, after eden-lun 814e51a11): a run recorded when an earlier mapping was made
++        // can outlive a later unmap or remap of its tail pages. Only follow it while it still ends
++        // on the physically contiguous page, otherwise go page by page, so reads and writes never
++        // land in memory that no longer backs this range.
++        const u32 phys_addr = tracked_entries[page_index].compressed_physical_ptr;
++        std::size_t next_pages = 1;
++        if (phys_addr != 0) {
++            next_pages = (std::max)(std::size_t(tracked_entries[page_index].continuity_tracker),
++                                    std::size_t{1});
++            if (next_pages > 1 &&
++                tracked_entries[page_index + next_pages - 1].compressed_physical_ptr !=
++                    phys_addr + static_cast<u32>(next_pages - 1)) {
++                next_pages = 1;
++            }
++        }
+         const std::size_t copy_amount = (std::min)((next_pages << Memory::YUZU_PAGEBITS) - page_offset, remaining_size);
+         const auto current_vaddr = u64((page_index << Memory::YUZU_PAGEBITS) + page_offset);
+         SCOPE_EXIT{
+@@ -393,7 +428,6 @@ void DeviceMemoryManager<Traits>::WalkBlock(DAddr addr, std::size_t size, auto o
+             remaining_size -= copy_amount;
+         };
+ 
+-        auto phys_addr = tracked_entries[page_index].compressed_physical_ptr;
+         if (phys_addr == 0) {
+             on_unmapped(copy_amount, current_vaddr);
+             continue;
+-- 
+2.43.0
+

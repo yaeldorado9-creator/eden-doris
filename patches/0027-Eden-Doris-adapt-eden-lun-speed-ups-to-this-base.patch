@@ -1,7 +1,7 @@
 From 0985840de05b9e2736d9882c7424c223c3453771 Mon Sep 17 00:00:00 2001
 From: "Eden (Doris) build" <doris@users.noreply.github.com>
 Date: Thu, 29 Oct 2026 11:28:59 -0500
-Subject: [PATCH 27/30] Eden (Doris): adapt eden-lun speed-ups to this base
+Subject: [PATCH 27/33] Eden (Doris): adapt eden-lun speed-ups to this base
 
 - PushImageDescriptors: keep the per-image rescale check (the render targets' scale says nothing
   about a sampled image; compute passes use the same helper)
