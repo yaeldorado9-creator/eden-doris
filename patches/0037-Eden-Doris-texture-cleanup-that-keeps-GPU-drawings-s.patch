@@ -1,0 +1,259 @@
+From cc46dab0930714634aba894abae801740a824578 Mon Sep 17 00:00:00 2001
+From: "Eden (Doris) build" <doris@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 17:37:35 -0500
+Subject: [PATCH 37/37] Eden (Doris): texture cleanup that keeps GPU drawings
+ (setting, on by default)
+
+Build 12's report: Eden's texture garbage collector starts at 40% of the GPU
+memory budget (1.6 GiB of 4 GiB on Snapdragon 8 Gen 2), counted over all the
+app's GPU memory. TotK in heavy areas sits at 1.7-2.2 GiB, so the collector
+ran every frame: 1500-2900 textures removed and 2000-3800 re-uploaded every 10
+seconds (about 10% of the GPU thread), up to 2059 copies back to guest memory
+in 10 seconds (each one waits for the GPU to finish everything: the GPU thread
+spent 19.5 ms of every frame waiting, 15 fps), and 10-124 textures the GPU had
+drawn thrown away every 10 seconds (rebuilt later from stale memory: flicker).
+
+Doris collection (Texture memory cleanup = Doris):
+- starts at 2.4 GiB (at least 512 MiB below the critical level, never below
+  Eden's own threshold);
+- textures must sit unused for 300 frames (120 under pressure, 20 when
+  critical) instead of 50/25/10;
+- textures the GPU drew into are only removed when memory is critical (Eden's
+  behaviour then); looking at them uses a separate budget so they can't block
+  the collection of others.
+
+Also: hand work to the Vulkan worker every 8 draws instead of 4 (each hand-off
+to a sleeping worker is a futex call: 4.5% of the GPU thread in build 12).
+Submits stay every 512 draws, as in Eden.
+---
+ .../features/settings/model/IntSetting.kt     |  1 +
+ .../settings/model/view/SettingsItem.kt       |  9 ++++
+ .../settings/ui/SettingsFragmentPresenter.kt  |  1 +
+ .../app/src/main/res/values/arrays.xml        | 10 ++++
+ .../app/src/main/res/values/strings.xml       |  4 ++
+ src/common/settings.h                         |  6 +++
+ .../renderer_vulkan/vk_rasterizer.cpp         |  5 +-
+ src/video_core/texture_cache/texture_cache.h  | 51 ++++++++++++++++---
+ .../texture_cache/texture_cache_base.h        |  3 ++
+ 9 files changed, 83 insertions(+), 7 deletions(-)
+
+diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/IntSetting.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/IntSetting.kt
+index a25444ab7..fad72e460 100644
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/IntSetting.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/IntSetting.kt
+@@ -33,6 +33,7 @@ enum class IntSetting(override val key: String) : AbstractIntSetting {
+     DORIS_SHADER_LOOP_LIMIT("doris_shader_loop_limit"),
+     DORIS_MHR_FIX("doris_mhr_fix"),
+     DORIS_GPU_BARRIERS("doris_gpu_barriers"),
++    DORIS_TEXTURE_GC("doris_texture_gc"),
+     DORIS_CORE_LAYOUT("doris_core_layout"),
+     DORIS_ASYNC_SHADER_WAIT("doris_async_shader_wait_ms"),
+     DORIS_TEXTURE_DECODE_WAIT("doris_texture_decode_wait_ms"),
+diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt
+index 8715530cb..c89dc5c2e 100644
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt
+@@ -218,6 +218,15 @@ abstract class SettingsItem(
+                     valuesId = R.array.dorisGpuBarriersValues
+                 )
+             )
++            put(
++                SingleChoiceSetting(
++                    IntSetting.DORIS_TEXTURE_GC,
++                    titleId = R.string.doris_texture_gc,
++                    descriptionId = R.string.doris_texture_gc_description,
++                    choicesId = R.array.dorisTextureGcEntries,
++                    valuesId = R.array.dorisTextureGcValues
++                )
++            )
+             put(
+                 SingleChoiceSetting(
+                     IntSetting.DORIS_ASYNC_SHADER_WAIT,
+diff --git a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt
+index c8cbed485..fbfb48d2d 100644
+--- a/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt
++++ b/src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt
+@@ -355,6 +355,7 @@ class SettingsFragmentPresenter(
+             add(BooleanSetting.DORIS_PROFILER.key)
+             add(IntSetting.DORIS_CORE_LAYOUT.key)
+             add(IntSetting.DORIS_GPU_BARRIERS.key)
++            add(IntSetting.DORIS_TEXTURE_GC.key)
+             add(IntSetting.DORIS_TEXTURE_DECODE_WAIT.key)
+             add(IntSetting.DORIS_TEXTURE_DECODE_THREADS.key)
+             add(IntSetting.DORIS_ASYNC_SHADER_WAIT.key)
+diff --git a/src/android/app/src/main/res/values/arrays.xml b/src/android/app/src/main/res/values/arrays.xml
+index 96916372e..7178d189f 100644
+--- a/src/android/app/src/main/res/values/arrays.xml
++++ b/src/android/app/src/main/res/values/arrays.xml
+@@ -657,6 +657,16 @@
+         <item>1</item>
+     </integer-array>
+ 
++    <string-array name="dorisTextureGcEntries">
++        <item>@string/doris_texture_gc_doris</item>
++        <item>@string/doris_texture_gc_eden</item>
++    </string-array>
++
++    <integer-array name="dorisTextureGcValues">
++        <item>1</item>
++        <item>0</item>
++    </integer-array>
++
+     <string-array name="dorisGpuBarriersEntries">
+         <item>@string/doris_barriers_full</item>
+         <item>@string/doris_barriers_tiled</item>
+diff --git a/src/android/app/src/main/res/values/strings.xml b/src/android/app/src/main/res/values/strings.xml
+index 8e032eb78..ef43e1257 100644
+--- a/src/android/app/src/main/res/values/strings.xml
++++ b/src/android/app/src/main/res/values/strings.xml
+@@ -608,6 +608,10 @@
+     <string name="doris_core_layout_description">Which CPU cores the heavy emulator threads use. Doris puts the GPU emulation thread, the busiest one, on the fastest core and keeps the other heavy threads on the middle cores, so they never slow each other down. Takes effect the next time the game starts.</string>
+     <string name="doris_cores_doris">Doris: GPU thread on the fastest core</string>
+     <string name="doris_cores_system">Let Android decide (Eden)</string>
++    <string name="doris_texture_gc">Texture memory cleanup</string>
++    <string name="doris_texture_gc_description">When the texture cache throws out old textures. Eden starts at 1.6 GB of GPU memory, which TotK always uses, so it removes and re-uploads thousands of textures every few seconds, and for textures the GPU drew into it either waits for the GPU (a hitch) or loses the drawing (flicker). Doris starts at 2.4 GB, waits longer, and keeps GPU drawings unless memory is critical. Takes effect right away.</string>
++    <string name="doris_texture_gc_doris">Doris: keep GPU drawings, clean up later</string>
++    <string name="doris_texture_gc_eden">Eden (as before)</string>
+     <string name="doris_gpu_barriers">GPU barriers</string>
+     <string name="doris_gpu_barriers_description">How the game\'s \"wait until the GPU is done\" points are carried out. Eden\'s way lets later drawing read results that aren\'t finished yet on Adreno, which can make distant terrain, buildings and shadows drop out for a frame. Doris uses real barriers. Takes effect the next time the game starts.</string>
+     <string name="doris_barriers_eden">Eden (as before)</string>
+diff --git a/src/common/settings.h b/src/common/settings.h
+index b8aae59ae..41c355fcc 100644
+--- a/src/common/settings.h
++++ b/src/common/settings.h
+@@ -600,6 +600,12 @@ struct Values {
+     // 2 = Doris as 1, plus the game's tiled-cache barriers (a no-op in Eden) become full barriers.
+     SwitchableSetting<u32> doris_gpu_barriers{linkage, 1, "doris_gpu_barriers",
+                                               Category::RendererAdvanced};
++    // Texture garbage collection. 0 = Eden: starts at 40% of the GPU memory budget and also
++    // removes textures the GPU drew into (copying them back first, which waits for the GPU, or
++    // losing them). 1 = Doris: starts at 2.4 GiB, waits longer before removing a texture, and only
++    // removes GPU-drawn textures when memory is critical.
++    SwitchableSetting<u32> doris_texture_gc{linkage, 1, "doris_texture_gc",
++                                            Category::RendererAdvanced};
+     // With asynchronous shaders on, Eden skips every draw whose shader is still compiling, so new
+     // things are invisible for a moment. Doris first waits up to this many milliseconds per frame
+     // (shared by all draws in it) for the shader to finish. 0 = skip right away, as Eden does.
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 501a82575..f22e34a66 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1042,7 +1042,10 @@ void RasterizerVulkan::LoadDiskResources(u64 title_id, std::stop_token stop_load
+ void RasterizerVulkan::FlushWork() {
+ #ifdef __ANDROID__
+     static constexpr u32 DRAWS_TO_DISPATCH = 512;
+-    static constexpr u32 CHECK_MASK = 3;
++    // Eden (Doris): hand work to the Vulkan worker every 8 draws (Eden's desktop value), not every
++    // 4: each hand-off to a sleeping worker is a futex system call (4.5% of the GPU thread in a
++    // build 12 profile). Submits still happen every 512 draws, exactly as in Eden.
++    static constexpr u32 CHECK_MASK = 7;
+ #else
+     static constexpr u32 DRAWS_TO_DISPATCH = 4096;
+     static constexpr u32 CHECK_MASK = 7;
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 9ad83d976..cba8def69 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -117,24 +117,62 @@ TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManag
+     }
+ }
+ 
++template <class P>
++u64 TextureCache<P>::DorisCollectionThreshold() const noexcept {
++    // Eden (Doris): Eden starts collecting at 40% of the GPU memory budget (1.6 GiB of the 4 GiB
++    // it allows on Snapdragon 8 Gen 2). Its "used memory" is everything the device reports for
++    // the app, and TotK's working set alone is around 2 GiB, so the collector never stopped:
++    // thousands of textures removed and re-uploaded every few seconds. Start at 2.4 GiB instead
++    // (always at least 512 MiB below the critical level, never below Eden's own threshold).
++    if (Settings::values.doris_texture_gc.GetValue() == 0) {
++        return expected_memory;
++    }
++    constexpr u64 DORIS_EXPECTED_MEMORY = 2_GiB + 400_MiB;
++    const u64 below_critical = critical_memory > 512_MiB ? critical_memory - 512_MiB : 0;
++    return (std::max)(expected_memory, (std::min)(DORIS_EXPECTED_MEMORY, below_critical));
++}
++
+ template <class P>
+ void TextureCache<P>::RunGarbageCollector() {
++    // Eden (Doris) collection: textures the GPU drew into are only removed when memory is
++    // critical. Eden also removed them under ordinary pressure, either copying each one back to
++    // guest memory first (which waits for the GPU to finish all its work: a hitch every time) or,
++    // when it can't be copied, throwing the drawing away (it comes back later from stale memory:
++    // flicker). Textures also have to sit unused for longer before they go.
++    const bool doris = Settings::values.doris_texture_gc.GetValue() != 0;
++    const u64 collection_threshold = DorisCollectionThreshold();
+     bool high_priority_mode = false;
+     bool aggressive_mode = false;
+     u64 ticks_to_destroy = 0;
+     size_t num_iterations = 0;
++    // Doris: textures the collector looks at but keeps, per pass (bounds the cost of a pass).
++    size_t num_skips = 0;
+     const auto Configure = [&](bool allow_aggressive) {
+-        high_priority_mode = total_used_memory >= expected_memory;
++        high_priority_mode = total_used_memory >= collection_threshold;
+         aggressive_mode = allow_aggressive && total_used_memory >= critical_memory;
+-        ticks_to_destroy = aggressive_mode ? 10ULL : high_priority_mode ? 25ULL : 50ULL;
++        if (doris) {
++            ticks_to_destroy = aggressive_mode ? 20ULL : high_priority_mode ? 120ULL : 300ULL;
++        } else {
++            ticks_to_destroy = aggressive_mode ? 10ULL : high_priority_mode ? 25ULL : 50ULL;
++        }
+         num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : 10);
++        num_skips = 256;
+     };
+-    const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode](ImageId image_id) {
++    const auto Cleanup = [this, doris, collection_threshold, &num_iterations, &num_skips,
++                          &high_priority_mode, &aggressive_mode](ImageId image_id) {
+         if (num_iterations == 0) {
+             return true;
+         }
+-        --num_iterations;
+         auto& image = slot_images[image_id];
++        if (doris && !aggressive_mode && True(image.flags & ImageFlagBits::GpuModified)) {
++            // Keep what the GPU drew; looking at it costs a little of a separate budget.
++            if (num_skips == 0) {
++                return true;
++            }
++            --num_skips;
++            return false;
++        }
++        --num_iterations;
+         if (True(image.flags & ImageFlagBits::IsDecoding)) {
+             return false;
+         }
+@@ -162,7 +200,7 @@ void TextureCache<P>::RunGarbageCollector() {
+         if (aggressive_mode && total_used_memory < critical_memory) {
+             num_iterations >>= 2;
+             aggressive_mode = false;
+-        } else if (high_priority_mode && total_used_memory < expected_memory) {
++        } else if (high_priority_mode && total_used_memory < collection_threshold) {
+             num_iterations >>= 1;
+             high_priority_mode = false;
+         }
+@@ -184,7 +222,8 @@ void TextureCache<P>::TickFrame() {
+     }
+     if (Doris::Perf::Enabled()) {
+         Doris::Perf::SetGauge(Doris::Perf::Gauge::TextureCacheMemory, total_used_memory >> 20);
+-        Doris::Perf::SetGauge(Doris::Perf::Gauge::TextureCacheExpected, expected_memory >> 20);
++        Doris::Perf::SetGauge(Doris::Perf::Gauge::TextureCacheExpected,
++                              DorisCollectionThreshold() >> 20);
+         Doris::Perf::SetGauge(Doris::Perf::Gauge::TextureCacheCritical, critical_memory >> 20);
+     }
+     if (total_used_memory > minimum_memory) {
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index 3e1ad0126..fdc0a4353 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -299,6 +299,9 @@ private:
+     /// Runs the Garbage Collector.
+     void RunGarbageCollector();
+ 
++    /// Eden (Doris): memory use above which the garbage collector starts removing textures.
++    [[nodiscard]] u64 DorisCollectionThreshold() const noexcept;
++
+     /// Find or create an image view in the guest descriptor table
+     ImageViewId VisitImageView(u32 index, bool compute);
+ 
+-- 
+2.43.0
+

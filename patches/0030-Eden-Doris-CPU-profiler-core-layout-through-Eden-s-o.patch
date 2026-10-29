@@ -1,7 +1,7 @@
 From 6999cec007d4a33980a5b54b77f13d848cc044cf Mon Sep 17 00:00:00 2001
 From: "Eden (Doris) build" <doris@users.noreply.github.com>
 Date: Thu, 29 Oct 2026 12:39:39 -0500
-Subject: [PATCH 30/36] Eden (Doris): CPU profiler; core layout through Eden's
+Subject: [PATCH 30/37] Eden (Doris): CPU profiler; core layout through Eden's
  own core groups (off by default)
 
 - doris_profiler (off by default): CPU-time timers sample the GPU thread and VulkanWorker about once

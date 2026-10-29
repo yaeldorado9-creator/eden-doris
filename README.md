@@ -47,6 +47,13 @@ effect the next time the game starts.
   middle or little cores; worker wake-ups, render passes cut by a submit, memory-protection changes, wait-for-idles
   and tiled-cache barriers per frame; texture uploads (and how many replaced GPU-drawn contents) and what the texture
   garbage collector removed, with GPU memory against its thresholds. Share it with **Share debug logs**.
+* **Texture memory cleanup** (default: Doris). Eden's texture garbage collector starts at 40% of the GPU memory budget
+  (1.6 GiB of the 4 GiB it allows on Snapdragon 8 Gen 2), counted over all of the app's GPU memory. TotK sits above
+  that in every busy area, so the collector ran every frame: thousands of textures removed and re-uploaded every few
+  seconds, textures the GPU had drawn into copied back to guest memory (each copy waits for the GPU to finish all its
+  work: a hitch) or thrown away (rebuilt later from stale memory: flicker). Doris starts at 2.4 GiB, removes only
+  textures unused for 300 frames (120 under pressure, 20 when critical), and keeps GPU drawings unless memory is
+  critical. "Eden (as before)" switches back. Takes effect right away.
 * **Wait for new textures** (default: up to 8 ms per frame). Only matters with ASTC Decoding Method on CPU Async:
   Eden draws new textures before they are decoded, so new places flash as textures fill in. Doris waits briefly for
   each new texture and uploads it straight away.
@@ -65,9 +72,11 @@ effect the next time the game starts.
 * Eden woke its Vulkan worker thread with a condition-variable notify every time it handed over work (every 4 draws),
   and the worker made another one per chunk; on Android every notify is a futex system call. Doris only notifies a
   thread that is actually asleep (build 11 profile: these calls were about 12% of the GPU emulation thread and 9% of
-  the worker). The timing of hand-offs and submits is Eden's own.
-* Build 12 also handed work over every 16 draws and held submits back while a render pass was open. That started the
-  GPU later in each frame and caused hitches, so it was undone in build 13.
+  the worker).
+* Work goes to the worker every 8 draws instead of 4 (Eden's desktop value), halving those calls. Submits stay every
+  512 draws, exactly as in Eden.
+* Build 12 also held submits back while a render pass was open. That started the GPU later in each frame and caused
+  hitches, so it was undone.
 
 ## Frame generation after a hitch
 
