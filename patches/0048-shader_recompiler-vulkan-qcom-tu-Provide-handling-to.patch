@@ -1,0 +1,849 @@
+From 9c7be80aefed7762a06a0a4d3c3ffec543084d3e Mon Sep 17 00:00:00 2001
+From: CamilleLaVey <camillelavey99@gmail.com>
+Date: Wed, 14 Oct 2026 00:04:16 +0200
+Subject: [PATCH 48/49] [shader_recompiler, vulkan, qcom, tu] Provide handling
+ to missing shader subgroups on QCOM (#4508)
+
+This works provides better emulation on certain GS missing for shader invocation data + geometry pass fallback in qcom/turnip drivers, some of those were provided as community patch by @a.kamaltdinov; which was refined to address the requirements on forced gpu reads; which used to kill some performance on low end devices; now, the stability with some of the graphical problems have been addressed and balanced. Shuffle shaders (SHFFL) are not actually provided on QCOM and turnip drivers, so any game that previously required this stage draw, will now avoid being ignored and tax some performance based on the complexity of the stage draw from now on. This will also address partially some tessellation problems as well.
+
+_Special Thanks:_
+
+1.- @a.kamaltdinov (for the initial patch "early fix for nier" provided for #4325)
+2.- @PavelBARABANOV (because the making the cherry-pick easier for a new PR)
+
+Co-authored-by: PavelBARABANOV <pavelbarabanov94@gmail.com>
+Reviewed-on: https://git.eden-emu.dev/eden-emu/eden/pulls/4508
+Reviewed-by: lizzie <lizzie@eden-emu.dev>
+Reviewed-by: crueter <crueter@eden-emu.dev>
+(cherry picked from commit a594c8d60ef79280adc046760561912207e16e17)
+---
+ src/shader_recompiler/CMakeLists.txt          |   1 +
+ .../backend/spirv/emit_spirv.cpp              |  33 ++++-
+ .../backend/spirv/emit_spirv_warp.cpp         | 127 ++++++++++++-----
+ .../backend/spirv/spirv_emit_context.h        |   1 +
+ .../frontend/maxwell/translate_program.cpp    | 110 ++++++++++++++-
+ src/shader_recompiler/host_translate_info.h   |   2 +
+ .../ir_opt/constant_propagation_pass.cpp      |  48 +++++--
+ .../ir_opt/geometry_compaction_pass.cpp       | 129 ++++++++++++++++++
+ src/shader_recompiler/ir_opt/passes.h         |   1 +
+ src/shader_recompiler/profile.h               |   3 +
+ .../renderer_vulkan/vk_pipeline_cache.cpp     |  17 ++-
+ src/video_core/vulkan_common/vulkan_device.h  |   5 +
+ 12 files changed, 417 insertions(+), 60 deletions(-)
+ create mode 100644 src/shader_recompiler/ir_opt/geometry_compaction_pass.cpp
+
+diff --git a/src/shader_recompiler/CMakeLists.txt b/src/shader_recompiler/CMakeLists.txt
+index 1e6a4d173..4f7273067 100644
+--- a/src/shader_recompiler/CMakeLists.txt
++++ b/src/shader_recompiler/CMakeLists.txt
+@@ -221,6 +221,7 @@ add_library(shader_recompiler STATIC
+     ir_opt/constant_propagation_pass.cpp
+     ir_opt/dead_code_elimination_pass.cpp
+     ir_opt/dual_vertex_pass.cpp
++    ir_opt/geometry_compaction_pass.cpp
+     ir_opt/global_memory_to_storage_buffer_pass.cpp
+     ir_opt/identity_removal_pass.cpp
+     ir_opt/layer_pass.cpp
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv.cpp b/src/shader_recompiler/backend/spirv/emit_spirv.cpp
+index 4d29df657..50f7fe5ce 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv.cpp
+@@ -4,6 +4,7 @@
+ // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <algorithm>
+ #include <span>
+ #include <tuple>
+ #include <type_traits>
+@@ -440,10 +441,13 @@ void SetupCapabilities(const Profile& profile, const Info& info, EmitContext& ct
+         ctx.AddCapability(spv::Capability::DrawParameters);
+     }
+     if ((info.uses_subgroup_vote || info.uses_subgroup_invocation_id ||
+-         info.uses_subgroup_shuffles) &&
++         info.uses_subgroup_shuffles || info.uses_subgroup_mask) &&
+         profile.support_vote && profile.SupportsSubgroupStage(ctx.stage)) {
+         ctx.AddCapability(spv::Capability::GroupNonUniformBallot);
+         ctx.AddCapability(spv::Capability::GroupNonUniformShuffle);
++        if (info.uses_subgroup_shuffles && profile.support_shuffle_relative) {
++            ctx.AddCapability(spv::Capability::GroupNonUniformShuffleRelative);
++        }
+         if (!profile.warp_size_potentially_larger_than_guest) {
+             // vote ops are only used when not taking the long path
+             ctx.AddCapability(spv::Capability::GroupNonUniformVote);
+@@ -522,6 +526,29 @@ void PatchPhiNodes(IR::Program& program, EmitContext& ctx) {
+                 return { ctx.Def(phi->Arg(phi_arg)), parent };
+             });
+         }
++
++void RewriteOpcodes(std::vector<u32>& code, std::span<const std::pair<u32, spv::Op>> rewrites) {
++    if (rewrites.empty()) {
++        return;
++    }
++    size_t offset = 5;
++    while (offset + 2 < code.size()) {
++        const u32 word_count{code[offset] >> 16};
++        const auto opcode{static_cast<spv::Op>(code[offset] & 0xFFFFu)};
++        if (word_count == 0) {
++            return;
++        }
++        if (opcode == spv::Op::OpGroupNonUniformShuffleXor ||
++            opcode == spv::Op::OpGroupNonUniformQuadBroadcast) {
++            const auto it{std::ranges::find(rewrites, code[offset + 2],
++                                            &std::pair<u32, spv::Op>::first)};
++            if (it != rewrites.end()) {
++                code[offset] = (code[offset] & 0xFFFF0000u) | static_cast<u32>(it->second);
++            }
++        }
++        offset += word_count;
++    }
++}
+ } // Anonymous namespace
+ 
+ std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info, IR::Program& program, Bindings& bindings) {
+@@ -536,7 +563,9 @@ std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_in
+     SetupCapabilities(profile, program.info, ctx);
+     SetupTransformFeedbackCapabilities(ctx, main);
+     PatchPhiNodes(program, ctx);
+-    return ctx.Assemble();
++    std::vector<u32> code{ctx.Assemble()};
++    RewriteOpcodes(code, ctx.opcode_rewrites);
++    return code;
+ }
+ 
+ Id EmitPhi(EmitContext& ctx, IR::Inst* inst) {
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_warp.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_warp.cpp
+index ffd5d9c29..8d8350996 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_warp.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_warp.cpp
+@@ -77,20 +77,57 @@ Id GetMaxThreadId(EmitContext& ctx, Id thread_id, Id clamp, Id segmentation_mask
+     return ComputeMaxThreadId(ctx, min_thread_id, clamp, not_seg_mask);
+ }
+ 
+-Id SelectValue(EmitContext& ctx, Id in_range, Id value, Id src_thread_id) {
+-    if (!StageSupportsSubgroups(ctx)) {
+-        return value;
++Id HostThreadId(EmitContext& ctx, Id thread_id) {
++    if (!ctx.profile.warp_size_potentially_larger_than_guest) {
++        return thread_id;
+     }
+-    return ctx.OpSelect(
+-        ctx.U32[1], in_range,
+-        ctx.OpGroupNonUniformShuffle(ctx.U32[1], SubgroupScope(ctx), value, src_thread_id), value);
+-}
+-
+-Id AddPartitionBase(EmitContext& ctx, Id thread_id) {
+     const Id partition_idx{ctx.OpShiftRightLogical(ctx.U32[1], GetThreadId(ctx), ctx.Const(5u))};
+     const Id partition_base{ctx.OpShiftLeftLogical(ctx.U32[1], partition_idx, ctx.Const(5u))};
+     return ctx.OpIAdd(ctx.U32[1], thread_id, partition_base);
+ }
++
++Id GuestLane(EmitContext& ctx, Id index) {
++    return ctx.OpBitwiseAnd(ctx.U32[1], index, ctx.Const(31U));
++}
++
++Id ShuffleAbsolute(EmitContext& ctx, Id value, Id src_thread_id) {
++    if (!ctx.profile.has_broken_spirv_subgroup_shuffle) {
++        return ctx.OpGroupNonUniformShuffle(ctx.U32[1], SubgroupScope(ctx), value, src_thread_id);
++    }
++    Id result{ctx.u32_zero_value};
++    for (u32 lane = 0; lane < ctx.profile.max_subgroup_size; ++lane) {
++        const Id read{
++            ctx.OpGroupNonUniformBroadcast(ctx.U32[1], SubgroupScope(ctx), value, ctx.Const(lane))};
++        const Id matches{ctx.OpIEqual(ctx.U1, src_thread_id, ctx.Const(lane))};
++        result = ctx.OpSelect(ctx.U32[1], matches, read, result);
++    }
++    return result;
++}
++
++Id ShuffleRelative(EmitContext& ctx, Id value, Id delta, Id src_thread_id, spv::Op op) {
++    if (!ctx.profile.support_shuffle_relative) {
++        return ShuffleAbsolute(ctx, value, HostThreadId(ctx, src_thread_id));
++    }
++    const Id result{ctx.OpGroupNonUniformShuffleXor(ctx.U32[1], SubgroupScope(ctx), value, delta)};
++    ctx.opcode_rewrites.emplace_back(result.value, op);
++    return result;
++}
++
++Id BroadcastLane(EmitContext& ctx, Id value, u32 lane) {
++    Id result{
++        ctx.OpGroupNonUniformBroadcast(ctx.U32[1], SubgroupScope(ctx), value, ctx.Const(lane))};
++    if (!ctx.profile.warp_size_potentially_larger_than_guest) {
++        return result;
++    }
++    const Id partition_idx{ctx.OpShiftRightLogical(ctx.U32[1], GetThreadId(ctx), ctx.Const(5u))};
++    for (u32 base = 32; base < ctx.profile.max_subgroup_size; base += 32) {
++        const Id read{ctx.OpGroupNonUniformBroadcast(ctx.U32[1], SubgroupScope(ctx), value,
++                                                     ctx.Const(base + lane))};
++        const Id matches{ctx.OpIEqual(ctx.U1, partition_idx, ctx.Const(base >> 5))};
++        result = ctx.OpSelect(ctx.U32[1], matches, read, result);
++    }
++    return result;
++}
+ } // Anonymous namespace
+ 
+ Id EmitLaneId(EmitContext& ctx) {
+@@ -203,61 +240,75 @@ Id EmitShuffleIndex(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id cla
+     const Id min_thread_id{ComputeMinThreadId(ctx, thread_id, segmentation_mask)};
+     const Id max_thread_id{ComputeMaxThreadId(ctx, min_thread_id, clamp, not_seg_mask)};
+ 
+-    const Id lhs{ctx.OpBitwiseAnd(ctx.U32[1], index, not_seg_mask)};
+-    Id src_thread_id{ctx.OpBitwiseOr(ctx.U32[1], lhs, min_thread_id)};
++    const Id lhs{ctx.OpBitwiseAnd(ctx.U32[1], GuestLane(ctx, index), not_seg_mask)};
++    const Id src_thread_id{ctx.OpBitwiseOr(ctx.U32[1], lhs, min_thread_id)};
+     const Id in_range{ctx.OpSLessThanEqual(ctx.U1, src_thread_id, max_thread_id)};
+ 
+-    if (ctx.profile.warp_size_potentially_larger_than_guest) {
+-        src_thread_id = AddPartitionBase(ctx, src_thread_id);
+-    }
+-
+     SetInBoundsFlag(inst, in_range);
+-    return SelectValue(ctx, in_range, value, src_thread_id);
++    if (!StageSupportsSubgroups(ctx)) {
++        return value;
++    }
++    const IR::Value lane{inst->Arg(1).Resolve()};
++    const IR::Value segment{inst->Arg(3).Resolve()};
++    if (lane.IsImmediate() && segment.IsImmediate() && segment.U32() == 0) {
++        return ctx.OpSelect(ctx.U32[1], in_range, BroadcastLane(ctx, value, lane.U32() & 31),
++                            value);
++    }
++    const Id shuffled{ShuffleAbsolute(ctx, value, HostThreadId(ctx, src_thread_id))};
++    return ctx.OpSelect(ctx.U32[1], in_range, shuffled, value);
+ }
+ 
+ Id EmitShuffleUp(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id clamp,
+                  Id segmentation_mask) {
++    if (!StageSupportsSubgroups(ctx)) {
++        SetInBoundsFlag(inst, ctx.false_value);
++        return value;
++    }
++    const Id delta{GuestLane(ctx, index)};
+     const Id thread_id{EmitLaneId(ctx)};
+     const Id max_thread_id{GetMaxThreadId(ctx, thread_id, clamp, segmentation_mask)};
+-    Id src_thread_id{ctx.OpISub(ctx.U32[1], thread_id, index)};
++    const Id src_thread_id{ctx.OpISub(ctx.U32[1], thread_id, delta)};
+     const Id in_range{ctx.OpSGreaterThanEqual(ctx.U1, src_thread_id, max_thread_id)};
+ 
+-    if (ctx.profile.warp_size_potentially_larger_than_guest) {
+-        src_thread_id = AddPartitionBase(ctx, src_thread_id);
+-    }
+-
+     SetInBoundsFlag(inst, in_range);
+-    return SelectValue(ctx, in_range, value, src_thread_id);
++    const Id shuffled{ShuffleRelative(ctx, value, delta, src_thread_id,
++                                      spv::Op::OpGroupNonUniformShuffleUp)};
++    return ctx.OpSelect(ctx.U32[1], in_range, shuffled, value);
+ }
+ 
+ Id EmitShuffleDown(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id clamp,
+                    Id segmentation_mask) {
++    if (!StageSupportsSubgroups(ctx)) {
++        SetInBoundsFlag(inst, ctx.false_value);
++        return value;
++    }
++    const Id delta{GuestLane(ctx, index)};
+     const Id thread_id{EmitLaneId(ctx)};
+     const Id max_thread_id{GetMaxThreadId(ctx, thread_id, clamp, segmentation_mask)};
+-    Id src_thread_id{ctx.OpIAdd(ctx.U32[1], thread_id, index)};
++    const Id src_thread_id{ctx.OpIAdd(ctx.U32[1], thread_id, delta)};
+     const Id in_range{ctx.OpSLessThanEqual(ctx.U1, src_thread_id, max_thread_id)};
+ 
+-    if (ctx.profile.warp_size_potentially_larger_than_guest) {
+-        src_thread_id = AddPartitionBase(ctx, src_thread_id);
+-    }
+-
+     SetInBoundsFlag(inst, in_range);
+-    return SelectValue(ctx, in_range, value, src_thread_id);
++    const Id shuffled{ShuffleRelative(ctx, value, delta, src_thread_id,
++                                      spv::Op::OpGroupNonUniformShuffleDown)};
++    return ctx.OpSelect(ctx.U32[1], in_range, shuffled, value);
+ }
+ 
+ Id EmitShuffleButterfly(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id clamp,
+                         Id segmentation_mask) {
++    if (!StageSupportsSubgroups(ctx)) {
++        SetInBoundsFlag(inst, ctx.false_value);
++        return value;
++    }
++    const Id mask{GuestLane(ctx, index)};
+     const Id thread_id{EmitLaneId(ctx)};
+     const Id max_thread_id{GetMaxThreadId(ctx, thread_id, clamp, segmentation_mask)};
+-    Id src_thread_id{ctx.OpBitwiseXor(ctx.U32[1], thread_id, index)};
++    const Id src_thread_id{ctx.OpBitwiseXor(ctx.U32[1], thread_id, mask)};
+     const Id in_range{ctx.OpSLessThanEqual(ctx.U1, src_thread_id, max_thread_id)};
+ 
+-    if (ctx.profile.warp_size_potentially_larger_than_guest) {
+-        src_thread_id = AddPartitionBase(ctx, src_thread_id);
+-    }
+-
+     SetInBoundsFlag(inst, in_range);
+-    return SelectValue(ctx, in_range, value, src_thread_id);
++    const Id shuffled{ctx.OpGroupNonUniformShuffleXor(ctx.U32[1], SubgroupScope(ctx), value, mask)};
++    return ctx.OpSelect(ctx.U32[1], in_range, shuffled, value);
+ }
+ 
+ Id EmitQuadBroadcast(EmitContext& ctx, Id value, Id lane) {
+@@ -267,10 +318,16 @@ Id EmitQuadBroadcast(EmitContext& ctx, Id value, Id lane) {
+     const Id base{ctx.OpBitwiseAnd(ctx.U32[1], GetThreadId(ctx), ctx.Const(~3u))};
+     const Id local_lane{ctx.OpBitwiseAnd(ctx.U32[1], lane, ctx.Const(3u))};
+     const Id src_thread_id{ctx.OpBitwiseOr(ctx.U32[1], base, local_lane)};
+-    return ctx.OpGroupNonUniformShuffle(ctx.U32[1], SubgroupScope(ctx), value, src_thread_id);
++    return ShuffleAbsolute(ctx, value, src_thread_id);
+ }
+ 
+ Id EmitQuadSwap(EmitContext& ctx, Id value, Id direction) {
++    if (ctx.profile.support_quad_shuffles) {
++        const Id result{
++            ctx.OpGroupNonUniformQuadBroadcast(ctx.U32[1], SubgroupScope(ctx), value, direction)};
++        ctx.opcode_rewrites.emplace_back(result.value, spv::Op::OpGroupNonUniformQuadSwap);
++        return result;
++    }
+     const Id xor_mask{ctx.OpIAdd(ctx.U32[1], direction, ctx.Const(1u))};
+     return ctx.OpGroupNonUniformShuffleXor(ctx.U32[1], SubgroupScope(ctx), value, xor_mask);
+ }
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.h b/src/shader_recompiler/backend/spirv/spirv_emit_context.h
+index fb20966b6..728eb67e0 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.h
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.h
+@@ -361,6 +361,7 @@ public:
+     Id frag_depth{};
+ 
+     std::vector<Id> interfaces;
++    std::vector<std::pair<u32, spv::Op>> opcode_rewrites;
+ 
+     Id load_const_func_u8{};
+     Id load_const_func_u16{};
+diff --git a/src/shader_recompiler/frontend/maxwell/translate_program.cpp b/src/shader_recompiler/frontend/maxwell/translate_program.cpp
+index ebc5a825d..a8517266c 100644
+--- a/src/shader_recompiler/frontend/maxwell/translate_program.cpp
++++ b/src/shader_recompiler/frontend/maxwell/translate_program.cpp
+@@ -5,7 +5,10 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <array>
++#include <bitset>
+ #include <memory>
++#include <optional>
+ #include <vector>
+ #include <queue>
+ 
+@@ -172,7 +175,17 @@ std::map<IR::Attribute, IR::Attribute> GenerateLegacyToGenericMappings(
+ void EmitGeometryPassthrough(IR::IREmitter& ir, const IR::Program& program,
+                              const Shader::VaryingState& passthrough_mask,
+                              bool passthrough_position,
+-                             std::optional<IR::Attribute> passthrough_layer_attr) {
++                             std::optional<IR::Attribute> passthrough_layer_attr,
++                             std::optional<IR::Reg> viewport_mask_reg) {
++    constexpr std::array CULLED_POSITION{2.0f, 2.0f, 2.0f, 1.0f};
++    IR::U1 culled{ir.Imm1(false)};
++    IR::U32 viewport{ir.Imm32(0)};
++    if (viewport_mask_reg) {
++        const IR::U32 mask{ir.GetReg(*viewport_mask_reg)};
++        const IR::U32 lowest_bit{ir.BitwiseAnd(mask, IR::U32{ir.INeg(mask)})};
++        culled = ir.IEqual(mask, ir.Imm32(0));
++        viewport = IR::U32{ir.Select(culled, ir.Imm32(0), ir.FindUMsb(lowest_bit))};
++    }
+     for (u32 i = 0; i < program.output_vertices; i++) {
+         // Assign generics from input
+         for (u32 j = 0; j < 32; j++) {
+@@ -190,10 +203,19 @@ void EmitGeometryPassthrough(IR::IREmitter& ir, const IR::Program& program,
+         if (passthrough_position) {
+             // Assign position from input
+             const IR::Attribute attr = IR::Attribute::PositionX;
+-            ir.SetAttribute(attr + 0, ir.GetAttribute(attr + 0, ir.Imm32(i)), ir.Imm32(0));
+-            ir.SetAttribute(attr + 1, ir.GetAttribute(attr + 1, ir.Imm32(i)), ir.Imm32(0));
+-            ir.SetAttribute(attr + 2, ir.GetAttribute(attr + 2, ir.Imm32(i)), ir.Imm32(0));
+-            ir.SetAttribute(attr + 3, ir.GetAttribute(attr + 3, ir.Imm32(i)), ir.Imm32(0));
++            for (u32 component = 0; component < 4; ++component) {
++                IR::F32 value{ir.GetAttribute(attr + component, ir.Imm32(i))};
++                if (viewport_mask_reg) {
++                    value = IR::F32{
++                        ir.Select(culled, ir.Imm32(CULLED_POSITION[component]), value)};
++                }
++                ir.SetAttribute(attr + component, value, ir.Imm32(0));
++            }
++        }
++
++        if (viewport_mask_reg) {
++            ir.SetAttribute(IR::Attribute::ViewportIndex, ir.BitCast<IR::F32>(viewport),
++                            ir.Imm32(0));
+         }
+ 
+         if (passthrough_layer_attr) {
+@@ -219,19 +241,91 @@ u32 GetOutputTopologyVertices(OutputTopology output_topology) {
+     }
+ }
+ 
++std::optional<IR::Reg> FindFreeRegister(const IR::Program& program) {
++    std::bitset<IR::NUM_REGS> used;
++    for (IR::Block* const block : program.blocks) {
++        for (const IR::Inst& inst : block->Instructions()) {
++            const IR::Opcode opcode{inst.GetOpcode()};
++            if (opcode == IR::Opcode::GetRegister || opcode == IR::Opcode::SetRegister) {
++                used.set(IR::RegIndex(inst.Arg(0).Reg()));
++            }
++        }
++    }
++    for (size_t index = IR::NUM_USER_REGS; index-- > 0;) {
++        if (!used.test(index)) {
++            return static_cast<IR::Reg>(index);
++        }
++    }
++    return std::nullopt;
++}
++
++std::optional<IR::Reg> LowerViewportMask(const IR::Program& program) {
++    const std::optional<IR::Reg> reg{FindFreeRegister(program)};
++    if (!reg || program.blocks.empty()) {
++        return std::nullopt;
++    }
++    bool stores_mask{};
++    for (IR::Block* const block : program.blocks) {
++        for (IR::Inst& inst : block->Instructions()) {
++            if (inst.GetOpcode() != IR::Opcode::SetAttribute ||
++                inst.Arg(0).Attribute() != IR::Attribute::ViewportMask) {
++                continue;
++            }
++            IR::IREmitter ir{*block, IR::Block::InstructionList::s_iterator_to(inst)};
++            ir.SetReg(*reg, ir.BitCast<IR::U32>(IR::F32{inst.Arg(1)}));
++            inst.Invalidate();
++            stores_mask = true;
++        }
++    }
++    if (!stores_mask) {
++        return std::nullopt;
++    }
++    IR::Block& entry{*program.blocks.front()};
++    IR::IREmitter ir{entry, entry.begin()};
++    ir.SetReg(*reg, ir.Imm32(1));
++    return reg;
++}
++
+ void LowerGeometryPassthrough(const IR::Program& program, const HostTranslateInfo& host_info) {
++    std::optional<IR::Reg> viewport_mask_reg;
++    if (!host_info.support_viewport_mask) {
++        viewport_mask_reg = LowerViewportMask(program);
++    }
+     for (IR::Block* const block : program.blocks) {
+         for (IR::Inst& inst : block->Instructions()) {
+             if (inst.GetOpcode() == IR::Opcode::Epilogue) {
+                 IR::IREmitter ir{*block, IR::Block::InstructionList::s_iterator_to(inst)};
+                 EmitGeometryPassthrough(
+                     ir, program, program.info.passthrough,
+-                    program.info.passthrough.AnyComponent(IR::Attribute::PositionX), {});
++                    program.info.passthrough.AnyComponent(IR::Attribute::PositionX), {},
++                    viewport_mask_reg);
+             }
+         }
+     }
+ }
+ 
++void TightenOutputVertices(IR::Program& program) {
++    if (program.stage != Stage::Geometry || program.is_geometry_passthrough) {
++        return;
++    }
++    const bool has_loops = std::ranges::any_of(program.syntax_list, [](const auto& node) {
++        return node.type == IR::AbstractSyntaxNode::Type::Loop;
++    });
++    if (has_loops) {
++        return;
++    }
++    u32 num_emits = 0;
++    for (IR::Block* const block : program.blocks) {
++        for (const IR::Inst& inst : block->Instructions()) {
++            if (inst.GetOpcode() == IR::Opcode::EmitVertex) {
++                ++num_emits;
++            }
++        }
++    }
++    if (num_emits != 0) {
++        program.output_vertices = (std::min)(program.output_vertices, num_emits);
++    }
++}
+ } // Anonymous namespace
+ 
+ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Block>& block_pool,
+@@ -299,12 +393,14 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
+     Optimization::PositionPass(env, program);
+ 
+     Optimization::GlobalMemoryToStorageBufferPass(program, normalized_host_info);
++    Optimization::GeometryCompactionPass(program, normalized_host_info);
+     Optimization::TexturePass(env, program, normalized_host_info);
+ 
+     if (Settings::values.resolution_info.active || Settings::values.rescale_hack.GetValue()) {
+         Optimization::RescalingPass(program);
+     }
+     Optimization::DeadCodeEliminationPass(program);
++    TightenOutputVertices(program);
+     if (Settings::values.renderer_debug) {
+         Optimization::VerificationPass(program);
+     }
+@@ -433,7 +529,7 @@ IR::Program GenerateGeometryPassthrough(ObjectPool<IR::Inst>& inst_pool,
+ 
+     IR::IREmitter ir{*current_block};
+     EmitGeometryPassthrough(ir, program, program.info.stores, true,
+-                            source_program.info.emulated_layer);
++                            source_program.info.emulated_layer, std::nullopt);
+ 
+     IR::Block* return_block{block_pool.Create(inst_pool)};
+     IR::IREmitter{*return_block}.Epilogue();
+diff --git a/src/shader_recompiler/host_translate_info.h b/src/shader_recompiler/host_translate_info.h
+index 93ce881c2..44df85ccb 100644
+--- a/src/shader_recompiler/host_translate_info.h
++++ b/src/shader_recompiler/host_translate_info.h
+@@ -34,10 +34,12 @@ struct HostTranslateInfo {
+     bool needs_demote_reorder{}; ///< True when the device needs DemoteToHelperInvocation reordered
+     bool support_snorm_render_buffer{};  ///< True when the device supports SNORM render buffers
+     bool support_viewport_index_layer{}; ///< True when the device supports gl_Layer in VS
++    bool support_viewport_mask{};
+     bool support_geometry_shader_passthrough{}; ///< True when the device supports geometry
+                                                 ///< passthrough shaders
+     bool support_conditional_barrier{}; ///< True when the device supports barriers in conditional
+                                         ///< control flow
++    bool single_lane_geometry_subgroups{};
+ 
+     void ApplyDescriptorLimitPolicy() noexcept {
+         if (min_ssbo_alignment == 0) {
+diff --git a/src/shader_recompiler/ir_opt/constant_propagation_pass.cpp b/src/shader_recompiler/ir_opt/constant_propagation_pass.cpp
+index 57c08588f..6285fef16 100644
+--- a/src/shader_recompiler/ir_opt/constant_propagation_pass.cpp
++++ b/src/shader_recompiler/ir_opt/constant_propagation_pass.cpp
+@@ -1,4 +1,4 @@
+-// SPDX-FileCopyrightText: Copyright 2025 Eden Emulator Project
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ 
+ // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
+@@ -651,6 +651,29 @@ IR::Value GetThroughCast(IR::Value value, IR::Opcode expected_cast) {
+     return value;
+ }
+ 
++u32 QuadButterflyMask(const IR::Inst& inst) {
++    if (inst.GetOpcode() == IR::Opcode::QuadSwap) {
++        const IR::Value direction{inst.Arg(1)};
++        if (!direction.IsImmediate()) {
++            return 0;
++        }
++        return direction.U32() + 1;
++    }
++    if (inst.GetOpcode() != IR::Opcode::ShuffleButterfly) {
++        return 0;
++    }
++    const IR::Value index{inst.Arg(1)};
++    const IR::Value clamp{inst.Arg(2)};
++    const IR::Value segmentation_mask{inst.Arg(3)};
++    if (!index.IsImmediate() || !clamp.IsImmediate() || !segmentation_mask.IsImmediate()) {
++        return 0;
++    }
++    if (clamp.U32() != 3 || segmentation_mask.U32() != 28) {
++        return 0;
++    }
++    return index.U32();
++}
++
+ void FoldFSwizzleAdd(IR::Block& block, IR::Inst& inst) {
+     const IR::Value swizzle{inst.Arg(2)};
+     if (!swizzle.IsImmediate()) {
+@@ -666,7 +689,8 @@ void FoldFSwizzleAdd(IR::Block& block, IR::Inst& inst) {
+         return;
+     }
+     IR::Inst* const inst2{value_1.InstRecursive()};
+-    if (inst2->GetOpcode() != IR::Opcode::ShuffleButterfly) {
++    const u32 lane_mask{QuadButterflyMask(*inst2)};
++    if (lane_mask == 0) {
+         return;
+     }
+     const IR::Value value_3{GetThroughCast(inst2->Arg(0).Resolve(), IR::Opcode::BitCastU32F32)};
+@@ -678,24 +702,15 @@ void FoldFSwizzleAdd(IR::Block& block, IR::Inst& inst) {
+             return;
+         }
+     }
+-    const IR::Value index{inst2->Arg(1)};
+-    const IR::Value clamp{inst2->Arg(2)};
+-    const IR::Value segmentation_mask{inst2->Arg(3)};
+-    if (!index.IsImmediate() || !clamp.IsImmediate() || !segmentation_mask.IsImmediate()) {
+-        return;
+-    }
+-    if (clamp.U32() != 3 || segmentation_mask.U32() != 28) {
+-        return;
+-    }
+     if (swizzle_value == 0x99) {
+         // DPdxFine
+-        if (index.U32() == 1) {
++        if (lane_mask == 1) {
+             IR::IREmitter ir{block, IR::Block::InstructionList::s_iterator_to(inst)};
+             inst.ReplaceUsesWith(ir.DPdxFine(IR::F32{inst.Arg(1)}));
+         }
+     } else if (swizzle_value == 0xA5) {
+         // DPdyFine
+-        if (index.U32() == 2) {
++        if (lane_mask == 2) {
+             IR::IREmitter ir{block, IR::Block::InstructionList::s_iterator_to(inst)};
+             inst.ReplaceUsesWith(ir.DPdyFine(IR::F32{inst.Arg(1)}));
+         }
+@@ -709,6 +724,13 @@ bool FindGradient3DDerivatives(std::array<IR::Value, 3>& results, IR::Value coor
+     const auto check_through_shuffle = [](IR::Value input, IR::Value& result) {
+         const IR::Value value_1{GetThroughCast(input.Resolve(), IR::Opcode::BitCastF32U32)};
+         IR::Inst* const inst2{value_1.InstRecursive()};
++        if (inst2->GetOpcode() == IR::Opcode::QuadBroadcast) {
++            if (!inst2->Arg(1).Resolve().IsImmediate()) {
++                return false;
++            }
++            result = GetThroughCast(inst2->Arg(0).Resolve(), IR::Opcode::BitCastU32F32);
++            return true;
++        }
+         if (inst2->GetOpcode() != IR::Opcode::ShuffleIndex) {
+             return false;
+         }
+diff --git a/src/shader_recompiler/ir_opt/geometry_compaction_pass.cpp b/src/shader_recompiler/ir_opt/geometry_compaction_pass.cpp
+new file mode 100644
+index 000000000..98cfa4740
+--- /dev/null
++++ b/src/shader_recompiler/ir_opt/geometry_compaction_pass.cpp
+@@ -0,0 +1,129 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#include <boost/container/small_vector.hpp>
++
++#include "shader_recompiler/frontend/ir/ir_emitter.h"
++#include "shader_recompiler/host_translate_info.h"
++#include "shader_recompiler/ir_opt/passes.h"
++
++namespace Shader::Optimization {
++namespace {
++constexpr int MAX_BALLOT_DEPTH = 8;
++
++struct SlotAtomic {
++    IR::Block* block;
++    IR::Inst* atomic;
++    IR::Inst* ballot;
++};
++
++IR::Inst* FindBallot(const IR::Value& value, int depth) {
++    if (depth > MAX_BALLOT_DEPTH || value.IsImmediate()) {
++        return nullptr;
++    }
++    IR::Inst* const inst{value.InstRecursive()};
++    if (inst->GetOpcode() == IR::Opcode::SubgroupBallot) {
++        return inst;
++    }
++    if (inst->GetOpcode() == IR::Opcode::Phi) {
++        return nullptr;
++    }
++    for (size_t index = 0; index < inst->NumArgs(); ++index) {
++        if (IR::Inst* const ballot{FindBallot(inst->Arg(index), depth + 1)}) {
++            return ballot;
++        }
++    }
++    return nullptr;
++}
++
++bool IsShuffle(IR::Opcode opcode) {
++    switch (opcode) {
++    case IR::Opcode::ShuffleIndex:
++    case IR::Opcode::ShuffleUp:
++    case IR::Opcode::ShuffleDown:
++    case IR::Opcode::ShuffleButterfly:
++        return true;
++    default:
++        return false;
++    }
++}
++
++IR::U32 PrimitiveSlot(IR::IREmitter& ir, u32 invocations, const IR::U32& amount) {
++    IR::U32 key{ir.GetAttributeU32(IR::Attribute::PrimitiveId)};
++    if (invocations > 1) {
++        key = ir.IAdd(ir.IMul(key, ir.Imm32(invocations)), ir.InvocationId());
++    }
++    return ir.IMul(key, amount);
++}
++
++bool MergesAtomic(const IR::Inst& phi, const IR::Block& block, const IR::Inst& atomic) {
++    for (size_t index = 0; index < phi.NumArgs(); ++index) {
++        const IR::Value arg{phi.Arg(index)};
++        if (phi.PhiBlock(index) == &block && !arg.IsImmediate() &&
++            arg.InstRecursive() == &atomic) {
++            return true;
++        }
++    }
++    return false;
++}
++
++void RewriteMergedSlots(IR::Block& block, IR::Inst& atomic, u32 invocations) {
++    for (IR::Block* const successor : block.ImmSuccessors()) {
++        for (IR::Inst& phi : successor->Instructions()) {
++            if (phi.GetOpcode() != IR::Opcode::Phi || !MergesAtomic(phi, block, atomic)) {
++                continue;
++            }
++            for (size_t index = 0; index < phi.NumArgs(); ++index) {
++                const IR::Value arg{phi.Arg(index)};
++                if (arg.IsImmediate() || !IsShuffle(arg.InstRecursive()->GetOpcode())) {
++                    continue;
++                }
++                IR::IREmitter ir{*phi.PhiBlock(index)};
++                const IR::U32 amount{arg.InstRecursive()->Arg(0)};
++                phi.SetArg(index, PrimitiveSlot(ir, invocations, amount));
++            }
++        }
++    }
++}
++
++void RewriteAtomic(IR::Block& block, IR::Inst& atomic, u32 invocations) {
++    const auto insert_point{IR::Block::InstructionList::s_iterator_to(atomic)};
++    IR::IREmitter ir{block, insert_point};
++    const IR::U32 amount{atomic.Arg(2)};
++    const IR::U32 slot{PrimitiveSlot(ir, invocations, amount)};
++    block.PrependNewInst(insert_point, IR::Opcode::StorageAtomicUMax32,
++                         {atomic.Arg(0), atomic.Arg(1), ir.IAdd(slot, amount)});
++    atomic.ReplaceUsesWith(slot);
++}
++
++void NeutralizePredicate(IR::Inst& ballot) {
++    const IR::Value pred{ballot.Arg(0)};
++    if (!pred.IsImmediate()) {
++        pred.InstRecursive()->ReplaceUsesWith(IR::Value{true});
++    }
++}
++}
++
++void GeometryCompactionPass(IR::Program& program, const HostTranslateInfo& host_info) {
++    if (program.stage != Stage::Geometry || !host_info.single_lane_geometry_subgroups) {
++        return;
++    }
++    boost::container::small_vector<SlotAtomic, 4> slot_atomics;
++    for (IR::Block* const block : program.post_order_blocks) {
++        for (IR::Inst& inst : block->Instructions()) {
++            if (inst.GetOpcode() != IR::Opcode::StorageAtomicIAdd32) {
++                continue;
++            }
++            if (IR::Inst* const ballot{FindBallot(inst.Arg(2), 0)}) {
++                slot_atomics.push_back({block, &inst, ballot});
++            }
++        }
++    }
++    for (const SlotAtomic& slot_atomic : slot_atomics) {
++        RewriteMergedSlots(*slot_atomic.block, *slot_atomic.atomic, program.invocations);
++        RewriteAtomic(*slot_atomic.block, *slot_atomic.atomic, program.invocations);
++        NeutralizePredicate(*slot_atomic.ballot);
++    }
++}
++
++}
+diff --git a/src/shader_recompiler/ir_opt/passes.h b/src/shader_recompiler/ir_opt/passes.h
+index 1e637cb23..0c2b44e02 100644
+--- a/src/shader_recompiler/ir_opt/passes.h
++++ b/src/shader_recompiler/ir_opt/passes.h
+@@ -16,6 +16,7 @@ void CollectShaderInfoPass(Environment& env, IR::Program& program);
+ void ConditionalBarrierPass(IR::Program& program);
+ void ConstantPropagationPass(Environment& env, IR::Program& program);
+ void DeadCodeEliminationPass(IR::Program& program);
++void GeometryCompactionPass(IR::Program& program, const HostTranslateInfo& host_info);
+ void GlobalMemoryToStorageBufferPass(IR::Program& program, const HostTranslateInfo& host_info);
+ void IdentityRemovalPass(IR::Program& program);
+ void LowerFp64ToFp32(IR::Program& program);
+diff --git a/src/shader_recompiler/profile.h b/src/shader_recompiler/profile.h
+index d2ac480ab..8e9c83f88 100644
+--- a/src/shader_recompiler/profile.h
++++ b/src/shader_recompiler/profile.h
+@@ -40,6 +40,7 @@ struct Profile {
+     bool support_shader_quad_control{};
+     bool support_quad_shuffles{};
+     bool support_vote{};
++    bool support_shuffle_relative{};
+     u32 supported_subgroup_stages{0x7F};
+     bool support_viewport_index_layer_non_geometry{};
+     bool support_viewport_mask{};
+@@ -102,6 +103,8 @@ struct Profile {
+     bool ignore_nan_fp_comparisons{};
+     /// Some drivers have broken support for OpVectorExtractDynamic on subgroup mask inputs
+     bool has_broken_spirv_subgroup_mask_vector_extract_dynamic{};
++    bool has_broken_spirv_subgroup_shuffle{};
++    u32 max_subgroup_size{};
+ 
+     u32 gl_max_compute_smem_size{};
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 3c6892b3f..2275dda23 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -385,7 +385,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
+     const auto subgroup_stage_bit{[subgroup_stages](VkShaderStageFlags flag, Shader::Stage stage) {
+         return (subgroup_stages & flag) != 0 ? (1u << static_cast<u32>(stage)) : 0u;
+     }};
+-    const u32 supported_subgroup_stages{
++    u32 supported_subgroup_stages{
+         subgroup_stage_bit(VK_SHADER_STAGE_VERTEX_BIT, Shader::Stage::VertexA) |
+         subgroup_stage_bit(VK_SHADER_STAGE_VERTEX_BIT, Shader::Stage::VertexB) |
+         subgroup_stage_bit(VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
+@@ -395,6 +395,9 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
+         subgroup_stage_bit(VK_SHADER_STAGE_GEOMETRY_BIT, Shader::Stage::Geometry) |
+         subgroup_stage_bit(VK_SHADER_STAGE_FRAGMENT_BIT, Shader::Stage::Fragment) |
+         subgroup_stage_bit(VK_SHADER_STAGE_COMPUTE_BIT, Shader::Stage::Compute)};
++    if (driver_id == VK_DRIVER_ID_MESA_TURNIP) {
++        supported_subgroup_stages &= ~(1u << static_cast<u32>(Shader::Stage::Geometry));
++    }
+     profile = Shader::Profile{
+         .supported_spirv = device.SupportedSpirvVersion(),
+         .unified_descriptor_binding = true,
+@@ -432,6 +435,8 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
+         .support_shader_quad_control = device.IsKhrShaderQuadControlSupported(),
+         .support_quad_shuffles = device.IsSubgroupFeatureSupported(VK_SUBGROUP_FEATURE_QUAD_BIT),
+         .support_vote = device.IsSubgroupFeatureSupported(VK_SUBGROUP_FEATURE_VOTE_BIT),
++        .support_shuffle_relative =
++            device.IsSubgroupFeatureSupported(VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT),
+         .supported_subgroup_stages = supported_subgroup_stages,
+         .support_viewport_index_layer_non_geometry =
+             device.IsExtShaderViewportIndexLayerSupported(),
+@@ -469,13 +474,17 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
+                                        driver_id == VK_DRIVER_ID_MESA_TURNIP,
+ 
+         .has_broken_spirv_clamp = driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS,
+-        .has_broken_spirv_position_input = driver_id == false,
++        .has_broken_spirv_position_input = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY,
+         .has_broken_unsigned_image_offsets = false,
+         .has_broken_signed_operations = false,
+         .has_broken_fp16_float_controls = driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY,
+         .has_broken_fp32_denorm_flush = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY,
+         .ignore_nan_fp_comparisons = false,
+-        .has_broken_spirv_subgroup_mask_vector_extract_dynamic = false,
++        .has_broken_spirv_subgroup_mask_vector_extract_dynamic =
++            driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY &&
++            device.GetDriverVersion() < VK_MAKE_VERSION(512, 672, 0),
++        .has_broken_spirv_subgroup_shuffle = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY,
++        .max_subgroup_size = device.GetMaxSubgroupSize(),
+         .has_broken_robust =
+             device.IsNvidia() && device.GetNvidiaArch() <= NvidiaArchitecture::Arch_Pascal,
+         .min_ssbo_alignment = device.GetStorageBufferAlignment(),
+@@ -502,8 +511,10 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
+                                 driver_id == VK_DRIVER_ID_SAMSUNG_PROPRIETARY,
+         .support_snorm_render_buffer = true,
+         .support_viewport_index_layer = device.IsExtShaderViewportIndexLayerSupported(),
++        .support_viewport_mask = device.IsNvViewportArray2Supported(),
+         .support_geometry_shader_passthrough = device.IsNvGeometryShaderPassthroughSupported(),
+         .support_conditional_barrier = device.SupportsConditionalBarriers(),
++        .single_lane_geometry_subgroups = !profile.SupportsSubgroupStage(Shader::Stage::Geometry),
+     };
+     host_info.ApplyDescriptorLimitPolicy();
+ 
+diff --git a/src/video_core/vulkan_common/vulkan_device.h b/src/video_core/vulkan_common/vulkan_device.h
+index 27e6636bd..a7f8a91c3 100644
+--- a/src/video_core/vulkan_common/vulkan_device.h
++++ b/src/video_core/vulkan_common/vulkan_device.h
+@@ -475,6 +475,11 @@ FN_MAX_LIMIT_LIST
+         return properties.subgroup_properties.supportedStages;
+     }
+ 
++    u32 GetMaxSubgroupSize() const {
++        return (std::max)(properties.subgroup_properties.subgroupSize,
++                          properties.subgroup_size_control.maxSubgroupSize);
++    }
++
+     /// Returns the maximum number of push descriptors.
+     u32 MaxPushDescriptors() const {
+         return properties.push_descriptor.maxPushDescriptors;
+-- 
+2.43.0
+

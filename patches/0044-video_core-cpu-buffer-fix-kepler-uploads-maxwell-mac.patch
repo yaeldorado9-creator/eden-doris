@@ -1,0 +1,189 @@
+From 458867176859c3352c114e345a8c4bd43a55af3b Mon Sep 17 00:00:00 2001
+From: xbzk <xbzk@eden-emu.dev>
+Date: Thu, 24 Sep 2026 18:44:14 +0200
+Subject: [PATCH 44/49] [video_core] cpu buffer fix + kepler uploads / maxwell
+ macro dirty tracking fixes (#4473)
+
+- [x] I have read and followed the [Contribution Guidelines](https://git.eden-emu.dev/eden-emu/eden/src/branch/master/CONTRIBUTING.md#code-contributions).
+- [x] I have read and followed the [AI Policy](https://git.eden-emu.dev/eden-emu/eden/src/branch/master/docs/policies/AI.md)
+- [x] I have read and followed the [Coding Guidelines](https://git.eden-emu.dev/eden-emu/eden/src/branch/master/docs/policies/Coding.md) to the best of my ability.
+
+-------------------
+
+Aimed to fix two known UE5 crashes: Kepler uploads and Maxwell macros, both caused by CPU/GPU races due dirty tracking issues.
+
+Kepler ComputeInline: preserved dirty tracking across dma continuations and async readback.
+Maxwell macros: preserved gpu owned subranges during page granular cpu uploads.
+DiscardWrite: stopped clearing neighboring macro arguments by rounding up ranges.
+DMA Step: improved continuation aware dirty sampling.
+
+To the Ender Magnolia crew (maybe 1 or 2 persons): This will fix the dash crash, and the random / shackled beast vaper crashes.
+
+There are some more UE5 issues to go next.
+
+Reviewed-on: https://git.eden-emu.dev/eden-emu/eden/pulls/4473
+Reviewed-by: lizzie <lizzie@eden-emu.dev>
+Reviewed-by: MaranBr <maranbr@eden-emu.dev>
+(cherry picked from commit dbeb73ee011416cffc6c203945f5ccc6b90621f6)
+---
+ src/video_core/buffer_cache/buffer_cache.h | 23 ++++++++++++++--------
+ src/video_core/dma_pusher.cpp              | 15 +++++++++-----
+ src/video_core/engines/kepler_compute.cpp  | 15 ++++++++++----
+ src/video_core/engines/kepler_compute.h    |  2 ++
+ 4 files changed, 38 insertions(+), 17 deletions(-)
+
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 6f3bd92f6..9bccf1cd7 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -118,7 +118,7 @@ void BufferCache<P>::TickFrame() {
+ 
+ template <class P>
+ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size) {
+-    if (memory_tracker.IsRegionGpuModified(device_addr, size)) {
++    if (IsRegionGpuModified(device_addr, size)) {
+         ClearDownload(device_addr, size);
+         gpu_modified_ranges.Subtract(device_addr, size);
+     }
+@@ -422,11 +422,8 @@ std::pair<typename P::Buffer*, u32> BufferCache<P>::ObtainCPUBuffer(
+         MarkWrittenBuffer(buffer_id, device_addr, size);
+         break;
+     case ObtainBufferOperation::DiscardWrite: {
+-        const DAddr device_addr_start = Common::AlignDown(device_addr, 64);
+-        const DAddr device_addr_end = Common::AlignUp(device_addr + size, 64);
+-        const size_t new_size = device_addr_end - device_addr_start;
+-        ClearDownload(device_addr_start, new_size);
+-        gpu_modified_ranges.Subtract(device_addr_start, new_size);
++        ClearDownload(device_addr, size);
++        gpu_modified_ranges.Subtract(device_addr, size);
+         break;
+     }
+     default:
+@@ -1767,14 +1764,24 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
+     if (!memory_tracker.IsRegionCpuModified(device_addr, size)) {
+         return true;
+     }
+-    memory_tracker.ForEachUploadRange(device_addr, size, [&](u64 device_addr_out, u64 range_size) {
++    const auto add_upload = [&](DAddr start, DAddr end) {
++        if (start == end) return;
++        const u64 range_size = end - start;
+         upload_copies.push_back(BufferCopy{
+             .src_offset = total_size_bytes,
+-            .dst_offset = device_addr_out - buffer_start,
++            .dst_offset = start - buffer_start,
+             .size = range_size,
+         });
+         total_size_bytes += range_size;
+         largest_copy = (std::max)(largest_copy, range_size);
++    };
++    memory_tracker.ForEachUploadRange(device_addr, size, [&](u64 device_addr_out, u64 range_size) {
++        DAddr upload_start = device_addr_out;
++        gpu_modified_ranges.ForEachInRange(device_addr_out, range_size, [&](DAddr gpu_start, DAddr gpu_end) {
++            add_upload(upload_start, gpu_start);
++            upload_start = gpu_end;
++        });
++        add_upload(upload_start, device_addr_out + range_size);
+     });
+     if (total_size_bytes == 0) {
+         return true;
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index bbb6bad36..306147371 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -16,7 +16,7 @@
+ namespace Tegra {
+ 
+ constexpr u32 MacroRegistersStart = 0xE00;
+-[[maybe_unused]] constexpr u32 ComputeInline = 0x6D;
++constexpr u32 ComputeInline = 0x6D;
+ 
+ DmaPusher::DmaPusher(Core::System& system_, MemoryManager& memory_manager_, Control::ChannelState& channel_state_)
+     : system{system_}
+@@ -73,11 +73,16 @@ bool DmaPusher::Step() {
+         synced = false;
+     }
+ 
+-    if (header.size > 0 && dma_state.method >= MacroRegistersStart && subchannels[dma_state.subchannel]) {
+-        subchannels[dma_state.subchannel]->current_dirty = memory_manager.IsMemoryDirty(dma_state.dma_get, header.size * sizeof(u32));
+-    }
+-
+     if (header.size > 0) {
++        if (subchannels[dma_state.subchannel] && dma_state.method_count) {
++            const auto engine = subchannel_type[dma_state.subchannel];
++            const bool kepler_payload = engine == Engines::EngineTypes::KeplerCompute && dma_state.method == ComputeInline && dma_state.non_incrementing;
++            const bool macro_payload = engine == Engines::EngineTypes::Maxwell3D && dma_state.method >= MacroRegistersStart;
++            if (kepler_payload || macro_payload) {
++                const size_t words = std::min<size_t>(dma_state.method_count, header.size);
++                subchannels[dma_state.subchannel]->current_dirty = memory_manager.IsMemoryDirty(dma_state.dma_get, words * sizeof(u32));
++            }
++        }
+         const bool use_safe = Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe();
+         if (use_safe) {
+             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::SafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
+diff --git a/src/video_core/engines/kepler_compute.cpp b/src/video_core/engines/kepler_compute.cpp
+index 1ef6e0fc0..96a12539a 100644
+--- a/src/video_core/engines/kepler_compute.cpp
++++ b/src/video_core/engines/kepler_compute.cpp
+@@ -49,13 +49,16 @@ void KeplerCompute::CallMethod(Core::System& system, u32 method, u32 method_argu
+     case KEPLER_COMPUTE_REG_INDEX(exec_upload): {
+         UploadInfo info{.upload_address = upload_address,
+                         .exec_address = upload_state.ExecTargetAddress(),
+-                        .copy_size = upload_state.GetUploadSize()};
++                        .copy_size = upload_state.GetUploadSize(),
++                        .was_dirty = upload_dirty};
+         uploads.push_back(info);
+         upload_state.ProcessExec(regs.exec_upload.linear != 0);
+         break;
+     }
+     case KEPLER_COMPUTE_REG_INDEX(data_upload): {
+         upload_address = current_dma_segment;
++        upload_dirty = current_dirty;
++        current_dirty = false;
+         upload_state.ProcessData(method_argument, is_last_call);
+         break;
+     }
+@@ -64,9 +67,11 @@ void KeplerCompute::CallMethod(Core::System& system, u32 method, u32 method_argu
+ 
+         for (auto& data : uploads) {
+             const GPUVAddr offset = data.exec_address - launch_desc_loc;
+-            if (offset / sizeof(u32) == LAUNCH_REG_INDEX(grid_dim_x) &&
+-                memory_manager.IsMemoryDirty(data.upload_address, data.copy_size)) {
+-                indirect_compute = {data.upload_address};
++            if (offset / sizeof(u32) == LAUNCH_REG_INDEX(grid_dim_x)) {
++                const bool source_dirty = memory_manager.IsMemoryDirty(data.upload_address, data.copy_size);
++                if (data.was_dirty || source_dirty) {
++                    indirect_compute = {data.upload_address};
++                }
+             }
+         }
+         uploads.clear();
+@@ -83,6 +88,8 @@ void KeplerCompute::CallMultiMethod(Core::System& system, u32 method, const u32*
+     switch (method) {
+     case KEPLER_COMPUTE_REG_INDEX(data_upload):
+         upload_address = current_dma_segment;
++        upload_dirty = current_dirty;
++        current_dirty = false;
+         upload_state.ProcessData(base_start, amount);
+         return;
+     default:
+diff --git a/src/video_core/engines/kepler_compute.h b/src/video_core/engines/kepler_compute.h
+index 4f7242f80..078d3d45b 100644
+--- a/src/video_core/engines/kepler_compute.h
++++ b/src/video_core/engines/kepler_compute.h
+@@ -226,11 +226,13 @@ private:
+     VideoCore::RasterizerInterface* rasterizer = nullptr;
+     Upload::State upload_state;
+     GPUVAddr upload_address;
++    bool upload_dirty{};
+ 
+     struct UploadInfo {
+         GPUVAddr upload_address;
+         GPUVAddr exec_address;
+         u32 copy_size;
++        bool was_dirty;
+     };
+     std::vector<UploadInfo> uploads;
+     std::optional<GPUVAddr> indirect_compute{};
+-- 
+2.43.0
+

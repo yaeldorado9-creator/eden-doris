@@ -1,0 +1,215 @@
+From 79b237d3a5324be0c76325e17fc8fadfe2559561 Mon Sep 17 00:00:00 2001
+From: "Eden (Doris) build" <doris@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 20:33:54 -0500
+Subject: [PATCH 45/49] Eden (Doris): port Eden #4531 (NCE invalidations keep
+ GPU writes, final form) and #4528 (old upload logic without optimized vertex
+ buffers)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014Ps8wnhVXtSU7d88gGtyHX
+---
+ src/common/doris_perf.h                       |  2 +
+ src/video_core/buffer_cache/buffer_cache.h    | 67 ++++++++++++++-----
+ src/video_core/gpu.cpp                        | 22 +++---
+ src/video_core/rasterizer_interface.h         | 10 +++
+ .../renderer_vulkan/vk_rasterizer.cpp         | 16 +++++
+ .../renderer_vulkan/vk_rasterizer.h           |  1 +
+ 6 files changed, 94 insertions(+), 24 deletions(-)
+
+diff --git a/src/common/doris_perf.h b/src/common/doris_perf.h
+index 26e763deb..0849403f7 100644
+--- a/src/common/doris_perf.h
++++ b/src/common/doris_perf.h
+@@ -50,6 +50,8 @@ enum class Count : int {
+     StagingCreatedBytes,
+     /// GPU memory allocated for textures and buffers.
+     GpuMemoryAllocatedBytes,
++    /// The game's code wrote to a page holding GPU-written bytes, which were copied back first.
++    GpuWritesKept,
+     /// Memory protection changes for CPU write tracking.
+     ProtectCalls,
+     /// The game's "wait for idle" GPU commands.
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 9bccf1cd7..fd73b71ad 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -1756,32 +1756,67 @@ void BufferCache<P>::TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept {
+ 
+ template <class P>
+ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size) {
+-    upload_copies.clear();
+-    u64 total_size_bytes = 0;
+-    u64 largest_copy = 0;
+-    const DAddr buffer_start = buffer.cpu_addr_cached;
+     // eden-lun 924f5904f: nothing to upload when the CPU wrote nothing in this range.
+     if (!memory_tracker.IsRegionCpuModified(device_addr, size)) {
+         return true;
+     }
+-    const auto add_upload = [&](DAddr start, DAddr end) {
+-        if (start == end) return;
+-        const u64 range_size = end - start;
++    // Eden #4473 + #4528 (ported to Eden (Doris)): with optimized vertex buffers, bytes the GPU
++    // wrote are left out of page-granular uploads; without them, Eden's older logic (the
++    // skipping caused vertex explosions on Turnip there).
++#ifdef __ANDROID__
++    const bool use_optimized_vertex_buffers =
++        Settings::values.use_optimized_vertex_buffers.GetValue();
++#else
++    constexpr bool use_optimized_vertex_buffers = true;
++#endif
++    if (use_optimized_vertex_buffers) {
++        upload_copies.clear();
++        u64 total_size_bytes = 0;
++        u64 largest_copy = 0;
++        const DAddr buffer_start = buffer.cpu_addr_cached;
++        const auto add_upload = [&](DAddr start, DAddr end) {
++            if (start == end) {
++                return;
++            }
++            const u64 range_size = end - start;
++            upload_copies.push_back(BufferCopy{
++                .src_offset = total_size_bytes,
++                .dst_offset = start - buffer_start,
++                .size = range_size,
++            });
++            total_size_bytes += range_size;
++            largest_copy = (std::max)(largest_copy, range_size);
++        };
++        memory_tracker.ForEachUploadRange(
++            device_addr, size, [&](u64 device_addr_out, u64 range_size) {
++                DAddr upload_start = device_addr_out;
++                gpu_modified_ranges.ForEachInRange(device_addr_out, range_size,
++                                                   [&](DAddr gpu_start, DAddr gpu_end) {
++                                                       add_upload(upload_start, gpu_start);
++                                                       upload_start = gpu_end;
++                                                   });
++                add_upload(upload_start, device_addr_out + range_size);
++            });
++        if (total_size_bytes == 0) {
++            return true;
++        }
++        const std::span<BufferCopy> copies_span(upload_copies.data(), upload_copies.size());
++        UploadMemory(buffer, total_size_bytes, largest_copy, copies_span);
++        any_buffer_uploaded = true;
++        return false;
++    }
++    upload_copies.clear();
++    u64 total_size_bytes = 0;
++    u64 largest_copy = 0;
++    const DAddr buffer_start = buffer.cpu_addr_cached;
++    memory_tracker.ForEachUploadRange(device_addr, size, [&](u64 device_addr_out, u64 range_size) {
+         upload_copies.push_back(BufferCopy{
+             .src_offset = total_size_bytes,
+-            .dst_offset = start - buffer_start,
++            .dst_offset = device_addr_out - buffer_start,
+             .size = range_size,
+         });
+         total_size_bytes += range_size;
+         largest_copy = (std::max)(largest_copy, range_size);
+-    };
+-    memory_tracker.ForEachUploadRange(device_addr, size, [&](u64 device_addr_out, u64 range_size) {
+-        DAddr upload_start = device_addr_out;
+-        gpu_modified_ranges.ForEachInRange(device_addr_out, range_size, [&](DAddr gpu_start, DAddr gpu_end) {
+-            add_upload(upload_start, gpu_start);
+-            upload_start = gpu_end;
+-        });
+-        add_upload(upload_start, device_addr_out + range_size);
+     });
+     if (total_size_bytes == 0) {
+         return true;
+diff --git a/src/video_core/gpu.cpp b/src/video_core/gpu.cpp
+index 48376da7c..c8048376c 100644
+--- a/src/video_core/gpu.cpp
++++ b/src/video_core/gpu.cpp
+@@ -228,14 +228,20 @@ struct GPU::Impl {
+ 
+     /// Notify rasterizer that any caches of the specified region should be invalidated
+     void InvalidateRegion(DAddr addr, u64 size, bool preserve_gpu_writes) {
+-        VideoCore::RasterizerInterface* rasterizer = renderer->ReadRasterizer();
+-        if (preserve_gpu_writes && rasterizer->MustFlushRegion(addr, size, VideoCommon::CacheType::BufferCache)) {
+-            const u64 fence = RequestSyncOperation([rasterizer, addr, size] {
+-                rasterizer->FlushRegion(addr, size, VideoCommon::CacheType::BufferCache);
+-                rasterizer->OnCacheInvalidation(addr, size);
+-            });
+-            gpu_thread.TickGPU(is_async);
+-            WaitForSyncOperation(fence);
++        // Eden #4490/#4531 (ported to Eden (Doris)): when the game's code writes to a page that
++        // also holds bytes the GPU wrote (and that were never copied back), copy those back
++        // first, so neither the CPU nor the GPU caches end up with stale data.
++        if (preserve_gpu_writes) {
++            VideoCore::RasterizerInterface* rasterizer = renderer->ReadRasterizer();
++            if (!rasterizer->TryCacheInvalidation(addr, size)) {
++                Doris::Perf::Add(Doris::Perf::Count::GpuWritesKept);
++                const u64 fence = RequestSyncOperation([rasterizer, addr, size] {
++                    rasterizer->FlushRegion(addr, size, VideoCommon::CacheType::BufferCache);
++                    rasterizer->OnCacheInvalidation(addr, size);
++                });
++                gpu_thread.TickGPU(is_async);
++                WaitForSyncOperation(fence);
++            }
+             return;
+         }
+         gpu_thread.InvalidateRegion(addr, size);
+diff --git a/src/video_core/rasterizer_interface.h b/src/video_core/rasterizer_interface.h
+index 481efbf53..0658409f0 100644
+--- a/src/video_core/rasterizer_interface.h
++++ b/src/video_core/rasterizer_interface.h
+@@ -111,6 +111,16 @@ public:
+     /// Notify rasterizer that any caches of the specified region are desync with guest
+     virtual void OnCacheInvalidation(PAddr addr, u64 size) = 0;
+ 
++    /// Eden #4531: invalidates like OnCacheInvalidation, unless the buffer cache holds bytes the
++    /// GPU wrote in the region (then returns false and changes nothing).
++    virtual bool TryCacheInvalidation(DAddr addr, u64 size) {
++        if (MustFlushRegion(addr, size, VideoCommon::CacheType::BufferCache)) {
++            return false;
++        }
++        OnCacheInvalidation(addr, size);
++        return true;
++    }
++
+     virtual bool OnCPUWrite(PAddr addr, u64 size) = 0;
+ 
+     /// Sync memory between guest and host.
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index e65aa64d9..a50e91006 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -803,6 +803,22 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
+     pipeline_cache.InvalidateRegion(addr, size);
+ }
+ 
++bool RasterizerVulkan::TryCacheInvalidation(DAddr addr, u64 size) {
++    if (addr == 0 || size == 0) {
++        return true;
++    }
++    {
++        std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
++        if (buffer_cache.IsRegionGpuModified(addr, size)) {
++            return false;
++        }
++        texture_cache.WriteMemory(addr, size);
++        buffer_cache.WriteMemory(addr, size);
++    }
++    pipeline_cache.InvalidateRegion(addr, size);
++    return true;
++}
++
+ void RasterizerVulkan::InvalidateGPUCache() {
+     gpu.InvalidateGPUCache();
+ }
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index ed1aa7933..6036b6d90 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -106,6 +106,7 @@ public:
+                           VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
+     void InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) override;
+     void OnCacheInvalidation(DAddr addr, u64 size) override;
++    bool TryCacheInvalidation(DAddr addr, u64 size) override;
+     bool OnCPUWrite(DAddr addr, u64 size) override;
+     void InvalidateGPUCache() override;
+     void UnmapMemory(DAddr addr, u64 size) override;
+-- 
+2.43.0
+

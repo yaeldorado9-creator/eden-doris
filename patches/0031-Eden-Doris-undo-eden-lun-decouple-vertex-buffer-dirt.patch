@@ -1,7 +1,7 @@
 From e5df80dd2cfc14c42f16f73f557a44e85f614376 Mon Sep 17 00:00:00 2001
 From: "Eden (Doris) build" <doris@users.noreply.github.com>
 Date: Thu, 29 Oct 2026 13:38:15 -0500
-Subject: [PATCH 31/41] Eden (Doris): undo eden-lun "decouple vertex buffer
+Subject: [PATCH 31/49] Eden (Doris): undo eden-lun "decouple vertex buffer
  dirty from vertex input"
 
 That change pointed the first word of each vertex stream (stride + enable) at

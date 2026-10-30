@@ -1,7 +1,7 @@
 From ea79673bcd1cd1b944d1553ca2bf84ba46f6c76c Mon Sep 17 00:00:00 2001
 From: "Eden (Doris) build" <doris@users.noreply.github.com>
 Date: Thu, 29 Oct 2026 14:02:19 -0500
-Subject: [PATCH 34/41] Eden (Doris): frame generation resumes about 100 ms
+Subject: [PATCH 34/49] Eden (Doris): frame generation resumes about 100 ms
  after a hitch, not 1 s
 
 Any frame that takes over 100 ms (a shader compile, a loading hitch) makes the

@@ -1,7 +1,7 @@
 From cc46dab0930714634aba894abae801740a824578 Mon Sep 17 00:00:00 2001
 From: "Eden (Doris) build" <doris@users.noreply.github.com>
 Date: Thu, 29 Oct 2026 17:37:35 -0500
-Subject: [PATCH 37/41] Eden (Doris): texture cleanup that keeps GPU drawings
+Subject: [PATCH 37/49] Eden (Doris): texture cleanup that keeps GPU drawings
  (setting, on by default)
 
 Build 12's report: Eden's texture garbage collector starts at 40% of the GPU

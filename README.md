@@ -51,10 +51,14 @@ effect the next time the game starts; the ones marked "right away" apply as soon
   (and how many redundant barriers were left out) and tiled-cache barriers per frame; texture uploads (and how many
   replaced GPU-drawn contents) and what the texture garbage collector removed, copied back or called off, with GPU
   memory against its thresholds; upload volume, new staging buffers and new GPU memory per frame, and the time the GPU
-  thread spent getting or freeing GPU memory and waiting for the game's commands. It also lists the longest hitches
+  thread spent getting or freeing GPU memory, waiting for the game's commands and waiting for the texture and buffer
+  cache locks (and how long fence handling held them); how often the game wrote to pages holding GPU-written bytes
+  (copied back first) and how long it waited for that; how many wait-for-idles came inside a render pass and how many
+  had no storage writes by draws before them. It also lists the longest hitches
   (frames over 50 ms) of every 10 seconds, each with how long the GPU emulation thread was actually busy in it, how
-  long it waited for the game's commands, for the GPU, for presentation and for GPU memory, how busy the game's own
-  threads were, and the shaders, uploads, new memory, texture removals, draws and submits in that frame. While the
+  long it waited for the game's commands, for the GPU, for presentation, for GPU memory and for the cache locks, how
+  busy the game's own threads were, and the shaders, uploads, new memory, texture removals, draws and submits in that
+  frame. While the
   report is on, a hitch sampler records the GPU emulation thread's call stacks during every frame that runs past
   40 ms (every 2 ms, nothing in between) and writes those of frames over 50 ms to `doris_hitches.txt` in the log
   folder. Share it with **Share debug logs**.
@@ -73,6 +77,31 @@ effect the next time the game starts; the ones marked "right away" apply as soon
   4096, 8192 (default), no limit.
 * **Monster Hunter Rise record fix**: always (PR #4324, default), only in Monster Hunter Rise, or off. The log notes
   every time it rewrites a copy, and in which game.
+
+## Fixes from newer Eden (build 18)
+
+Doris is based on late-August Eden. These later Eden fixes are carried over (as git commits with
+`cherry picked from` lines, or ported where this base differs):
+
+* **TotK dark squares** (Eden #4565). Adreno (Qualcomm's driver and Turnip) rounds texture-gather coordinates
+  differently from the Switch's GPU, so a gather near a texel edge can read the neighbouring texels. In *Tears of the
+  Kingdom* that gives large dark squares on the ground; whole stretches of terrain can show the wrong material. Eden
+  already corrected the coordinates for other GPUs; now also for Qualcomm and Turnip.
+* **GPU-written data kept when the game writes next to it** (Eden #4490, #4531, #4530). With the NCE CPU backend,
+  the game writing anywhere on a page that also holds bytes the GPU wrote (culling results, indirect draw
+  arguments, vertex data) made Eden throw those bytes away and later re-read stale ones from guest memory. They are
+  now copied back first. Includes Eden's fix for the duplicate-interrupt deadlock this exposed.
+* **Dirty tracking for GPU inline uploads and macros** (Eden #4473): compute inline uploads and Maxwell macro
+  arguments that arrive in several pieces are tracked as one, and neighbouring macro arguments are no longer cleared.
+* **Bindless textures chosen by a condition** (Eden #4551): when a shader picks its texture with a condition, the
+  shader compiler now follows the condition instead of using an old handle (the wrong texture).
+* **Missing subgroup operations on Qualcomm and Turnip** (Eden #4508): warp shuffles and geometry shader subgroup
+  data are emulated where the driver lacks them, instead of being skipped.
+* **Buffer uploads without "optimized vertex buffers"** use Eden's older logic (Eden #4528), as Eden does on
+  Android.
+
+The shader changes mean the first game start after installing build 18 rebuilds the game's shaders (a longer
+loading screen, once).
 
 ## Submitting work to the GPU
 
@@ -133,8 +162,10 @@ Doris's texture cleanup (build 16, the default):
   included, so nothing piles up and nothing the game is still using is thrown out.
 * The pressure threshold is 2.45 GiB instead of 1.6 GiB (2.2 GiB in build 16; aggressive cleanup still starts at
   3.2 GiB). Above it, the rules are Eden's (unused for 25 frames).
-* From build 17 a removal is also called off when another texture over the same guest memory is created, removed or
-  drawn into before the copy is written back (the copy must never land on top of newer contents).
+* Build 17 also called a removal off whenever another texture over the same guest memory was created, removed or
+  drawn into before the copy was written back. In the build 17 log that started about 1850 copies back every
+  10 seconds (build 16: about 160), most of them called off again, and the GPU was busier. Build 18 is back to
+  build 16's rules.
 
 "Eden (as before)" switches back to build 15 (Eden's rules, one GPU wait per pass) without restarting the game.
 

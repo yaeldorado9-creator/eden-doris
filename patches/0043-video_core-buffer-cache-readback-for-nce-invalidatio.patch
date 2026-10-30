@@ -1,0 +1,91 @@
+From bbe478d4ae85b3b0ebacd65d547f35b257d05fb8 Mon Sep 17 00:00:00 2001
+From: xbzk <xbzk@eden-emu.dev>
+Date: Wed, 30 Sep 2026 22:13:37 +0200
+Subject: [PATCH 43/49] [video_core] buffer cache readback for nce
+ invalidations (#4490)
+
+- [x] I have read and followed the [Contribution Guidelines](https://git.eden-emu.dev/eden-emu/eden/src/branch/master/CONTRIBUTING.md#code-contributions).
+- [x] I have read and followed the [AI Policy](https://git.eden-emu.dev/eden-emu/eden/src/branch/master/docs/policies/AI.md)
+- [x] I have read and followed the [Coding Guidelines](https://git.eden-emu.dev/eden-emu/eden/src/branch/master/docs/policies/Coding.md) to the best of my ability.
+
+-------------------
+
+This is a follow up of 4473, a fix for the next Ender Magnolia known crash, the shackled beast's vaper crash, but specific for NCE.
+
+Imma try to be short:
+
+NCE invalidation was dooming whole guest pages when it shouldn't. If the GPU buffer cache owns some bytes on a page, invalidating first discards their ownership, and the retrying CPU can then observe stale data. On Android, this was corrupting some indirect draw packets and causing huge invalid index count reach staging memory allocation.
+
+Reviewed-on: https://git.eden-emu.dev/eden-emu/eden/pulls/4490
+Reviewed-by: CamilleLaVey <camillelavey99@gmail.com>
+Reviewed-by: lizzie <lizzie@eden-emu.dev>
+(cherry picked from commit 8e2d26c272681d6cafe6d5e703dafdc8200c7b65)
+---
+ src/core/memory.cpp    |  2 +-
+ src/video_core/gpu.cpp | 16 +++++++++++++---
+ src/video_core/gpu.h   |  2 +-
+ 3 files changed, 15 insertions(+), 5 deletions(-)
+
+diff --git a/src/core/memory.cpp b/src/core/memory.cpp
+index 013e83562..baa7c09b7 100644
+--- a/src/core/memory.cpp
++++ b/src/core/memory.cpp
+@@ -757,7 +757,7 @@ struct Memory::Impl {
+         };
+         auto& gpu = system.GPU();
+         gpu_device_memory->ApplyOpOnPointer(
+-            p, scratch_buffers[core], [&](DAddr address) { gpu.InvalidateRegion(address, size); });
++            p, scratch_buffers[core], [&](DAddr address) { gpu.InvalidateRegion(address, size, true); });
+     }
+ 
+     Core::System& system;
+diff --git a/src/video_core/gpu.cpp b/src/video_core/gpu.cpp
+index baa8c39d2..48376da7c 100644
+--- a/src/video_core/gpu.cpp
++++ b/src/video_core/gpu.cpp
+@@ -227,7 +227,17 @@ struct GPU::Impl {
+     }
+ 
+     /// Notify rasterizer that any caches of the specified region should be invalidated
+-    void InvalidateRegion(DAddr addr, u64 size) {
++    void InvalidateRegion(DAddr addr, u64 size, bool preserve_gpu_writes) {
++        VideoCore::RasterizerInterface* rasterizer = renderer->ReadRasterizer();
++        if (preserve_gpu_writes && rasterizer->MustFlushRegion(addr, size, VideoCommon::CacheType::BufferCache)) {
++            const u64 fence = RequestSyncOperation([rasterizer, addr, size] {
++                rasterizer->FlushRegion(addr, size, VideoCommon::CacheType::BufferCache);
++                rasterizer->OnCacheInvalidation(addr, size);
++            });
++            gpu_thread.TickGPU(is_async);
++            WaitForSyncOperation(fence);
++            return;
++        }
+         gpu_thread.InvalidateRegion(addr, size);
+     }
+ 
+@@ -516,8 +526,8 @@ void GPU::FlushRegion(DAddr addr, u64 size) {
+     impl->FlushRegion(addr, size);
+ }
+ 
+-void GPU::InvalidateRegion(DAddr addr, u64 size) {
+-    impl->InvalidateRegion(addr, size);
++void GPU::InvalidateRegion(DAddr addr, u64 size, bool preserve_gpu_writes) {
++    impl->InvalidateRegion(addr, size, preserve_gpu_writes);
+ }
+ 
+ bool GPU::OnCPUWrite(DAddr addr, u64 size) {
+diff --git a/src/video_core/gpu.h b/src/video_core/gpu.h
+index 75956ea19..974d214e1 100644
+--- a/src/video_core/gpu.h
++++ b/src/video_core/gpu.h
+@@ -248,7 +248,7 @@ public:
+     void FlushRegion(DAddr addr, u64 size);
+ 
+     /// Notify rasterizer that any caches of the specified region should be invalidated
+-    void InvalidateRegion(DAddr addr, u64 size);
++    void InvalidateRegion(DAddr addr, u64 size, bool preserve_gpu_writes = false);
+ 
+     /// Notify rasterizer that CPU is trying to write this area. It returns true if the area is
+     /// sensible, false otherwise, addr and size must be a valid combination
+-- 
+2.43.0
+

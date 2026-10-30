@@ -1,0 +1,44 @@
+From 2ce4cc637e66081f01ab669d5e841d7bdfb6d22b Mon Sep 17 00:00:00 2001
+From: xbzk <xbzk@eden-emu.dev>
+Date: Mon, 26 Oct 2026 17:24:45 +0100
+Subject: [PATCH 46/49] [nce] handles duplicate NCE interrupts (#4530)
+
+- [x] I have read and followed the [Contribution Guidelines](https://git.eden-emu.dev/eden-emu/eden/src/branch/master/CONTRIBUTING.md#code-contributions).
+- [x] I have read and followed the [AI Policy](https://git.eden-emu.dev/eden-emu/eden/src/branch/master/docs/policies/AI.md).
+- [x] I have read and followed the [Coding Guidelines](https://git.eden-emu.dev/eden-emu/eden/src/branch/master/docs/policies/Coding.md) to the best of my ability.
+
+-------------------
+Another crash observed in Ender Magnolia: A deadlock caused between CPUCore_0/GPU/GPUFencingThread.
+
+CPUCore_0 waits for GPU work inside the NCE fault handler
+GPU waits for the syncpoint mutex
+GPUFencingThread holds that mutex while waiting for CPUCore_0 NCE interrupt lock
+
+The fix makes duplicate interrupts return before acquiring the lock, while the first request keeps its original behavior.
+
+Reviewed-on: https://git.eden-emu.dev/eden-emu/eden/pulls/4530
+Reviewed-by: CamilleLaVey <camillelavey99@gmail.com>
+Reviewed-by: Shinmegumi <shinmegumi@eden-emu.dev>
+(cherry picked from commit 5239cbe2a78d6533e3541a71c4d3c723818dcb6e)
+---
+ src/core/arm/nce/arm_nce.cpp | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/core/arm/nce/arm_nce.cpp b/src/core/arm/nce/arm_nce.cpp
+index 63d5638fc..438dd4d98 100644
+--- a/src/core/arm/nce/arm_nce.cpp
++++ b/src/core/arm/nce/arm_nce.cpp
+@@ -369,8 +369,8 @@ void ArmNce::SetContext(const Kernel::Svc::ThreadContext& ctx) {
+ }
+ 
+ void ArmNce::SignalInterrupt(Kernel::KThread* thread) {
+-    // Add break loop condition.
+-    m_guest_ctx.esr_el1.fetch_or(static_cast<u64>(HaltReason::BreakLoop));
++    constexpr u64 break_loop = static_cast<u64>(HaltReason::BreakLoop);
++    if ((m_guest_ctx.esr_el1.fetch_or(break_loop) & break_loop) != 0) return;
+ 
+     auto* params = &thread->GetNativeExecutionParameters();
+     LockThreadParameters(params);
+-- 
+2.43.0
+

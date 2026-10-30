@@ -1,0 +1,222 @@
+From e39f2487e2bcf181460d2b4b5f51ef6f741256a0 Mon Sep 17 00:00:00 2001
+From: xbzk <xbzk@eden-emu.dev>
+Date: Mon, 26 Oct 2026 17:24:00 +0100
+Subject: [PATCH 47/49] [ir] resolve conditional Phi inputs when tracking
+ bindless texture handles (#4551)
+
+- [x] I have read and followed the [Contribution Guidelines](https://git.eden-emu.dev/eden-emu/eden/src/branch/master/CONTRIBUTING.md#code-contributions).
+- [x] I have read and followed the [AI Policy](https://git.eden-emu.dev/eden-emu/eden/src/branch/master/docs/policies/AI.md).
+- [x] I have read and followed the [Coding Guidelines](https://git.eden-emu.dev/eden-emu/eden/src/branch/master/docs/policies/Coding.md) to the best of my ability.
+
+-------------------
+Aimed to fix Ender Magnolia missing shader textures. Main example is Yolvan character bullets.
+
+By using windows version of the game, dxvk lib to make it vulkan, and renderdoc, it was possible to capture bullets, and by tracking backward composition and comparing with a similar scene from eden with missing bullets, it was possible to unveil the missing functionality: conditional Phi inputs resolve for bindless handles.
+By ignoring the boolean predicate register in the shader, handles for these shaders were resolving to some old value instead of proper live conditional ones.
+
+TESTS:
+-Compare Yolvan bullets
+-Usual roam on main titles for regression check.
+
+Reviewed-on: https://git.eden-emu.dev/eden-emu/eden/pulls/4551
+Reviewed-by: CamilleLaVey <camillelavey99@gmail.com>
+Reviewed-by: Shinmegumi <shinmegumi@eden-emu.dev>
+(cherry picked from commit 0689f73147ebeddb9ac5fb8b0edf2625425f8d71)
+---
+ .../frontend/ir/breadth_first_search.h        | 11 ++-
+ src/shader_recompiler/ir_opt/texture_pass.cpp | 87 +++++++++++++++----
+ 2 files changed, 79 insertions(+), 19 deletions(-)
+
+diff --git a/src/shader_recompiler/frontend/ir/breadth_first_search.h b/src/shader_recompiler/frontend/ir/breadth_first_search.h
+index ec5542554..afe153f18 100644
+--- a/src/shader_recompiler/frontend/ir/breadth_first_search.h
++++ b/src/shader_recompiler/frontend/ir/breadth_first_search.h
+@@ -1,8 +1,12 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
+ // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #pragma once
+ 
++#include <functional>
+ #include <optional>
+ #include <type_traits>
+ #include <queue>
+@@ -13,9 +17,10 @@
+ 
+ namespace Shader::IR {
+ 
+-template <typename Pred>
+-auto BreadthFirstSearch(const Value& value, Pred&& pred)
++template <typename Pred, typename Resolve = std::identity>
++auto BreadthFirstSearch(Value value, Pred&& pred, Resolve&& resolve = {})
+     -> std::invoke_result_t<Pred, const Inst*> {
++    value = resolve(value);
+     if (value.IsImmediate()) {
+         // Nothing to do with immediates
+         return std::nullopt;
+@@ -36,7 +41,7 @@ auto BreadthFirstSearch(const Value& value, Pred&& pred)
+         }
+         // Visit the right most arguments first
+         for (size_t arg = inst->NumArgs(); arg--;) {
+-            const Value arg_value{inst->Arg(arg)};
++            const Value arg_value{resolve(inst->Arg(arg))};
+             if (arg_value.IsImmediate()) {
+                 continue;
+             }
+diff --git a/src/shader_recompiler/ir_opt/texture_pass.cpp b/src/shader_recompiler/ir_opt/texture_pass.cpp
+index 0d0144fca..c84b5ae94 100644
+--- a/src/shader_recompiler/ir_opt/texture_pass.cpp
++++ b/src/shader_recompiler/ir_opt/texture_pass.cpp
+@@ -31,6 +31,60 @@ struct TextureInst {
+ 
+ using TextureInstVector = boost::container::small_vector<TextureInst, 24>;
+ 
++const IR::Block* ConditionalHeader(const IR::Block* body) {
++    const auto predecessors{body->ImmPredecessors()};
++    const auto successors{body->ImmSuccessors()};
++    if (predecessors.size() != 1 || successors.size() != 1) return nullptr;
++    const IR::Block* const header{predecessors[0]};
++    const auto targets{header->ImmSuccessors()};
++    if (targets.size() != 2 || targets[0] != body || targets[1] != successors[0] ||
++        targets[1]->ImmPredecessors().size() != 2 || header->empty() ||
++        header->back().GetOpcode() != IR::Opcode::ConditionRef) {
++        return nullptr;
++    }
++    return header;
++}
++
++std::pair<IR::Value, bool> Condition(IR::Value value) {
++    bool negated{};
++    while (const IR::Inst* inst = value.TryInstRecursive()) {
++        if (inst->GetOpcode() == IR::Opcode::LogicalNot) negated = !negated;
++        else if (inst->GetOpcode() != IR::Opcode::ConditionRef) break;
++        value = inst->Arg(0);
++    }
++    return {value.Resolve(), negated};
++}
++
++IR::Value ResolveConditionalPhi(IR::Value value, const IR::Block* block) {
++    if (!value.Resolve().IsPhi() || !(block = ConditionalHeader(block))) return value;
++    const auto [condition, negated]{Condition(block->back().Arg(0))};
++    boost::container::small_vector<const IR::Block*, 16> visited;
++    while (value.Resolve().IsPhi() && std::ranges::find(visited, block) == visited.end()) {
++        visited.push_back(block);
++        const IR::Inst* const phi{value.InstRecursive()};
++        const auto predecessors{block->ImmPredecessors()};
++        if (predecessors.size() == 1) {
++            block = predecessors[0];
++            continue;
++        }
++        if (predecessors.size() != 2 || phi->NumArgs() != 2) break;
++        const IR::Block* body{predecessors[0]};
++        const IR::Block* header{ConditionalHeader(body)};
++        if (header != predecessors[1]) {
++            body = predecessors[1];
++            header = ConditionalHeader(body);
++            if (header != predecessors[0]) break;
++        }
++        const auto [other_condition, other_negated]{Condition(header->back().Arg(0))};
++        if (condition == other_condition && (phi->PhiBlock(0) == header || phi->PhiBlock(0) == body)) {
++            const IR::Block* const incoming{negated == other_negated ? body : header};
++            value = phi->Arg(phi->PhiBlock(0) == incoming ? 0 : 1);
++        }
++        block = header;
++    }
++    return value;
++}
++
+ constexpr u32 DESCRIPTOR_SIZE = 8;
+ constexpr u32 DESCRIPTOR_SIZE_SHIFT = u32(std::countr_zero(DESCRIPTOR_SIZE));
+ constexpr u32 DESCRIPTOR_MAX_COUNT = 1024;
+@@ -299,23 +353,23 @@ static inline bool IsTexturePixelFormatIntegerCached(Environment& env,
+ }
+ 
+ 
+-std::optional<ConstBufferAddr> Track(const IR::Value& value, Environment& env, const HostTranslateInfo& host_info);
+-static inline std::optional<ConstBufferAddr> TrackCached(const IR::Value& v, Environment& env, const HostTranslateInfo& host_info) {
+-    if (const IR::Inst* key = v.InstRecursive()) {
++std::optional<ConstBufferAddr> Track(const IR::Value& value, Environment& env, const HostTranslateInfo& host_info, const IR::Block* block);
++static inline std::optional<ConstBufferAddr> TrackCached(const IR::Value& v, Environment& env, const HostTranslateInfo& host_info, const IR::Block* block) {
++    if (const IR::Inst* key = v.TryInstRecursive()) {
+         if (auto it = env.track_cache.find(key); it != env.track_cache.end()) return it->second;
+-        auto found = Track(v, env, host_info);
++        auto found = Track(v, env, host_info, block);
+         if (found) env.track_cache.emplace(key, *found);
+         return found;
+     }
+-    return Track(v, env, host_info);
++    return Track(v, env, host_info, block);
+ }
+ 
+-std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environment& env, const HostTranslateInfo& host_info);
++std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environment& env, const HostTranslateInfo& host_info, const IR::Block* block);
+ 
+-std::optional<ConstBufferAddr> Track(const IR::Value& value, Environment& env, const HostTranslateInfo& host_info) {
+-    return IR::BreadthFirstSearch(value, [&env, &host_info](const IR::Inst* inst) {
+-        return TryGetConstBuffer(inst, env, host_info);
+-    });
++std::optional<ConstBufferAddr> Track(const IR::Value& value, Environment& env, const HostTranslateInfo& host_info, const IR::Block* block) {
++    return IR::BreadthFirstSearch(value, [&env, &host_info, block](const IR::Inst* inst) {
++        return TryGetConstBuffer(inst, env, host_info, block);
++    }, [&](IR::Value operand) { return ResolveConditionalPhi(operand, block); });
+ }
+ 
+ std::optional<u32> TryGetConstant(IR::Value& value, Environment& env) {
+@@ -339,13 +393,13 @@ std::optional<u32> TryGetConstant(IR::Value& value, Environment& env) {
+     return ReadCbufCached(env, index_number, offset_number);
+ }
+ 
+-std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environment& env, const HostTranslateInfo& host_info) {
++std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environment& env, const HostTranslateInfo& host_info, const IR::Block* block) {
+     switch (inst->GetOpcode()) {
+     default:
+         return std::nullopt;
+     case IR::Opcode::BitwiseOr32: {
+-        std::optional lhs{TrackCached(inst->Arg(0), env, host_info)};
+-        std::optional rhs{TrackCached(inst->Arg(1), env, host_info)};
++        std::optional lhs{TrackCached(inst->Arg(0), env, host_info, block)};
++        std::optional rhs{TrackCached(inst->Arg(1), env, host_info, block)};
+         if (!lhs || !rhs) {
+             return std::nullopt;
+         }
+@@ -375,7 +429,7 @@ std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environme
+         if (!shift.IsImmediate()) {
+             return std::nullopt;
+         }
+-        std::optional lhs{TrackCached(inst->Arg(0), env, host_info)};
++        std::optional lhs{TrackCached(inst->Arg(0), env, host_info, block)};
+         if (lhs) {
+             lhs->shift_left = shift.U32();
+         }
+@@ -403,7 +457,7 @@ std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environme
+                 return std::nullopt;
+             } while (false);
+         }
+-        std::optional lhs{TrackCached(op1, env, host_info)};
++        std::optional lhs{TrackCached(op1, env, host_info, block)};
+         if (lhs) {
+             lhs->shift_left = static_cast<u32>(std::countr_zero(op2.U32()));
+         }
+@@ -469,7 +523,7 @@ std::optional<ConstBufferAddr> TryGetConstBuffer(const IR::Inst* inst, Environme
+ TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst, const HostTranslateInfo& host_info) {
+     ConstBufferAddr addr;
+     if (IsBindless(inst)) {
+-        const std::optional<ConstBufferAddr> track_addr{TrackCached(inst.Arg(0), env, host_info)};
++        const std::optional<ConstBufferAddr> track_addr{TrackCached(inst.Arg(0), env, host_info, block)};
+ 
+         if (!track_addr) {
+             throw NotImplementedException("Failed to track bindless texture constant buffer");
+@@ -671,6 +725,7 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
+     env.track_cache.clear();
+     TextureInstVector to_replace;
+     for (IR::Block* const block : program.post_order_blocks) {
++        env.track_cache.clear();
+         for (IR::Inst& inst : block->Instructions()) {
+             if (!IsTextureInstruction(inst)) {
+                 continue;
+-- 
+2.43.0
+
