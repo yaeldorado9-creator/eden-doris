@@ -47,7 +47,7 @@ if [ ! -f "$OUT/build/build.ninja" ]; then
 fi
 ninja -C "$OUT/build" src/freedreno/vulkan/libvulkan_freedreno.so
 PKG=$OUT/pkg; rm -rf "$PKG"; mkdir -p "$PKG"
-cp "$OUT/build/src/freedreno/vulkan/libvulkan_freedreno.so" "$PKG/vulkan.freedreno.so"
+"$TC/bin/llvm-strip" --strip-all "$OUT/build/src/freedreno/vulkan/libvulkan_freedreno.so" -o "$PKG/vulkan.freedreno.so"
 SHA=$(git -C "$MESA" rev-parse --short=10 HEAD)
 sed -e "s/@NUM@/$NUM/g" -e "s/@SHA@/$SHA/g" -e "s/@LABEL@/$LABEL/g" "$HERE/meta.json.in" > "$PKG/meta.json"
 ( cd "$PKG" && rm -f "../$ZIP" && zip -q -9 "../$ZIP" meta.json vulkan.freedreno.so )
