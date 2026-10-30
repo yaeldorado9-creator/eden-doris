@@ -1,4 +1,4 @@
-From dd945a920d51114115e19e42fe3b7a19c0382026 Mon Sep 17 00:00:00 2001
+From af06498883f922c3243a6ae05439f162c70228bc Mon Sep 17 00:00:00 2001
 From: "Eden (Doris) build" <doris@users.noreply.github.com>
 Date: Fri, 30 Oct 2026 09:58:02 -0500
 Subject: [PATCH] Eden (Doris): NCE: the game's reads of memory a GPU drawing
@@ -332,7 +332,7 @@ index 7fc46cdcd..fc74b01b2 100644
  void DeviceMemoryManager<Traits>::UpdatePagesCachedCount(DAddr addr, size_t size, s32 delta) {
      Common::ScopedRangeLock lk(counter_guard, addr, size);
 diff --git a/src/core/memory.cpp b/src/core/memory.cpp
-index baa7c09b7..ae02ee8f6 100644
+index baa7c09b7..a92140f5d 100644
 --- a/src/core/memory.cpp
 +++ b/src/core/memory.cpp
 @@ -11,6 +11,7 @@
@@ -451,7 +451,7 @@ index baa7c09b7..ae02ee8f6 100644
 +                }
 +                thread_local Common::ScratchBuffer<u32> doris_scratch;
 +                gpu_device_memory->ApplyOpOnPointer(pointer, doris_scratch, [&](DAddr address) {
-+                    system.GPU().OnCPURead(address, YUZU_PAGESIZE);
++                    (void)system.GPU().OnCPURead(address, YUZU_PAGESIZE);
 +                });
 +            }
 +        }
