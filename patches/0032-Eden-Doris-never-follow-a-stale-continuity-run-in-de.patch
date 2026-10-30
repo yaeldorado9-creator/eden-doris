@@ -1,7 +1,7 @@
 From 126ac55e520484c2cc091c2da392dc991df10cbd Mon Sep 17 00:00:00 2001
 From: "Eden (Doris) build" <doris@users.noreply.github.com>
 Date: Thu, 29 Oct 2026 13:39:17 -0500
-Subject: [PATCH 32/40] Eden (Doris): never follow a stale continuity run in
+Subject: [PATCH 32/41] Eden (Doris): never follow a stale continuity run in
  device memory
 
 A continuity run recorded when a mapping was made can outlive a later unmap or

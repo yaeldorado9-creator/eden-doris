@@ -1,7 +1,7 @@
 From 8ff061eae559584bbc1cb8f849c335afa5e1048f Mon Sep 17 00:00:00 2001
 From: alvindimas05 <alvin.dimas.praditya@gmail.com>
 Date: Fri, 23 Oct 2026 11:12:02 +0700
-Subject: [PATCH 23/40] [maxwell_3d] reserve macro parameter buffer up front
+Subject: [PATCH 23/41] [maxwell_3d] reserve macro parameter buffer up front
 
 (cherry picked from commit 5e4809145dd433ae5d440e375881745920bea7df)
 ---

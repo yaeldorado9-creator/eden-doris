@@ -1,0 +1,1106 @@
+From 0bc92253d3fe438e97fb816d192366684a24c224 Mon Sep 17 00:00:00 2001
+From: "Eden (Doris) build" <doris@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 19:45:15 -0500
+Subject: [PATCH 41/41] Eden (Doris): bigger stream buffer for uploads;
+ pipeline builders on fast cores when shaders are synchronous; shader loop
+ limit back to 8192; hitch sampler
+
+- Stream buffer 512 MiB on Android (prefaulted at load), uploads up to half of it go through
+  it, and the real GPU progress is read before falling back to (or creating) staging buffers.
+  Build 16's longest hitches came with GPU memory jumping 256-576 MiB in 64 MiB blocks and
+  falling back within seconds.
+- With asynchronous shaders off, pipeline builder threads run at normal priority on the
+  performance cores instead of as power-efficient background threads (the Vulkan worker
+  waited 55-224 ms per new pipeline).
+- Shader loop limit default 8192 (Eden's) instead of PR #4324's 256: the counter is per
+  invocation for the whole shader, so nested loops were cut short.
+- Async texture removal is also called off when another texture over the same memory is
+  created, removed or drawn into meanwhile; pressure threshold 2.45 GiB.
+- Report: upload volume, new staging buffers and GPU memory, time getting/freeing GPU memory,
+  waiting for the game's commands, game threads' CPU time per hitch; hitch sampler writes
+  the GPU thread's stacks during frames over 50 ms to doris_hitches.txt.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014Ps8wnhVXtSU7d88gGtyHX
+---
+ .../app/src/main/res/values/strings.xml       |   6 +-
+ src/common/doris_perf.cpp                     | 100 ++++++-
+ src/common/doris_perf.h                       |  15 +
+ src/common/doris_profiler.cpp                 | 273 +++++++++++++++++-
+ src/common/doris_profiler.h                   |  10 +
+ src/common/settings.h                         |  13 +-
+ src/common/thread.cpp                         |   6 +
+ src/common/thread.h                           |   5 +
+ src/common/thread_worker.h                    |   6 +-
+ src/core/cpu_manager.cpp                      |   2 +
+ src/video_core/gpu_thread.cpp                 |   7 +-
+ .../renderer_vulkan/vk_pipeline_cache.cpp     |   8 +-
+ .../vk_staging_buffer_pool.cpp                |  51 +++-
+ src/video_core/texture_cache/texture_cache.h  |  66 ++++-
+ .../texture_cache/texture_cache_base.h        |   6 +
+ .../vulkan_common/vulkan_memory_allocator.cpp |  16 +-
+ 16 files changed, 544 insertions(+), 46 deletions(-)
+
+diff --git a/src/android/app/src/main/res/values/strings.xml b/src/android/app/src/main/res/values/strings.xml
+index 65164156c..2bacb742f 100644
+--- a/src/android/app/src/main/res/values/strings.xml
++++ b/src/android/app/src/main/res/values/strings.xml
+@@ -609,7 +609,7 @@
+     <string name="doris_cores_doris">Doris: GPU thread on the fastest core</string>
+     <string name="doris_cores_system">Let Android decide (Eden)</string>
+     <string name="doris_texture_cleanup">Texture cleanup</string>
+-    <string name="doris_texture_cleanup_description">How old textures are removed from GPU memory. Eden copies each texture the GPU drew into back to game memory and waits for the GPU every time (a hitch), and below 1.6 GB of GPU memory keeps those drawings while removing everything else after 50 frames, so TotK keeps re-uploading textures. Doris copies back without waiting, removes a texture only after its copy is done (and keeps it if it was used meanwhile), and gives every texture 300 frames below 2.2 GB. Takes effect right away.</string>
++    <string name="doris_texture_cleanup_description">How old textures are removed from GPU memory. Eden copies each texture the GPU drew into back to game memory and waits for the GPU every time (a hitch), and below 1.6 GB of GPU memory keeps those drawings while removing everything else after 50 frames, so TotK keeps re-uploading textures. Doris copies back without waiting, removes a texture only after its copy is done (and keeps it if it was used meanwhile), and gives every texture 300 frames below 2.45 GB. Takes effect right away.</string>
+     <string name="doris_texture_cleanup_doris">Doris: no waits, fewer re-uploads</string>
+     <string name="doris_texture_cleanup_eden">Eden (as before)</string>
+     <string name="doris_gpu_barriers">GPU barriers</string>
+@@ -629,11 +629,11 @@
+     <string name="doris_texture_decode_threads">Texture decoding threads</string>
+     <string name="doris_texture_decode_threads_description">Background threads that decode textures with CPU Async (Eden uses 1). More threads let new places fill in faster. Takes effect the next time the game starts.</string>
+     <string name="doris_shader_loop_limit">Shader loop limit</string>
+-    <string name="doris_shader_loop_limit_description">How many times a loop inside a game shader may repeat before it is cut short. The PR #4324 build uses 256 (faster, but long loops are cut); Eden normally uses 8192. Takes effect the next time the game starts.</string>
++    <string name="doris_shader_loop_limit_description">How many times a loop inside a game shader may repeat before it is cut short. The count runs for the whole shader, so a loop inside another loop reaches it quickly. The PR #4324 build uses 256 (made for Monster Hunter Rise; cuts real work short in other games); Eden and Doris use 8192. Changing it recompiles the affected shaders once, so that game start takes longer. Takes effect the next time the game starts.</string>
+     <string name="doris_mhr_fix">Monster Hunter Rise record fix</string>
+     <string name="doris_mhr_fix_description">The PR #4324 workaround for character flicker in Monster Hunter Rise. That build runs it in every game; it can be limited to Monster Hunter Rise or turned off.</string>
+     <string name="doris_loop_limit_256">256 (PR #4324)</string>
+-    <string name="doris_loop_limit_8192">8192 (Eden default)</string>
++    <string name="doris_loop_limit_8192">8192 (Eden and Doris default)</string>
+     <string name="doris_loop_limit_off">No limit</string>
+     <string name="doris_mhr_fix_always">Always (PR #4324)</string>
+     <string name="doris_mhr_fix_mhr_only">Only in Monster Hunter Rise</string>
+diff --git a/src/common/doris_perf.cpp b/src/common/doris_perf.cpp
+index b92751400..301369344 100644
+--- a/src/common/doris_perf.cpp
++++ b/src/common/doris_perf.cpp
+@@ -30,6 +30,7 @@
+ 
+ #include <fmt/format.h>
+ 
++#include "common/doris_profiler.h"
+ #include "common/logging.h"
+ #include "common/settings.h"
+ #include "common/thread.h"
+@@ -100,6 +101,8 @@ struct Hitch {
+     /// CPU time the GPU emulation thread used during the frame. Close to frame_ms: that thread
+     /// was the bottleneck. Far below it (and few waits): it sat idle waiting for the game.
+     double gpu_thread_cpu_ms{};
++    /// CPU time the game's own threads (emulated CPU cores) used during the frame, all together.
++    double game_cpu_ms{};
+     std::array<std::uint64_t, static_cast<size_t>(Count::Max)> counts{};
+     std::array<std::uint64_t, static_cast<size_t>(Wait::Max)> waits_ns{};
+ };
+@@ -115,11 +118,17 @@ struct FrameState {
+     bool valid{false};
+     Clock::time_point start;
+     std::uint64_t gpu_thread_cpu_ns{};
++    std::uint64_t game_cpu_ns{};
+     std::array<std::uint64_t, static_cast<size_t>(Count::Max)> counts{};
+     std::array<std::uint64_t, static_cast<size_t>(Wait::Max)> waits_ns{};
+ };
+ FrameState frame_state;
+ 
++/// Threads running the game's code (emulated CPU cores).
++constexpr size_t MAX_GAME_THREADS = 8;
++std::array<std::atomic<int>, MAX_GAME_THREADS> game_thread_ids{};
++std::atomic<size_t> game_thread_count{0};
++
+ std::uint64_t ThreadCpuNs() {
+ #if defined(__linux__) || defined(__ANDROID__)
+     timespec now{};
+@@ -131,6 +140,30 @@ std::uint64_t ThreadCpuNs() {
+     return 0;
+ }
+ 
++/// CPU time used so far by all the game's threads together (ns).
++std::uint64_t GameThreadsCpuNs() {
++    std::uint64_t total = 0;
++#if defined(__linux__) || defined(__ANDROID__)
++    const size_t count = std::min(game_thread_count.load(std::memory_order_relaxed),
++                                  MAX_GAME_THREADS);
++    for (size_t i = 0; i < count; ++i) {
++        const int tid = game_thread_ids[i].load(std::memory_order_acquire);
++        if (tid <= 0) {
++            continue;
++        }
++        // The kernel's per-thread CPU clock of another thread in this process
++        // (MAKE_THREAD_CPUCLOCK(tid, CPUCLOCK_SCHED)).
++        const clockid_t clock = static_cast<clockid_t>((~static_cast<unsigned>(tid) << 3) | 6U);
++        timespec now{};
++        if (clock_gettime(clock, &now) == 0) {
++            total += static_cast<std::uint64_t>(now.tv_sec) * 1'000'000'000ULL +
++                     static_cast<std::uint64_t>(now.tv_nsec);
++        }
++    }
++#endif
++    return total;
++}
++
+ std::string ReadFirstLine(const std::string& path) {
+     std::ifstream file(path);
+     std::string line;
+@@ -451,6 +484,20 @@ void ReportLoop() {
+                                  prime * 100 / samples, middle * 100 / samples,
+                                  little * 100 / samples);
+         }
++        LOG_INFO(Frontend,
++                 "Doris perf: per frame {:.2f} MiB uploaded, {:.2f} new staging buffers ({:.2f} "
++                 "MiB), {:.2f} MiB new GPU memory, GPU thread {:.2f} ms getting/freeing GPU "
++                 "memory and {:.1f} ms waiting for the game's commands",
++                 static_cast<double>(counted[static_cast<size_t>(Count::UploadBytes)]) /
++                     (1024.0 * 1024.0) / frame_count,
++                 per_frame(counted[static_cast<size_t>(Count::StagingCreated)]),
++                 static_cast<double>(counted[static_cast<size_t>(Count::StagingCreatedBytes)]) /
++                     (1024.0 * 1024.0) / frame_count,
++                 static_cast<double>(
++                     counted[static_cast<size_t>(Count::GpuMemoryAllocatedBytes)]) /
++                     (1024.0 * 1024.0) / frame_count,
++                 ms_per_frame(waited[static_cast<size_t>(Wait::GpuMemory)]),
++                 ms_per_frame(waited[static_cast<size_t>(Wait::GameCommands)]));
+         LOG_INFO(Frontend,
+                  "Doris perf: GPU work per frame {:.1f} ms (frame generation {:.1f} ms, output "
+                  "scaling {:.1f} ms) | cores: {}",
+@@ -497,20 +544,28 @@ void ReportLoop() {
+             const auto w = [&](Wait kind) {
+                 return static_cast<double>(hitch.waits_ns[static_cast<size_t>(kind)]) / 1e6;
+             };
++            const auto mib = [&](Count counter) {
++                return static_cast<double>(c(counter)) / (1024.0 * 1024.0);
++            };
+             LOG_INFO(Frontend,
+                      "Doris hitch: {:.0f} ms frame ({:.1f} s before this line; {} over {:.0f} ms "
+-                     "in this window) | GPU thread busy {:.0f} ms, waited for the GPU {:.1f} ms, "
+-                     "for presentation {:.1f} ms; Vulkan worker waited for shaders {:.1f} ms | "
+-                     "{} new pipelines, {} texture uploads, {} textures removed ({} copies back "
+-                     "started), {} draws, {} dispatches, {} render passes, {} submits, {} "
+-                     "wait-for-idles, {} protection changes, {} worker wake-ups",
++                     "in this window) | GPU thread busy {:.0f} ms, waited for the game's "
++                     "commands {:.0f} ms, for the GPU {:.1f} ms, for presentation {:.1f} ms, "
++                     "getting/freeing GPU memory {:.1f} ms; game threads busy {:.0f} ms; Vulkan "
++                     "worker waited for shaders {:.1f} ms | {} new pipelines, {} texture uploads, "
++                     "{:.1f} MiB uploaded, {} new staging buffers ({:.0f} MiB), {:.0f} MiB new "
++                     "GPU memory, {} textures removed ({} copies back started), {} draws, {} "
++                     "dispatches, {} render passes, {} submits, {} wait-for-idles, {} protection "
++                     "changes, {} worker wake-ups",
+                      hitch.frame_ms, std::chrono::duration<double>(now - hitch.end).count(),
+-                     window_hitch_count, HITCH_MS, hitch.gpu_thread_cpu_ms, w(Wait::GpuFence),
+-                     w(Wait::PresentFrame), w(Wait::Shaders), c(Count::NewPipelines),
+-                     c(Count::TextureUploads), c(Count::GcRemoved), c(Count::GcDownloaded),
+-                     c(Count::Draws), c(Count::Dispatches), c(Count::RenderPasses),
+-                     c(Count::Submits), c(Count::WaitForIdle), c(Count::ProtectCalls),
+-                     c(Count::WorkerWakeups));
++                     window_hitch_count, HITCH_MS, hitch.gpu_thread_cpu_ms, w(Wait::GameCommands),
++                     w(Wait::GpuFence), w(Wait::PresentFrame), w(Wait::GpuMemory),
++                     hitch.game_cpu_ms, w(Wait::Shaders), c(Count::NewPipelines),
++                     c(Count::TextureUploads), mib(Count::UploadBytes), c(Count::StagingCreated),
++                     mib(Count::StagingCreatedBytes), mib(Count::GpuMemoryAllocatedBytes),
++                     c(Count::GcRemoved), c(Count::GcDownloaded), c(Count::Draws),
++                     c(Count::Dispatches), c(Count::RenderPasses), c(Count::Submits),
++                     c(Count::WaitForIdle), c(Count::ProtectCalls), c(Count::WorkerWakeups));
+         }
+     }
+ }
+@@ -558,6 +613,16 @@ void AddGpuTime(GpuPart part, std::uint64_t nanoseconds) {
+     gpu_ns[static_cast<size_t>(part)].fetch_add(nanoseconds, std::memory_order_relaxed);
+ }
+ 
++void RegisterGameThread() {
++#ifdef DORIS_PERF_PROCFS
++    const size_t index = game_thread_count.fetch_add(1);
++    if (index >= MAX_GAME_THREADS) {
++        return;
++    }
++    game_thread_ids[index].store(static_cast<int>(syscall(SYS_gettid)), std::memory_order_release);
++#endif
++}
++
+ void RegisterThread(const char* label) {
+     if (std::strcmp(label, "GPU") == 0) {
+         is_gpu_thread = true;
+@@ -578,14 +643,17 @@ void OnGameFrame() {
+         return;
+     }
+     std::call_once(start_flag, [] { std::thread(ReportLoop).detach(); });
++    // On the GPU emulation thread (this function runs there); does nothing once started for it.
++    Doris::Profiler::StartHitchSampler();
+     const auto now = Clock::now();
+     const auto counts_now = ReadAll(counters);
+     const auto waits_now = ReadAll(wait_ns);
+     const std::uint64_t cpu_now = ThreadCpuNs();
++    const std::uint64_t game_cpu_now = GameThreadsCpuNs();
+     std::optional<Hitch> hitch;
++    double frame_ms = 0.0;
+     if (frame_state.valid) {
+-        const double frame_ms =
+-            std::chrono::duration<double, std::milli>(now - frame_state.start).count();
++        frame_ms = std::chrono::duration<double, std::milli>(now - frame_state.start).count();
+         if (frame_ms >= HITCH_MS) {
+             hitch.emplace();
+             hitch->end = now;
+@@ -593,13 +661,19 @@ void OnGameFrame() {
+             hitch->gpu_thread_cpu_ms =
+                 static_cast<double>(cpu_now - std::min(cpu_now, frame_state.gpu_thread_cpu_ns)) /
+                 1e6;
++            hitch->game_cpu_ms =
++                static_cast<double>(game_cpu_now -
++                                    std::min(game_cpu_now, frame_state.game_cpu_ns)) /
++                1e6;
+             hitch->counts = Since(counts_now, frame_state.counts);
+             hitch->waits_ns = Since(waits_now, frame_state.waits_ns);
+         }
+     }
++    Doris::Profiler::HitchFrameBoundary(frame_ms);
+     frame_state.valid = true;
+     frame_state.start = now;
+     frame_state.gpu_thread_cpu_ns = cpu_now;
++    frame_state.game_cpu_ns = game_cpu_now;
+     frame_state.counts = counts_now;
+     frame_state.waits_ns = waits_now;
+ 
+diff --git a/src/common/doris_perf.h b/src/common/doris_perf.h
+index eaa656013..26e763deb 100644
+--- a/src/common/doris_perf.h
++++ b/src/common/doris_perf.h
+@@ -43,6 +43,13 @@ enum class Count : int {
+     GcCancelled,
+     /// Full barriers skipped because nothing was recorded since the previous one.
+     BarriersSkipped,
++    /// Bytes handed to the GPU through upload staging memory (textures, buffers).
++    UploadBytes,
++    /// Staging buffers newly created (each one is fresh memory the kernel has to provide).
++    StagingCreated,
++    StagingCreatedBytes,
++    /// GPU memory allocated for textures and buffers.
++    GpuMemoryAllocatedBytes,
+     /// Memory protection changes for CPU write tracking.
+     ProtectCalls,
+     /// The game's "wait for idle" GPU commands.
+@@ -78,6 +85,10 @@ enum class Wait : int {
+     Shaders,
+     /// Waiting for the GPU to reach a point (fences, synchronization with the game).
+     GpuFence,
++    /// Getting or freeing GPU memory (textures, buffers, staging memory).
++    GpuMemory,
++    /// The GPU emulation thread waiting for the game to send GPU commands.
++    GameCommands,
+     Max,
+ };
+ 
+@@ -115,4 +126,8 @@ void AddGpuTime(GpuPart part, std::uint64_t nanoseconds);
+ /// which kind of core it mostly ran on.
+ void RegisterThread(const char* label);
+ 
++/// Remembers a thread that runs the game's code (emulated CPU core), so a hitch can say how
++/// busy the game's own threads were during it.
++void RegisterGameThread();
++
+ } // namespace Doris::Perf
+diff --git a/src/common/doris_profiler.cpp b/src/common/doris_profiler.cpp
+index d142b1f51..7552ca03a 100644
+--- a/src/common/doris_profiler.cpp
++++ b/src/common/doris_profiler.cpp
+@@ -16,6 +16,7 @@
+ #include <cstdint>
+ #include <cstring>
+ #include <ctime>
++#include <deque>
+ #include <fstream>
+ #include <map>
+ #include <mutex>
+@@ -70,7 +71,17 @@ std::array<Slot, MAX_THREADS> slots;
+ std::atomic<int> slot_count{0};
+ std::once_flag start_flag;
+ 
++void HitchHandler(const ucontext_t* context);
++
+ void Handler(int, siginfo_t* info, void* raw_context) {
++    if (info->si_code == SI_TKILL) {
++        // Sent by the hitch sampler's watchdog (pthread_kill), not by a profiler timer.
++        HitchHandler(static_cast<const ucontext_t*>(raw_context));
++        return;
++    }
++    if (info->si_code != SI_TIMER) {
++        return;
++    }
+     const int index = info->si_value.sival_int;
+     if (index < 0 || index >= MAX_THREADS) {
+         return;
+@@ -265,20 +276,265 @@ void WriterLoop() {
+     }
+ }
+ 
+-} // Anonymous namespace
+ 
+-void RegisterCurrentThread(const char* label) {
+-    if (!Settings::values.doris_profiler.GetValue()) {
+-        return;
+-    }
+-    std::call_once(start_flag, [] {
++std::once_flag handler_flag;
++
++void InstallHandler() {
++    std::call_once(handler_flag, [] {
+         struct sigaction action {};
+         action.sa_sigaction = Handler;
+         action.sa_flags = SA_SIGINFO | SA_RESTART;
+         sigemptyset(&action.sa_mask);
+         sigaction(SIGPROF, &action, nullptr);
+-        std::thread(WriterLoop).detach();
+     });
++}
++
++// ---- Hitch sampler -------------------------------------------------------------------------
++
++constexpr auto HITCH_ARM_AFTER = std::chrono::milliseconds{40};
++constexpr auto HITCH_SAMPLE_EVERY = std::chrono::milliseconds{2};
++constexpr double HITCH_MIN_MS = 50.0;
++constexpr uint32_t HITCH_CAPACITY = 4096;   // samples in the ring (8 s of sampling)
++constexpr size_t HITCHES_KEPT = 60;
++constexpr auto HITCH_WRITE_INTERVAL = std::chrono::seconds{10};
++
++struct HitchSampler {
++    /// The sampled thread (the current GPU emulation thread) while active.
++    std::atomic<int> tid{0};
++    uintptr_t stack_low{};
++    uintptr_t stack_high{};
++    std::atomic<bool> active{false};
++    /// Start of the frame in progress (steady clock, ns) and its number.
++    std::atomic<int64_t> frame_start_ns{0};
++    std::atomic<uint32_t> frame_id{0};
++    /// Ring of samples; written only by the signal handler on the sampled thread.
++    std::array<Sample, HITCH_CAPACITY> samples{};
++    std::atomic<uint32_t> write_pos{0};
++    uint32_t frame_first_pos{0}; // sampled thread only
++};
++HitchSampler hitch;
++
++struct FinishedHitch {
++    double frame_ms;
++    std::chrono::steady_clock::time_point when;
++    std::vector<Sample> samples;
++};
++std::mutex finished_mutex;
++std::deque<FinishedHitch> finished_hitches;
++bool finished_dirty = false;
++
++int64_t NowNs() {
++    return std::chrono::duration_cast<std::chrono::nanoseconds>(
++               std::chrono::steady_clock::now().time_since_epoch())
++        .count();
++}
++
++int CurrentTid() {
++    // bionic keeps the thread id in thread-local storage (no system call, signal safe).
++    return static_cast<int>(gettid());
++}
++
++void HitchHandler(const ucontext_t* context) {
++    // Only ever sample the thread the sampler was started on (its stack bounds are known).
++    if (!hitch.active.load(std::memory_order_acquire) ||
++        CurrentTid() != hitch.tid.load(std::memory_order_relaxed)) {
++        return;
++    }
++    const uint32_t position = hitch.write_pos.load(std::memory_order_relaxed);
++    Sample& sample = hitch.samples[position % HITCH_CAPACITY];
++    sample.pc = static_cast<uintptr_t>(context->uc_mcontext.pc);
++    sample.lr = static_cast<uintptr_t>(context->uc_mcontext.regs[30]);
++    uint32_t depth = 0;
++    uintptr_t fp = static_cast<uintptr_t>(context->uc_mcontext.regs[29]);
++    while (depth < sample.frames.size()) {
++        if ((fp & 15) != 0 || fp < hitch.stack_low || fp + 16 > hitch.stack_high) {
++            break;
++        }
++        const auto* record = reinterpret_cast<const uintptr_t*>(fp);
++        const uintptr_t next = record[0];
++        const uintptr_t ret = record[1];
++        if (ret == 0) {
++            break;
++        }
++        sample.frames[depth++] = ret;
++        if (next <= fp) {
++            break;
++        }
++        fp = next;
++    }
++    sample.depth = depth;
++    hitch.write_pos.store(position + 1, std::memory_order_release);
++}
++
++/// Wakes up when the current frame turns 40 ms old, then samples the thread every 2 ms until
++/// the frame ends. Between hitches it wakes about once per frame and does nothing else.
++void HitchWatchdogLoop() {
++    Common::SetCurrentThreadName("DorisHitches");
++    Common::SetCurrentThreadToEfficiencyCores();
++    std::unordered_map<uintptr_t, Location> cache;
++    const std::string path =
++        Common::FS::GetEdenPathString(Common::FS::EdenPath::LogDir) + "/doris_hitches.txt";
++    auto last_write = std::chrono::steady_clock::now();
++    std::deque<FinishedHitch> kept;
++    size_t total_hitches = 0;
++    const auto start = std::chrono::steady_clock::now();
++    std::vector<uintptr_t> stack;
++    while (true) {
++        if (!hitch.active.load(std::memory_order_acquire)) {
++            std::this_thread::sleep_for(std::chrono::milliseconds{100});
++            continue;
++        }
++        const uint32_t id = hitch.frame_id.load(std::memory_order_acquire);
++        const int64_t frame_start = hitch.frame_start_ns.load(std::memory_order_acquire);
++        const auto armed_at = std::chrono::steady_clock::time_point{
++            std::chrono::nanoseconds{frame_start}} + HITCH_ARM_AFTER;
++        if (std::chrono::steady_clock::now() < armed_at) {
++            std::this_thread::sleep_until(armed_at);
++        }
++        // Sample while the same frame is still running (for at most 2 seconds: longer means
++        // emulation is paused or loading, not a hitch).
++        constexpr int64_t SAMPLE_AT_MOST_NS = 2'000'000'000;
++        while (hitch.frame_id.load(std::memory_order_acquire) == id &&
++               hitch.active.load(std::memory_order_acquire)) {
++            if (NowNs() - frame_start > SAMPLE_AT_MOST_NS) {
++                std::this_thread::sleep_for(std::chrono::milliseconds{50});
++                continue;
++            }
++            // tgkill, not pthread_kill: if the thread has just exited this fails harmlessly.
++            syscall(SYS_tgkill, static_cast<int>(getpid()), hitch.tid.load(), SIGPROF);
++            std::this_thread::sleep_for(HITCH_SAMPLE_EVERY);
++        }
++        // Collect finished hitches and write them out now and then.
++        {
++            std::scoped_lock lock{finished_mutex};
++            while (!finished_hitches.empty()) {
++                kept.push_back(std::move(finished_hitches.front()));
++                finished_hitches.pop_front();
++                ++total_hitches;
++                if (kept.size() > HITCHES_KEPT) {
++                    kept.pop_front();
++                }
++            }
++            if (!finished_dirty ||
++                std::chrono::steady_clock::now() - last_write < HITCH_WRITE_INTERVAL) {
++                continue;
++            }
++            finished_dirty = false;
++        }
++        last_write = std::chrono::steady_clock::now();
++        std::ofstream file(path, std::ios::trunc);
++        if (!file) {
++            continue;
++        }
++        file << fmt::format("# Doris hitch stacks v1: GPU emulation thread, one sample every {} "
++                            "ms once a frame has lasted {} ms; {} hitches so far, the latest {} "
++                            "below (seconds since the game started)\n",
++                            HITCH_SAMPLE_EVERY.count(), HITCH_ARM_AFTER.count(), total_hitches,
++                            kept.size());
++        for (const FinishedHitch& finished : kept) {
++            std::unordered_map<std::vector<uintptr_t>, uint64_t, StackHash> stacks;
++            for (const Sample& sample : finished.samples) {
++                stack.clear();
++                stack.push_back(sample.pc);
++                const uint32_t depth = std::min<uint32_t>(sample.depth, MAX_DEPTH - 2);
++                if (depth == 0 || sample.frames[0] != sample.lr) {
++                    stack.push_back(sample.lr);
++                }
++                for (uint32_t frame = 0; frame < depth; ++frame) {
++                    stack.push_back(sample.frames[frame]);
++                }
++                ++stacks[stack];
++            }
++            std::vector<std::pair<uint64_t, const std::vector<uintptr_t>*>> sorted;
++            for (const auto& [frames, count] : stacks) {
++                sorted.emplace_back(count, &frames);
++            }
++            std::ranges::sort(sorted, [](const auto& a, const auto& b) { return a.first > b.first; });
++            file << fmt::format(
++                "[hitch {:.0f} ms at {:.1f} s] samples {}\n", finished.frame_ms,
++                std::chrono::duration<double>(finished.when - start).count(),
++                finished.samples.size());
++            for (size_t i = 0; i < sorted.size() && i < 40; ++i) {
++                std::string line = std::to_string(sorted[i].first);
++                for (const uintptr_t address : *sorted[i].second) {
++                    line += ' ';
++                    line += Describe(address, cache);
++                }
++                file << line << '\n';
++            }
++        }
++    }
++}
++
++std::once_flag hitch_watchdog_flag;
++
++} // Anonymous namespace
++
++void StartHitchSampler() {
++    const int me = CurrentTid();
++    if (hitch.active.load() && hitch.tid.load() == me) {
++        return;
++    }
++    hitch.active.store(false);
++    pthread_attr_t attributes;
++    if (pthread_getattr_np(pthread_self(), &attributes) == 0) {
++        void* stack_address = nullptr;
++        size_t stack_size = 0;
++        if (pthread_attr_getstack(&attributes, &stack_address, &stack_size) == 0) {
++            hitch.stack_low = reinterpret_cast<uintptr_t>(stack_address);
++            hitch.stack_high = hitch.stack_low + stack_size;
++        }
++        pthread_attr_destroy(&attributes);
++    }
++    InstallHandler();
++    hitch.frame_first_pos = hitch.write_pos.load();
++    hitch.frame_start_ns.store(NowNs(), std::memory_order_release);
++    hitch.frame_id.fetch_add(1);
++    hitch.tid.store(me);
++    hitch.active.store(true, std::memory_order_release);
++    std::call_once(hitch_watchdog_flag, [] { std::thread(HitchWatchdogLoop).detach(); });
++    LOG_INFO(Frontend, "Doris: hitch sampler on (doris_hitches.txt)");
++}
++
++void StopHitchSampler() {
++    if (hitch.tid.load() == CurrentTid()) {
++        hitch.active.store(false, std::memory_order_release);
++    }
++}
++
++void HitchFrameBoundary(double frame_ms) {
++    if (!hitch.active.load(std::memory_order_relaxed) ||
++        hitch.tid.load(std::memory_order_relaxed) != CurrentTid()) {
++        return;
++    }
++    // A new frame starts: the watchdog stops sampling the old one.
++    hitch.frame_start_ns.store(NowNs(), std::memory_order_release);
++    hitch.frame_id.fetch_add(1, std::memory_order_acq_rel);
++    const uint32_t end = hitch.write_pos.load(std::memory_order_acquire);
++    const uint32_t first = hitch.frame_first_pos;
++    hitch.frame_first_pos = end;
++    if (frame_ms < HITCH_MIN_MS || end == first || end - first > HITCH_CAPACITY) {
++        return;
++    }
++    FinishedHitch finished{frame_ms, std::chrono::steady_clock::now(), {}};
++    finished.samples.reserve(end - first);
++    for (uint32_t position = first; position != end; ++position) {
++        finished.samples.push_back(hitch.samples[position % HITCH_CAPACITY]);
++    }
++    std::scoped_lock lock{finished_mutex};
++    finished_hitches.push_back(std::move(finished));
++    if (finished_hitches.size() > HITCHES_KEPT) {
++        finished_hitches.pop_front();
++    }
++    finished_dirty = true;
++}
++
++void RegisterCurrentThread(const char* label) {
++    if (!Settings::values.doris_profiler.GetValue()) {
++        return;
++    }
++    InstallHandler();
++    std::call_once(start_flag, [] { std::thread(WriterLoop).detach(); });
+     const int index = slot_count.fetch_add(1);
+     if (index >= MAX_THREADS) {
+         return;
+@@ -327,6 +583,9 @@ void RegisterCurrentThread(const char* label) {
+ 
+ namespace Doris::Profiler {
+ void RegisterCurrentThread(const char*) {}
++void StartHitchSampler() {}
++void StopHitchSampler() {}
++void HitchFrameBoundary(double) {}
+ } // namespace Doris::Profiler
+ 
+ #endif
+diff --git a/src/common/doris_profiler.h b/src/common/doris_profiler.h
+index ddcb62039..fe7f01781 100644
+--- a/src/common/doris_profiler.h
++++ b/src/common/doris_profiler.h
+@@ -14,4 +14,14 @@ namespace Doris::Profiler {
+ /// Only for host threads (GPU, Vulkan worker); never for threads that run guest code.
+ void RegisterCurrentThread(const char* label);
+ 
++/// Hitch sampler, for the GPU emulation thread (called on it): whenever one of its frames has
++/// lasted 40 ms, its call stack is sampled every 2 ms until the frame ends. The stacks of every
++/// frame that ends up longer than 50 ms are written to doris_hitches.txt in the log folder (the
++/// latest 60 hitches), to be symbolized like doris_profile.txt. Costs nothing between hitches.
++void StartHitchSampler();
++/// Called on the same thread before it exits.
++void StopHitchSampler();
++/// Called on the same thread at every frame boundary, with the length of the frame that ended.
++void HitchFrameBoundary(double frame_ms);
++
+ } // namespace Doris::Profiler
+diff --git a/src/common/settings.h b/src/common/settings.h
+index 1317e0a34..09f4e586b 100644
+--- a/src/common/settings.h
++++ b/src/common/settings.h
+@@ -584,10 +584,13 @@ struct Values {
+     SwitchableSetting<bool> barrier_feedback_loops{linkage, true, "barrier_feedback_loops",
+                                                    Category::RendererAdvanced};
+ 
+-    // Eden (Doris) experiments. Defaults reproduce the PR #4324 build exactly.
+-    // Iterations each shader loop may run before it is cut short (0 = no cap).
+-    // PR #4324 lowered Eden's 8192 to 256 for Monster Hunter Rise.
+-    SwitchableSetting<u32> doris_shader_loop_limit{linkage, 256, "doris_shader_loop_limit",
++    // Eden (Doris) experiments.
++    // Iterations each shader loop may run before it is cut short (0 = no cap). PR #4324 lowered
++    // Eden's 8192 to 256 for Monster Hunter Rise. The count is per loop and per pixel/vertex/
++    // thread for the whole shader (not reset when the loop starts again), so a loop inside
++    // another one reaches 256 quickly and the rest of its work is skipped. Doris uses Eden's 8192
++    // from build 17.
++    SwitchableSetting<u32> doris_shader_loop_limit{linkage, 8192, "doris_shader_loop_limit",
+                                                    Category::RendererAdvanced};
+     // PR #4324's Monster Hunter Rise record fix: 0 = off, 1 = only in Monster Hunter Rise,
+     // 2 = always, in every game (as the PR #4324 build does).
+@@ -603,7 +606,7 @@ struct Values {
+     // Texture cleanup. 0 = Eden's rules (copies back wait for the GPU once per cleanup pass).
+     // 1 = Doris: copies back never wait for the GPU (a texture is removed once its copy is done,
+     // and kept if it was used or changed meanwhile), textures stay 300 frames instead of 50 below
+-    // the pressure threshold (2.2 GiB instead of 1.6 GiB), GPU drawings included.
++    // the pressure threshold (2.45 GiB instead of 1.6 GiB), GPU drawings included.
+     SwitchableSetting<u32> doris_texture_cleanup{linkage, 1, "doris_texture_cleanup",
+                                                  Category::RendererAdvanced};
+     // With asynchronous shaders on, Eden skips every draw whose shader is still compiling, so new
+diff --git a/src/common/thread.cpp b/src/common/thread.cpp
+index f6f94c4b2..a84be1fbc 100644
+--- a/src/common/thread.cpp
++++ b/src/common/thread.cpp
+@@ -603,6 +603,12 @@ void SetCurrentThreadToDorisCores(bool fastest) {
+ #endif
+ }
+ 
++void SetCurrentThreadToPerformanceCoresOnly() {
++#if defined(__ANDROID__)
++    SetCurrentThreadCoreGroup(CoreGroup::Performance);
++#endif
++}
++
+ void SetCurrentThreadToBackgroundWork() {
+ #if defined(__ANDROID__)
+     ADPF::AddCurrentThread(ADPF::Session::Background);
+diff --git a/src/common/thread.h b/src/common/thread.h
+index a372c8ecb..692c56810 100644
+--- a/src/common/thread.h
++++ b/src/common/thread.h
+@@ -103,6 +103,8 @@ enum class ThreadPlacement : u32 {
+     Default = 0,
+     Background = 1,
+     Efficiency = 2,
++    /// Eden (Doris): normal priority on the performance cores, for work something is waiting on.
++    Performance = 3,
+ };
+ 
+ void SetCurrentThreadPriority(ThreadPriority new_priority);
+@@ -111,6 +113,9 @@ void SetCurrentThreadToPerformanceCores();
+ /// Eden (Doris): keep the calling thread on the fastest cores (prime) or on the other performance
+ /// cores (middle). Recorded like the other core groups, so it survives policy refreshes.
+ void SetCurrentThreadToDorisCores(bool fastest);
++/// Eden (Doris): keep the calling thread on the performance cores (middle and prime), without
++/// joining a performance hint session.
++void SetCurrentThreadToPerformanceCoresOnly();
+ void SetCurrentThreadToEfficiencyCores();
+ void SetCurrentThreadToBackgroundWork();
+ void SetCurrentThreadToAllCores();
+diff --git a/src/common/thread_worker.h b/src/common/thread_worker.h
+index ec3ca0af4..4a72b5dc9 100644
+--- a/src/common/thread_worker.h
++++ b/src/common/thread_worker.h
+@@ -42,13 +42,17 @@ public:
+         : workers_queued{num_workers}, thread_name{std::move(name)} {
+         const auto lambda = [this, func, placement](std::stop_token stop_token) {
+             Common::SetCurrentThreadName(thread_name.c_str());
+-            if (placement != ThreadPlacement::Default) {
++            if (placement != ThreadPlacement::Default &&
++                placement != ThreadPlacement::Performance) {
+                 Common::SetCurrentThreadPriority(ThreadPriority::Low);
+             }
+             switch (placement) {
+             case ThreadPlacement::Efficiency:
+                 Common::SetCurrentThreadToEfficiencyCores();
+                 break;
++            case ThreadPlacement::Performance:
++                Common::SetCurrentThreadToPerformanceCoresOnly();
++                break;
+             case ThreadPlacement::Background:
+                 Common::SetCurrentThreadToBackgroundWork();
+                 break;
+diff --git a/src/core/cpu_manager.cpp b/src/core/cpu_manager.cpp
+index 38ff20083..273357f0f 100644
+--- a/src/core/cpu_manager.cpp
++++ b/src/core/cpu_manager.cpp
+@@ -5,6 +5,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include "common/doris_cores.h"
++#include "common/doris_perf.h"
+ #include "common/fiber.h"
+ #include "common/scope_exit.h"
+ #include "common/thread.h"
+@@ -177,6 +178,7 @@ void CpuManager::RunThread(std::stop_token token, std::size_t core) {
+     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
+     Common::SetCurrentThreadToPerformanceCores();
+     Doris::Cores::PinCurrentThread(Doris::Cores::Role::Worker);
++    Doris::Perf::RegisterGameThread();
+     auto& data = core_data[core];
+     data.host_context = Common::Fiber::ThreadToFiber();
+ 
+diff --git a/src/video_core/gpu_thread.cpp b/src/video_core/gpu_thread.cpp
+index 76bd83ab9..b21ffbd49 100644
+--- a/src/video_core/gpu_thread.cpp
++++ b/src/video_core/gpu_thread.cpp
+@@ -42,7 +42,11 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
+         auto current_context = context.Acquire();
+         CommandDataContainer next;
+         while (!stop_token.stop_requested()) {
+-            state.queue.PopWait(next, stop_token);
++            {
++                // Eden (Doris): time spent waiting for the game's next GPU commands.
++                const Doris::Perf::ScopedWait doris_wait{Doris::Perf::Wait::GameCommands};
++                state.queue.PopWait(next, stop_token);
++            }
+             if (stop_token.stop_requested()) {
+                 break;
+             }
+@@ -65,6 +69,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
+                 state.cv.notify_all();
+             }
+         }
++        Doris::Profiler::StopHitchSampler();
+     });
+ }
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 8619c52a1..519913143 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -369,8 +369,14 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
+       texture_cache{texture_cache_}, shader_notify{shader_notify_},
+       use_asynchronous_shaders{Settings::values.use_asynchronous_shaders.GetValue()},
+       use_vulkan_pipeline_cache{Settings::values.use_vulkan_driver_pipeline_cache.GetValue()},
++      // Eden (Doris): with asynchronous shaders off, the game stops until a new pipeline is
++      // built, so the builders must not be background threads (nice 10, power-efficiency hint,
++      // usually little cores): in TotK the Vulkan worker waited 55 to 224 ms per new pipeline.
+       workers(device.HasBrokenParallelShaderCompiling() ? 1ULL : GetTotalPipelineWorkers(),
+-              "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),
++              "VkPipelineBuilder", {},
++              Settings::values.use_asynchronous_shaders.GetValue()
++                  ? Common::ThreadPlacement::Background
++                  : Common::ThreadPlacement::Performance),
+       serialization_thread(1, "VkPipelineSerialization", {},
+                            Common::ThreadPlacement::Background) {
+     const auto& float_control{device.FloatControlProperties()};
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+index 7b6571d33..a059e4683 100644
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+@@ -5,6 +5,7 @@
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ 
+ #include <algorithm>
++#include <cstring>
+ #include <utility>
+ #include <vector>
+ 
+@@ -14,6 +15,7 @@
+ #include "common/assert.h"
+ #include "common/bit_util.h"
+ #include "common/common_types.h"
++#include "common/doris_perf.h"
+ #include "common/literals.h"
+ #include "video_core/renderer_vulkan/vk_scheduler.h"
+ #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
+@@ -35,6 +37,13 @@ constexpr VkDeviceSize MAX_ALIGNMENT = 256;
+ // - GT 1030 on ^NIX will OOM with 256mib
+ #if defined(__FreeBSD__)
+ constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 128_MiB;
++#elif defined(__ANDROID__)
++// Eden (Doris): 512 MiB. When the part of the stream buffer an upload needs is still in use by
++// the GPU, the upload gets a staging buffer of its own instead, allocated on the spot and freed
++// two seconds later. When TotK streams a new area its uploads outran 256 MiB, and GPU memory
++// jumped by up to 576 MiB (nine 64 MiB blocks) and fell back again, with the GPU thread stuck
++// in 360 to 560 ms hitches.
++constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 512_MiB;
+ #else
+ constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 256_MiB;
+ #endif
+@@ -96,12 +105,24 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
+     }
+     stream_pointer = stream_buffer.Mapped();
+     ASSERT_MSG(!stream_pointer.empty(), "Stream buffer must be host visible!");
++    // Eden (Doris): touch every page now, while the game loads, so the kernel doesn't have to
++    // provide (and clear) them one by one during the first pass through the buffer in game.
++    std::memset(stream_pointer.data(), 0, stream_pointer.size());
+ }
+ 
+ StagingBufferPool::~StagingBufferPool() = default;
+ 
+ StagingBufferRef StagingBufferPool::Request(size_t size, MemoryUsage usage, bool deferred) {
+-    if (!deferred && usage == MemoryUsage::Upload && size <= region_size) {
++    if (usage == MemoryUsage::Upload) {
++        Doris::Perf::Add(Doris::Perf::Count::UploadBytes, size);
++    }
++    // Eden (Doris): uploads up to half the stream buffer (Eden: one 16 MiB region) go through it
++    // too, while the GPU is done with that part of it. Larger ones used to get a staging buffer
++    // of their own, rounded up to a power of two (a 130 MiB texture got 256 MiB), allocated and
++    // written for the first time on the GPU thread (every page faulted in and cleared by the
++    // kernel), then freed again two seconds later: in TotK the longest hitches (360 to 560 ms
++    // of the GPU thread at work) came with GPU memory jumping by 250 to 576 MiB and falling back.
++    if (!deferred && usage == MemoryUsage::Upload && size <= stream_buffer_size / 2) {
+         return GetStreamBuffer(size);
+     }
+     return GetStagingBuffer(size, usage, deferred);
+@@ -128,8 +149,17 @@ void StagingBufferPool::TickFrame() {
+ }
+ 
+ StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
+-    if (AreRegionsActive(Region(free_iterator) + 1,
+-                         (std::min)(Region(iterator + size) + 1, NUM_SYNCS))) {
++    const auto regions_active = [this](size_t begin, size_t end) {
++        if (!AreRegionsActive(begin, end)) {
++            return false;
++        }
++        // Eden (Doris): the GPU progress known here is only updated when something waits for
++        // the GPU; read the real one before deciding the regions are still in use.
++        scheduler.GetMasterSemaphore().Refresh();
++        return AreRegionsActive(begin, end);
++    };
++    if (regions_active(Region(free_iterator) + 1,
++                       (std::min)(Region(iterator + size) + 1, NUM_SYNCS))) {
+         // Avoid waiting for the previous usages to be free
+         return GetStagingBuffer(size, MemoryUsage::Upload);
+     }
+@@ -146,7 +176,7 @@ StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
+         iterator = 0;
+         free_iterator = size;
+ 
+-        if (AreRegionsActive(0, Region(size) + 1)) {
++        if (regions_active(0, Region(size) + 1)) {
+             // Avoid waiting for the previous usages to be free
+             return GetStagingBuffer(size, MemoryUsage::Upload);
+         }
+@@ -175,6 +205,12 @@ StagingBufferRef StagingBufferPool::GetStagingBuffer(size_t size, MemoryUsage us
+     if (const std::optional<StagingBufferRef> ref = TryGetReservedBuffer(size, usage, deferred)) {
+         return *ref;
+     }
++    // Eden (Doris): a buffer may be free already without this side knowing; check before making
++    // a new one.
++    scheduler.GetMasterSemaphore().Refresh();
++    if (const std::optional<StagingBufferRef> ref = TryGetReservedBuffer(size, usage, deferred)) {
++        return *ref;
++    }
+     return CreateStagingBuffer(size, usage, deferred);
+ }
+ 
+@@ -222,6 +258,8 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
+     if (device.IsBufferDeviceAddressSupported()) {
+         buffer_ci.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+     }
++    Doris::Perf::Add(Doris::Perf::Count::StagingCreated);
++    Doris::Perf::Add(Doris::Perf::Count::StagingCreatedBytes, buffer_ci.size);
+     vk::Buffer buffer = memory_allocator.CreateBuffer(buffer_ci, usage);
+     if (device.HasDebuggingToolAttached()) {
+         ++buffer_index;
+@@ -276,7 +314,10 @@ void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
+     const size_t end_offset = (std::min)(begin_offset + deletions_per_tick, old_size);
+     const auto begin = entries.begin() + begin_offset;
+     const auto end = entries.begin() + end_offset;
+-    entries.erase(std::remove_if(begin, end, is_deletable), end);
++    {
++        const Doris::Perf::ScopedWait doris_wait{Doris::Perf::Wait::GpuMemory};
++        entries.erase(std::remove_if(begin, end, is_deletable), end);
++    }
+ 
+     const size_t new_size = entries.size();
+     staging.delete_index += deletions_per_tick;
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 757d538ce..b3b1bdfec 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -303,7 +303,8 @@ void TextureCache<P>::DorisRunGarbageCollector() {
+         if (must_download) {
+             if constexpr (DORIS_ASYNC_REMOVAL) {
+                 if (doris_pending_removals.size() >= MAX_PENDING_REMOVALS ||
+-                    doris_pending_bytes >= MAX_PENDING_BYTES) {
++                    doris_pending_bytes >= MAX_PENDING_BYTES ||
++                    True(image.flags & ImageFlagBits::Sparse)) {
+                     return false;
+                 }
+                 Doris::Perf::Add(Doris::Perf::Count::GcDownloaded);
+@@ -316,6 +317,9 @@ void TextureCache<P>::DorisRunGarbageCollector() {
+                     .gpu_tick = runtime.DorisCurrentTick(),
+                     .issue_frame = frame_tick,
+                     .modification_tick = image.modification_tick,
++                    .global_modification_tick = modification_tick,
++                    .cpu_addr = image.cpu_addr,
++                    .cpu_addr_end = image.cpu_addr_end,
+                     .staging_bytes = image.unswizzled_size_bytes,
+                 });
+                 doris_pending_bytes += image.unswizzled_size_bytes;
+@@ -357,8 +361,10 @@ u64 TextureCache<P>::DorisPressureThreshold() const noexcept {
+     if (!DORIS_ASYNC_REMOVAL || Settings::values.doris_texture_cleanup.GetValue() == 0) {
+         return expected_memory;
+     }
+-    constexpr u64 DORIS_EXPECTED_MEMORY = 2_GiB + 200_MiB;
+-    const u64 below_critical = critical_memory > 1_GiB ? critical_memory - 1_GiB : 0;
++    // 2.45 GiB with Eden's 3.2 GiB critical level (build 16: 2.2 GiB; from build 17 the stream
++    // buffer is 256 MiB bigger, and that memory is counted too).
++    constexpr u64 DORIS_EXPECTED_MEMORY = 2_GiB + 456_MiB;
++    const u64 below_critical = critical_memory > 768_MiB ? critical_memory - 768_MiB : 0;
+     return (std::max)(expected_memory, (std::min)(DORIS_EXPECTED_MEMORY, below_critical));
+ }
+ 
+@@ -380,7 +386,20 @@ void TextureCache<P>::DorisProcessPendingRemovals() {
+             const bool used_since = image.lru_touch_frame >= removal.issue_frame;
+             const bool drawn_since = image.modification_tick != removal.modification_tick;
+             const bool written_by_cpu = True(image.flags & ImageFlagBits::CpuModified);
+-            if (used_since || drawn_since || written_by_cpu) {
++            // Another texture over the same guest memory drawn into since: its contents are
++            // newer than this copy, which must not be written over them.
++            bool neighbour_drawn = false;
++            if (!used_since && !drawn_since && !written_by_cpu) {
++                ForEachImageInRegion(
++                    image.cpu_addr, image.cpu_addr_end - image.cpu_addr,
++                    [&](ImageId other_id, ImageBase& other) {
++                        if (other_id != removal.image_id &&
++                            other.modification_tick > removal.global_modification_tick) {
++                            neighbour_drawn = true;
++                        }
++                    });
++            }
++            if (used_since || drawn_since || written_by_cpu || neighbour_drawn) {
+                 // Still in use, or its contents changed: keep it.
+                 Doris::Perf::Add(Doris::Perf::Count::GcCancelled);
+                 runtime.FreeDeferredStagingBuffer(removal.staging);
+@@ -414,6 +433,29 @@ void TextureCache<P>::DorisForgetPendingRemoval(ImageId image_id) {
+     }
+ }
+ 
++template <class P>
++void TextureCache<P>::DorisCancelPendingOverlapping(VAddr begin, VAddr end, ImageId except) {
++    if constexpr (DORIS_ASYNC_REMOVAL) {
++        for (size_t index = 0; index < doris_pending_removals.size();) {
++            DorisPendingRemoval& removal = doris_pending_removals[index];
++            if (removal.image_id == except || removal.cpu_addr_end <= begin ||
++                end <= removal.cpu_addr) {
++                ++index;
++                continue;
++            }
++            Doris::Perf::Add(Doris::Perf::Count::GcCancelled);
++            doris_pending_bytes -= (std::min)(doris_pending_bytes, removal.staging_bytes);
++            runtime.FreeDeferredStagingBuffer(removal.staging);
++            doris_pending_removals.erase(doris_pending_removals.begin() +
++                                         static_cast<std::ptrdiff_t>(index));
++        }
++    } else {
++        static_cast<void>(begin);
++        static_cast<void>(end);
++        static_cast<void>(except);
++    }
++}
++
+ template <class P>
+ bool TextureCache<P>::DorisIsPendingRemoval(ImageId image_id) const noexcept {
+     return std::ranges::any_of(doris_pending_removals, [image_id](const auto& removal) {
+@@ -439,9 +481,13 @@ void TextureCache<P>::TickFrame() {
+         // Removals already under way still finish (and free their staging memory).
+         DorisProcessPendingRemovals();
+     }
+-    sentenced_images.Tick();
+-    sentenced_framebuffers.Tick();
+-    sentenced_image_view.Tick();
++    {
++        // Eden (Doris): destroying textures frees their GPU memory.
++        const Doris::Perf::ScopedWait doris_wait{Doris::Perf::Wait::GpuMemory};
++        sentenced_images.Tick();
++        sentenced_framebuffers.Tick();
++        sentenced_image_view.Tick();
++    }
+     TickAsyncDecode();
+     TickAsyncUnswizzle();
+ 
+@@ -2510,6 +2556,8 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
+     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
+                "Trying to register an already registered image");
+     image.flags |= ImageFlagBits::Registered;
++    // Eden (Doris): a texture appearing over memory that a pending removal will write to.
++    DorisCancelPendingOverlapping(image.cpu_addr, image.cpu_addr_end, image_id);
+     u64 tentative_size = (std::max)(image.guest_size_bytes, image.unswizzled_size_bytes);
+     if ((IsPixelFormatASTC(image.info.format) &&
+          True(image.flags & ImageFlagBits::AcceleratedUpload)) ||
+@@ -2678,9 +2726,11 @@ void TextureCache<P>::UntrackImage(ImageBase& image, ImageId image_id) {
+ 
+ template <class P>
+ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
+-    // Eden (Doris): a texture waiting for its copy back can also be deleted another way.
++    // Eden (Doris): a texture waiting for its copy back can also be deleted another way, and a
++    // texture going away over the memory of another pending removal calls that one off.
+     DorisForgetPendingRemoval(image_id);
+     ImageBase& image = slot_images[image_id];
++    DorisCancelPendingOverlapping(image.cpu_addr, image.cpu_addr_end, image_id);
+     if (image.HasScaled()) {
+         total_used_memory -= GetScaledImageSizeBytes(image);
+     }
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index b8371aa3f..965f95de3 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -393,6 +393,9 @@ private:
+     void DorisProcessPendingRemovals();
+     /// Eden (Doris): drops a pending removal (the image is being deleted another way).
+     void DorisForgetPendingRemoval(ImageId image_id);
++    /// Eden (Doris): calls off pending removals of images that share guest memory with
++    /// [begin, end) (another image there was created or deleted), except the given image.
++    void DorisCancelPendingOverlapping(VAddr begin, VAddr end, ImageId except);
+     /// Eden (Doris): true if the image is waiting for its copy back before removal.
+     [[nodiscard]] bool DorisIsPendingRemoval(ImageId image_id) const noexcept;
+     /// Eden (Doris): memory use above which the garbage collector is under pressure.
+@@ -478,6 +481,9 @@ private:
+         u64 gpu_tick;          // the copy is done once the GPU has passed this tick
+         u64 issue_frame;       // frame_tick when the copy was recorded
+         u64 modification_tick; // the image's modification tick at that point
++        u64 global_modification_tick; // the texture cache's at that point
++        VAddr cpu_addr;
++        VAddr cpu_addr_end;
+         size_t staging_bytes;
+     };
+     std::vector<DorisPendingRemoval> doris_pending_removals;
+diff --git a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
+index e57864ede..048d924db 100644
+--- a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
++++ b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
+@@ -15,6 +15,7 @@
+ #include "common/alignment.h"
+ #include "common/assert.h"
+ #include "common/common_types.h"
++#include "common/doris_perf.h"
+ #include "common/literals.h"
+ #include "common/logging.h"
+ #include <ranges>
+@@ -240,7 +241,12 @@ namespace Vulkan {
+         VkImage handle{};
+         VmaAllocation allocation{};
+         VmaAllocationInfo alloc_info{};
+-        vk::Check(vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info));
++        {
++            // Eden (Doris): time the GPU emulation thread spends getting GPU memory.
++            const Doris::Perf::ScopedWait doris_wait{Doris::Perf::Wait::GpuMemory};
++            vk::Check(vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info));
++        }
++        Doris::Perf::Add(Doris::Perf::Count::GpuMemoryAllocatedBytes, alloc_info.size);
+ 
+         // Log GPU memory allocation for images
+         if (GPU::Logging::IsActive() &&
+@@ -277,7 +283,13 @@ namespace Vulkan {
+         VmaAllocation allocation{};
+         VkMemoryPropertyFlags property_flags{};
+ 
+-        vk::Check(vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info));
++        {
++            // Eden (Doris): time the GPU emulation thread spends getting GPU memory.
++            const Doris::Perf::ScopedWait doris_wait{Doris::Perf::Wait::GpuMemory};
++            vk::Check(
++                vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info));
++        }
++        Doris::Perf::Add(Doris::Perf::Count::GpuMemoryAllocatedBytes, alloc_info.size);
+         vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
+ 
+         // Log GPU memory allocation for buffers
+-- 
+2.43.0
+

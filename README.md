@@ -50,10 +50,14 @@ effect the next time the game starts; the ones marked "right away" apply as soon
   middle or little cores; worker wake-ups, render passes cut by a submit, memory-protection changes, wait-for-idles
   (and how many redundant barriers were left out) and tiled-cache barriers per frame; texture uploads (and how many
   replaced GPU-drawn contents) and what the texture garbage collector removed, copied back or called off, with GPU
-  memory against its thresholds. It also lists the longest hitches (frames over 50 ms) of every 10 seconds, each with
-  how long the GPU emulation thread was actually busy in it (busy for the whole frame: the emulator held it up; idle:
-  it was waiting for the game), how long it waited for the GPU and for presentation, and the shaders, texture uploads,
-  texture removals, draws and submits in that frame. Share it with **Share debug logs**.
+  memory against its thresholds; upload volume, new staging buffers and new GPU memory per frame, and the time the GPU
+  thread spent getting or freeing GPU memory and waiting for the game's commands. It also lists the longest hitches
+  (frames over 50 ms) of every 10 seconds, each with how long the GPU emulation thread was actually busy in it, how
+  long it waited for the game's commands, for the GPU, for presentation and for GPU memory, how busy the game's own
+  threads were, and the shaders, uploads, new memory, texture removals, draws and submits in that frame. While the
+  report is on, a hitch sampler records the GPU emulation thread's call stacks during every frame that runs past
+  40 ms (every 2 ms, nothing in between) and writes those of frames over 50 ms to `doris_hitches.txt` in the log
+  folder. Share it with **Share debug logs**.
 * **Wait for new textures** (default: up to 8 ms per frame). Only matters with ASTC Decoding Method on CPU Async:
   Eden draws new textures before they are decoded, so new places flash as textures fill in. Doris waits briefly for
   each new texture and uploads it straight away.
@@ -62,8 +66,11 @@ effect the next time the game starts; the ones marked "right away" apply as soon
   anything whose shader is still compiling, so new places flicker as things pop in. Doris first waits up to this long
   per frame for the shader to finish. "Don't wait (Eden)" switches back.
 * **Shader loop limit**: how many times a loop inside a game shader may repeat before it is cut short.
-  PR #4324 lowered Eden's 8192 to 256. Choices: 256 (PR #4324, default), 512, 1024, 2048, 4096, 8192 (Eden default),
-  no limit.
+  PR #4324 lowered Eden's 8192 to 256 for Monster Hunter Rise. The count runs per pixel (or vertex, or compute
+  thread) for the whole shader and is not reset when a loop starts again, so a loop inside another loop reaches 256
+  quickly and the rest of its work is skipped. From build 17 the default is Eden's 8192 (the first game start after
+  the change takes longer, while the affected shaders are compiled again). Choices: 256 (PR #4324), 512, 1024, 2048,
+  4096, 8192 (default), no limit.
 * **Monster Hunter Rise record fix**: always (PR #4324, default), only in Monster Hunter Rise, or off. The log notes
   every time it rewrites a copy, and in which game.
 
@@ -78,6 +85,29 @@ effect the next time the game starts; the ones marked "right away" apply as soon
 * From build 16, recorded work is handed to the worker every 16 draws instead of every 4. Build 15 still woke the
   worker 500 to 780 times per frame (it falls asleep between hand-offs), each one a futex system call on the GPU
   emulation thread; the build 14 profile put system calls from draws at 5.4% of that thread.
+
+## Uploads (build 17)
+
+The build 16 log: the longest hitches (360 to 560 ms, with the GPU emulation thread busy all along) each came with
+GPU memory jumping by 256 to 576 MiB, always in whole 64 MiB blocks, and falling back within seconds. The likeliest
+source is staging memory (build 17's report measures it directly): an upload that doesn't fit in the part of the stream buffer the GPU has finished with gets a staging buffer of
+its own, made on the spot (fresh memory the kernel has to provide and clear, page by page, on the GPU thread) and freed
+again about two seconds later; so does every upload over 16 MiB.
+
+* The stream buffer is 512 MiB on Android (Eden: 256 MiB), and all of it is touched once while the game loads.
+* Uploads up to half its size go through it (Eden: up to 16 MiB).
+* Before deciding that part of it, or a spare staging buffer, is still in use, the GPU's real progress is read
+  (the value kept on the CPU side is only updated when something waits for the GPU).
+
+The texture cleanup's pressure threshold moves from 2.2 to 2.45 GiB to make room for the bigger stream buffer.
+
+## Shader builds (build 17)
+
+With asynchronous shaders off, a draw that needs a new pipeline stops everything until the pipeline is built. Eden
+builds pipelines on background threads (lower priority, power-efficiency hint, usually the little cores); in the
+build 16 log the Vulkan worker waited 55 to 224 ms each time. With asynchronous shaders off, Doris runs the builders
+at normal priority on the performance cores. (With asynchronous shaders on, nothing waits for them, and they stay in
+the background as in Eden.)
 
 ## Texture cleanup
 
@@ -101,8 +131,10 @@ Doris's texture cleanup (build 16, the default):
   (128 MiB) are under way at a time.
 * Below the pressure threshold a texture has to be unused for 300 frames (10 seconds) before it goes, GPU drawings
   included, so nothing piles up and nothing the game is still using is thrown out.
-* The pressure threshold is 2.2 GiB instead of 1.6 GiB (aggressive cleanup still starts at 3.2 GiB). Above it, the
-  rules are Eden's (unused for 25 frames).
+* The pressure threshold is 2.45 GiB instead of 1.6 GiB (2.2 GiB in build 16; aggressive cleanup still starts at
+  3.2 GiB). Above it, the rules are Eden's (unused for 25 frames).
+* From build 17 a removal is also called off when another texture over the same guest memory is created, removed or
+  drawn into before the copy is written back (the copy must never land on top of newer contents).
 
 "Eden (as before)" switches back to build 15 (Eden's rules, one GPU wait per pass) without restarting the game.
 
