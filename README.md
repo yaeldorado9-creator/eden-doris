@@ -61,7 +61,9 @@ effect the next time the game starts; the ones marked "right away" apply as soon
   (copied back first) and how long it waited for that; how many wait-for-idles came inside a render pass and how many
   had no storage writes by draws before them; how often the game wrote next to GPU-drawn textures and whether their
   contents were kept; and the textures (size and format) that were uploaded again over GPU-drawn contents, had their
-  bytes changed by the game, or were removed by the cleanup with GPU-drawn contents lost. It also lists the longest hitches
+  bytes changed by the game, or were removed by the cleanup with GPU-drawn contents lost; partial uploads; which path
+  marked a GPU-drawn texture as changed as a whole; separate heap mappings (Android); every separate heap rebuild (all
+  memory protection changes wait for it) is logged with how long it took. It also lists the longest hitches
   (frames over 50 ms) of every 10 seconds, each with how long the GPU emulation thread was actually busy in it, how
   long it waited for the game's commands, for the GPU, for presentation, for GPU memory and for the cache locks, how
   busy the game's own threads were, and the shaders, uploads, new memory, texture removals, draws and submits in that
@@ -102,6 +104,23 @@ a page, not where:
   game's write. Each copy waits for the GPU to finish everything queued, about 20 ms while a frame is in flight, and
   in the build 18 log the game then wrote the next pages of the same buffer, in bursts of 10 to 13 waits. Build 19
   copies back the GPU-written bytes of the surrounding 512 KiB at once, so those writes find none.
+
+### Only what changed is uploaded (build 20)
+
+The build 19 report named the textures that still lost what the GPU drew: one family, R8G8 textures of 260x260 with
+9 mip levels (256 plus a 2-pixel border on each side, the shape of a terrain tile) and the render targets of their
+levels, uploaded again from guest memory up to 141 times in 10 seconds. When the game's code changes any part of a
+texture, Eden uploads all of it again, so everything else the GPU drew in it (the other mip levels, the borders, the
+rest of the level) was replaced with old contents. From build 20:
+
+* A game write to a GPU-drawn texture keeps a copy of the texture's bytes on up to 64 pages per texture; at the
+  texture's next use (or the end of the frame) Doris finds the 512-byte blocks of the texture's memory layout whose
+  bytes changed and uploads only those. Everything else keeps what the GPU drew. Plain 2D textures, texture arrays
+  and mip levels are handled; other layouts, or writes over more than 64 pages (the game rewriting the whole
+  texture), are uploaded whole as in Eden.
+* DMA copies and inline uploads that Eden carries out on the CPU upload just the blocks they wrote into GPU-drawn
+  textures.
+* The block layout maths was checked on a PC against Eden's own unswizzling for 11 texture layouts.
 
 ## Fixes from newer Eden (build 18)
 

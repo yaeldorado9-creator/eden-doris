@@ -1,7 +1,7 @@
 From 971c478da7a3e47a498f3b566f8d533f62abab11 Mon Sep 17 00:00:00 2001
 From: "Eden (Doris) build" <doris@users.noreply.github.com>
 Date: Thu, 29 Oct 2026 18:44:19 -0500
-Subject: [PATCH 40/50] Eden (Doris): texture cleanup without GPU waits; fewer
+Subject: [PATCH 40/51] Eden (Doris): texture cleanup without GPU waits; fewer
  worker wake-ups; redundant barriers skipped; hitch report
 
 - Texture cleanup (setting, default Doris; "Eden" = build 15 behaviour): textures the GPU drew

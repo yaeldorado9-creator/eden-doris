@@ -1,7 +1,7 @@
 From 7687e034d35039d294aa1f760ce4b38e3ddafe12 Mon Sep 17 00:00:00 2001
 From: "Eden (Doris) build" <doris@users.noreply.github.com>
 Date: Fri, 30 Oct 2026 00:07:39 -0500
-Subject: [PATCH 50/50] Eden (Doris): GPU drawings survive game writes next to
+Subject: [PATCH 50/51] Eden (Doris): GPU drawings survive game writes next to
  them; copy-backs cover 512 KiB; barriers only where needed; report names
  textures and shows the clock
 

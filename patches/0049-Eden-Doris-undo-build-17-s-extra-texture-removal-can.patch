@@ -1,7 +1,7 @@
 From 2008c1ec4c75c43db34d85adc32da226c2c6d9f1 Mon Sep 17 00:00:00 2001
 From: "Eden (Doris) build" <doris@users.noreply.github.com>
 Date: Thu, 29 Oct 2026 20:50:49 -0500
-Subject: [PATCH 49/50] Eden (Doris): undo build 17's extra texture-removal
+Subject: [PATCH 49/51] Eden (Doris): undo build 17's extra texture-removal
  cancelling; report cache lock waits, copies of GPU-written bytes and
  wait-for-idle details
 

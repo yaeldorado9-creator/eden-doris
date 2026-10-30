@@ -1,7 +1,7 @@
 From 9c7be80aefed7762a06a0a4d3c3ffec543084d3e Mon Sep 17 00:00:00 2001
 From: CamilleLaVey <camillelavey99@gmail.com>
 Date: Wed, 14 Oct 2026 00:04:16 +0200
-Subject: [PATCH 48/50] [shader_recompiler, vulkan, qcom, tu] Provide handling
+Subject: [PATCH 48/51] [shader_recompiler, vulkan, qcom, tu] Provide handling
  to missing shader subgroups on QCOM (#4508)
 
 This works provides better emulation on certain GS missing for shader invocation data + geometry pass fallback in qcom/turnip drivers, some of those were provided as community patch by @a.kamaltdinov; which was refined to address the requirements on forced gpu reads; which used to kill some performance on low end devices; now, the stability with some of the graphical problems have been addressed and balanced. Shuffle shaders (SHFFL) are not actually provided on QCOM and turnip drivers, so any game that previously required this stage draw, will now avoid being ignored and tax some performance based on the complexity of the stage draw from now on. This will also address partially some tessellation problems as well.

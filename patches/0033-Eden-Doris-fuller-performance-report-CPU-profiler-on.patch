@@ -1,7 +1,7 @@
 From 4db1348ab1eb51e16872a433fc83443c7a1219bb Mon Sep 17 00:00:00 2001
 From: "Eden (Doris) build" <doris@users.noreply.github.com>
 Date: Thu, 29 Oct 2026 13:58:11 -0500
-Subject: [PATCH 33/50] Eden (Doris): fuller performance report; CPU profiler
+Subject: [PATCH 33/51] Eden (Doris): fuller performance report; CPU profiler
  on for now
 
 The 10-second performance report now also says, per game frame:
