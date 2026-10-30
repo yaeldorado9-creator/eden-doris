@@ -19,11 +19,13 @@ Balemuni's **Apex v2 Ultimate** Turnip driver rebuilt from source, as the base f
   `log/apex_doris.txt` in Eden's folder every 10 s: GPU time of the timed render passes, SYSMEM vs GMEM, and the
   passes that cost the most with both modes' averages.
 
-- **0003**: the report times every GPU operation for 3 s of every 10 s (Mesa's GPU tracepoints, through a Doris
-  hook in u_trace): render passes by size, mode and draws, what inside them takes the time, uploads, downloads,
-  copies, blits, clears, compute and the time between operations; and every 10 s the GPU clock and load and the
-  battery, GPU and CPU temperatures. The profiled autotuner locks a pass's mode sooner (10 samples, 10 s, passes
-  from 0.15 ms).
+- **0003**: **Eden's 32-bit color images stay tiled.** Eden gives every 32-bit color image a view format list
+  with all 19 formats of its size class, BGRA8 among them; on A740 (a7xx gen2) Turnip makes any image whose list
+  mixes swapped and unswapped formats LINEAR, so all of TotK's 32-bit render targets and textures were drawn and
+  sampled untiled. For Eden they are now tiled (still without UBWC). Also: every 10 s the GPU clock and load and
+  the battery, GPU and CPU temperatures go to `apex_doris.txt`, and the profiled autotuner locks a pass's mode
+  sooner (10 samples, 10 s, passes from 0.15 ms). (Apex Doris 4's per-operation timing is removed: it cost
+  performance and wrote nothing.)
 
 Apex's own TotK rule switched on for Eden (prefer GMEM; zip `-apexfix` in apex-doris-3) did not fix the grass or
 the ground and is no longer built; its patch is in the history.

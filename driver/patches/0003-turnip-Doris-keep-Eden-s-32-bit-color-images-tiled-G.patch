@@ -1,0 +1,556 @@
+From 0e48ac8024cf40d9e26d3d4b1e948924c9d5407b Mon Sep 17 00:00:00 2001
+From: "Eden (Doris) build" <doris@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 15:04:17 -0500
+Subject: [PATCH] turnip (Doris): keep Eden's 32-bit color images tiled; GPU
+ clock/load/temperature report; lock render modes sooner
+
+- tu_image: Eden gives every 32-bit color image a view format list with all 19 formats of its
+  size class, BGRA8 among them. On A740 (a7xx gen2, no all-formats-compatible UBWC) a format list
+  mixing swapped and unswapped formats forced the image LINEAR, so all of TotK's 32-bit render
+  targets and textures (RGBA8, RGB10A2, RG16F, R11G11B10F, R32) were drawn and sampled untiled.
+  For Eden ("yuzu Emulator" engine) keep them tiled (still without UBWC). Tiled images ignore the
+  swap in CCU and TP alike, so a swapped view reads the image's own channel order; R8G8 vs R16
+  reinterpretation still goes linear.
+- tu_doris: for Eden, every 10 s the GPU clock and load (sampled every second) and battery, GPU
+  and CPU temperatures go to apex_doris.txt with the autotuner's render pass report.
+- autotune (profiled): lock a render pass's mode after 10 samples per mode and 10 s (was 15 and
+  30 s) and for passes from 0.15 ms (was 1 ms).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014Ps8wnhVXtSU7d88gGtyHX
+---
+ src/freedreno/vulkan/meson.build    |   1 +
+ src/freedreno/vulkan/tu_autotune.cc |  60 ++-----
+ src/freedreno/vulkan/tu_device.cc   |   2 +
+ src/freedreno/vulkan/tu_doris.cc    | 259 ++++++++++++++++++++++++++++
+ src/freedreno/vulkan/tu_doris.h     |  34 ++++
+ src/freedreno/vulkan/tu_image.cc    |  15 ++
+ src/freedreno/vulkan/tu_queue.cc    |   2 +
+ 7 files changed, 328 insertions(+), 45 deletions(-)
+ create mode 100644 src/freedreno/vulkan/tu_doris.cc
+ create mode 100644 src/freedreno/vulkan/tu_doris.h
+
+diff --git a/src/freedreno/vulkan/meson.build b/src/freedreno/vulkan/meson.build
+index b0197103975..23af096c9b0 100644
+--- a/src/freedreno/vulkan/meson.build
++++ b/src/freedreno/vulkan/meson.build
+@@ -42,6 +42,7 @@ libtu_files = files(
+   'tu_cs_breadcrumbs.cc',
+   'tu_cs.cc',
+   'tu_device.cc',
++  'tu_doris.cc',
+   'tu_descriptor_set.cc',
+   'tu_dynamic_rendering.cc',
+   'tu_event.cc',
+diff --git a/src/freedreno/vulkan/tu_autotune.cc b/src/freedreno/vulkan/tu_autotune.cc
+index 146efc6f27b..3a01104a310 100644
+--- a/src/freedreno/vulkan/tu_autotune.cc
++++ b/src/freedreno/vulkan/tu_autotune.cc
+@@ -27,6 +27,7 @@
+ #include "tu_pass.h"
+ 
+ #include "git_sha1.h"
++#include "tu_doris.h"
+ 
+ /** Compile-time debug options **/
+ 
+@@ -1172,10 +1173,14 @@ struct tu_autotune::rp_history {
+                 * avoids performance hazards from switching to an extremely suboptimal mode even if done very rarely.
+                 * Note: Due to the potentially huge negative impact of a bad lock, this is a very conservative check.
+                 */
+-               constexpr uint32_t MIN_LOCK_DURATION_COUNT = 15;
+-               constexpr uint64_t MIN_LOCK_THRESHOLD = GPU_TICKS_PER_US * 1'000; /* 1ms */
++               /* Eden (Doris): lock sooner and for shorter passes too. In TotK on Eden many passes take
++                * 0.2-1 ms and were never locked, so they kept trying the slower mode 1% of the time
++                * (a GMEM try of a 0.6 ms SYSMEM pass took 1.2-1.7 ms).
++                */
++               constexpr uint32_t MIN_LOCK_DURATION_COUNT = 10;
++               constexpr uint64_t MIN_LOCK_THRESHOLD = GPU_TICKS_PER_US * 150; /* 0.15ms */
+                constexpr uint32_t LOCK_PERCENT_DIFF = 30;
+-               constexpr uint64_t LOCK_TIME_WINDOW_NS = 30'000'000'000; /* 30s */
++               constexpr uint64_t LOCK_TIME_WINDOW_NS = 10'000'000'000; /* 10s */
+ 
+                uint64_t now = os_time_get_nano();
+                bool current_sysmem_winning = avg_sysmem < avg_gmem;
+@@ -1699,35 +1704,11 @@ struct tu_autotune::doris_report {
+       bool locked = false;
+    };
+ 
+-   FILE *file = nullptr;
+    uint64_t start_ns = 0, window_start_ns = 0;
+    std::unordered_map<uint64_t, rp_stats> window;
+    std::unordered_map<uint64_t, rp_stats> session;
+-
+-   ~doris_report()
+-   {
+-      if (file)
+-         fclose(file);
+-   }
+ };
+ 
+-static std::string
+-doris_process_name()
+-{
+-   char name[256] = {};
+-   FILE *f = fopen("/proc/self/cmdline", "rb");
+-   if (!f)
+-      return {};
+-   size_t n = fread(name, 1, sizeof(name) - 1, f);
+-   fclose(f);
+-   name[n] = 0;
+-   std::string s(name);
+-   size_t colon = s.find(':');
+-   if (colon != std::string::npos)
+-      s.resize(colon);
+-   return s;
+-}
+-
+ static void
+ doris_open_report(tu_autotune &at);
+ 
+@@ -1757,7 +1738,7 @@ tu_autotune::doris_note(const rp_history &history, const rp_entry &const_entry)
+ }
+ 
+ static void
+-doris_write_table(FILE *f, const char *title, std::unordered_map<uint64_t, tu_autotune::doris_report::rp_stats> &map,
++doris_write_table(const char *title, std::unordered_map<uint64_t, tu_autotune::doris_report::rp_stats> &map,
+                   double seconds, size_t top)
+ {
+    uint64_t sysmem_ticks = 0, gmem_ticks = 0, binning_ticks = 0;
+@@ -1775,7 +1756,7 @@ doris_write_table(FILE *f, const char *title, std::unordered_map<uint64_t, tu_au
+       return a.second->sysmem_ticks + a.second->gmem_ticks > b.second->sysmem_ticks + b.second->gmem_ticks;
+    });
+    auto ms_per_s = [&](uint64_t ticks) { return ticks / GPU_TICKS_PER_US / 1000.0 / MAX2(seconds, 0.001); };
+-   fprintf(f,
++   tu_doris_printf(
+            "%s: %.1f s | timed render passes (5+ draws) %.1f ms of GPU per second: SYSMEM %" PRIu64 " passes "
+            "%.1f ms/s, GMEM %" PRIu64 " passes %.1f ms/s (binning %.1f ms/s) | %zu different passes\n",
+            title, seconds, ms_per_s(sysmem_ticks + gmem_ticks), sysmem_count, ms_per_s(sysmem_ticks), gmem_count,
+@@ -1784,7 +1765,7 @@ doris_write_table(FILE *f, const char *title, std::unordered_map<uint64_t, tu_au
+       const auto &st = *sorted[i].second;
+       double sys_avg = st.sysmem_count ? st.sysmem_ticks / GPU_TICKS_PER_US / st.sysmem_count : 0;
+       double gmem_avg = st.gmem_count ? st.gmem_ticks / GPU_TICKS_PER_US / st.gmem_count : 0;
+-      fprintf(f,
++      tu_doris_printf(
+               "  %016" PRIx64 " %4ux%-4u %4u draws: %.1f ms/s | SYSMEM %5u x %7.0f us | GMEM %5u x %7.0f us "
+               "(%u bins, binning %.0f us) | now SYSMEM %u%%%s\n",
+               sorted[i].first, st.width, st.height, st.draws, ms_per_s(st.sysmem_ticks + st.gmem_ticks),
+@@ -1803,12 +1784,11 @@ tu_autotune::doris_maybe_write()
+    double window_s = (now - doris->window_start_ns) / 1e9;
+    double session_s = (now - doris->start_ns) / 1e9;
+    if (!doris->window.empty()) {
+-      fprintf(doris->file, "== %.0f s, algorithm %s\n", session_s, active_config.load().to_string().c_str());
+-      doris_write_table(doris->file, "last window", doris->window, window_s, 12);
++      tu_doris_printf("== %.0f s, algorithm %s\n", session_s, active_config.load().to_string().c_str());
++      doris_write_table("render passes timed by the autotuner, last window", doris->window, window_s, 12);
+       /* The whole session every minute. */
+       if ((uint64_t) session_s / 60 != (uint64_t) (session_s - window_s) / 60)
+-         doris_write_table(doris->file, "session", doris->session, session_s, 25);
+-      fflush(doris->file);
++         doris_write_table("render passes timed by the autotuner, session", doris->session, session_s, 25);
+    }
+    doris->window.clear();
+    doris->window_start_ns = now;
+@@ -1817,20 +1797,10 @@ tu_autotune::doris_maybe_write()
+ static void
+ doris_open_report(tu_autotune &at)
+ {
+-   std::string name = doris_process_name();
+-   if (name.find("eden") == std::string::npos)
+-      return;
+-   std::string path = "/storage/emulated/0/Android/data/" + name + "/files/log/apex_doris.txt";
+-   struct stat st;
+-   const char *mode = (stat(path.c_str(), &st) == 0 && st.st_size > 4 * 1024 * 1024) ? "w" : "a";
+-   FILE *f = fopen(path.c_str(), mode);
+-   if (!f)
++   if (!tu_doris_enabled())
+       return;
+    at.doris = std::make_unique<tu_autotune::doris_report>();
+-   at.doris->file = f;
+    at.doris->start_ns = at.doris->window_start_ns = os_time_get_nano();
+-   fprintf(f, "\n#### Apex Doris render pass report (" PACKAGE_VERSION MESA_GIT_SHA1 "), device opened\n");
+-   fflush(f);
+ }
+ 
+ tu_autotune::tu_autotune(struct tu_device *device, VkResult &result)
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index b554a5b024c..baa9c805236 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -11,6 +11,7 @@
+ 
+ #include "drm-uapi/drm_fourcc.h"
+ #include "git_sha1.h"
++#include "tu_doris.h"
+ #include "perfcntrs/freedreno_perfcntr.h"
+ 
+ #include "common/freedreno_stompable_regs.h"
+@@ -3235,6 +3236,7 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
+                      tu_trace_capture_data,
+                      tu_trace_get_data,
+                      tu_trace_delete_flush_data);
++   tu_doris_device_init(device);
+ 
+    tu_breadcrumbs_init(device);
+ 
+diff --git a/src/freedreno/vulkan/tu_doris.cc b/src/freedreno/vulkan/tu_doris.cc
+new file mode 100644
+index 00000000000..8f595d45c37
+--- /dev/null
++++ b/src/freedreno/vulkan/tu_doris.cc
+@@ -0,0 +1,259 @@
++/*
++ * Copyright © 2026 Eden (Doris)
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "tu_doris.h"
++
++#include <algorithm>
++#include <atomic>
++#include <cstdarg>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++#include <string>
++#include <unordered_map>
++#include <vector>
++#include <sys/stat.h>
++
++#include "util/os_time.h"
++
++#include "tu_device.h"
++
++#include "git_sha1.h"
++
++namespace {
++
++/** The report file **/
++
++std::once_flag open_once;
++std::mutex file_mutex;
++FILE *report = nullptr;
++
++std::string
++process_name()
++{
++   char name[256] = {};
++   FILE *f = fopen("/proc/self/cmdline", "rb");
++   if (!f)
++      return {};
++   size_t n = fread(name, 1, sizeof(name) - 1, f);
++   fclose(f);
++   name[n] = 0;
++   std::string s(name);
++   size_t colon = s.find(':');
++   if (colon != std::string::npos)
++      s.resize(colon);
++   return s;
++}
++
++void
++open_report()
++{
++   std::string name = process_name();
++   if (name.find("eden") == std::string::npos)
++      return;
++   std::string path = "/storage/emulated/0/Android/data/" + name + "/files/log/apex_doris.txt";
++   struct stat st;
++   const char *mode = (stat(path.c_str(), &st) == 0 && st.st_size > 4 * 1024 * 1024) ? "w" : "a";
++   report = fopen(path.c_str(), mode);
++}
++
++std::string
++read_first_line(const char *path)
++{
++   char line[256] = {};
++   FILE *f = fopen(path, "r");
++   if (!f)
++      return {};
++   if (!fgets(line, sizeof(line), f))
++      line[0] = 0;
++   fclose(f);
++   std::string s(line);
++   while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' '))
++      s.pop_back();
++   return s;
++}
++
++/** System state: GPU clock and load every second, temperatures every 10 seconds **/
++
++struct thermal_zone {
++   std::string temp_path;
++   bool cpu, gpu;
++};
++
++constexpr uint64_t WINDOW_NS = 10'000'000'000ull;
++
++struct system_state {
++   std::mutex mutex;
++   uint64_t last_sample_ns = 0, window_start_ns = 0;
++   double clock_sum = 0, busy_sum = 0;
++   unsigned clock_min = ~0u, clock_max = 0, samples = 0, busy_samples = 0;
++   bool zones_scanned = false;
++   std::vector<thermal_zone> zones;
++} sys;
++
++double
++to_celsius(const std::string &text)
++{
++   double value = atof(text.c_str());
++   return value > 1000.0 ? value / 1000.0 : value;
++}
++
++void
++scan_zones()
++{
++   sys.zones_scanned = true;
++   for (int zone = 0; zone < 160; zone++) {
++      char base[96];
++      snprintf(base, sizeof(base), "/sys/class/thermal/thermal_zone%d/", zone);
++      std::string type = read_first_line((std::string(base) + "type").c_str());
++      if (type.empty()) {
++         if (zone > 8)
++            break;
++         continue;
++      }
++      bool cpu = type.find("cpu") != std::string::npos;
++      bool gpu = type.find("gpu") != std::string::npos;
++      if (cpu || gpu)
++         sys.zones.push_back({ std::string(base) + "temp", cpu, gpu });
++   }
++}
++
++void
++write_system_line(double window_s)
++{
++   std::string temps;
++   std::string battery = read_first_line("/sys/class/power_supply/battery/temp");
++   if (!battery.empty()) {
++      char buf[48];
++      snprintf(buf, sizeof(buf), "battery %.1f C", atof(battery.c_str()) / 10.0);
++      temps += buf;
++   }
++   if (!sys.zones_scanned)
++      scan_zones();
++   double hottest_cpu = 0, hottest_gpu = 0;
++   for (auto &z : sys.zones) {
++      std::string t = read_first_line(z.temp_path.c_str());
++      if (t.empty())
++         continue;
++      double c = to_celsius(t);
++      if (c <= 0 || c > 150)
++         continue;
++      if (z.gpu)
++         hottest_gpu = MAX2(hottest_gpu, c);
++      else
++         hottest_cpu = MAX2(hottest_cpu, c);
++   }
++   char buf[160];
++   if (hottest_gpu > 0) {
++      snprintf(buf, sizeof(buf), "%sGPU %.1f C", temps.empty() ? "" : ", ", hottest_gpu);
++      temps += buf;
++   }
++   if (hottest_cpu > 0) {
++      snprintf(buf, sizeof(buf), "%sCPU %.1f C", temps.empty() ? "" : ", ", hottest_cpu);
++      temps += buf;
++   }
++
++   std::string gpu;
++   if (sys.samples) {
++      snprintf(buf, sizeof(buf), "GPU clock avg %.0f MHz (%u-%u)", sys.clock_sum / sys.samples, sys.clock_min,
++               sys.clock_max);
++      gpu += buf;
++   }
++   if (sys.busy_samples) {
++      snprintf(buf, sizeof(buf), "%sbusy avg %.0f%%", gpu.empty() ? "GPU " : ", ", sys.busy_sum / sys.busy_samples);
++      gpu += buf;
++   }
++   tu_doris_printf("system (%.0f s): %s | %s\n", window_s, gpu.empty() ? "GPU clock n/a" : gpu.c_str(),
++                   temps.empty() ? "temperatures n/a" : temps.c_str());
++}
++
++void
++sample_gpu()
++{
++   std::string clock = read_first_line("/sys/class/kgsl/kgsl-3d0/gpuclk");
++   if (clock.empty())
++      clock = read_first_line("/sys/class/kgsl/kgsl-3d0/devfreq/cur_freq");
++   if (!clock.empty()) {
++      unsigned mhz = (unsigned) (atof(clock.c_str()) / 1e6);
++      sys.clock_sum += mhz;
++      sys.clock_min = MIN2(sys.clock_min, mhz);
++      sys.clock_max = MAX2(sys.clock_max, mhz);
++      sys.samples++;
++   }
++   std::string busy = read_first_line("/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage");
++   if (!busy.empty()) {
++      sys.busy_sum += atof(busy.c_str());
++      sys.busy_samples++;
++   } else {
++      unsigned long long busy_time = 0, total_time = 0;
++      std::string raw = read_first_line("/sys/class/kgsl/kgsl-3d0/gpubusy");
++      if (sscanf(raw.c_str(), "%llu %llu", &busy_time, &total_time) == 2 && total_time) {
++         sys.busy_sum += busy_time * 100.0 / total_time;
++         sys.busy_samples++;
++      }
++   }
++}
++
++} /* namespace */
++
++bool
++tu_doris_enabled(void)
++{
++   std::call_once(open_once, open_report);
++   return report != nullptr;
++}
++
++void
++tu_doris_printf(const char *format, ...)
++{
++   if (!tu_doris_enabled())
++      return;
++   std::scoped_lock lock(file_mutex);
++   va_list args;
++   va_start(args, format);
++   vfprintf(report, format, args);
++   va_end(args);
++   fflush(report);
++}
++
++void
++tu_doris_device_init(struct tu_device *device)
++{
++   if (!tu_doris_enabled())
++      return;
++   tu_doris_printf("\n#### Apex Doris GPU report (Mesa " PACKAGE_VERSION MESA_GIT_SHA1 "), device opened\n");
++}
++
++bool
++tu_doris_is_eden_engine(const char *engine_name)
++{
++   return engine_name && !strcmp(engine_name, "yuzu Emulator");
++}
++
++void
++tu_doris_tick(void)
++{
++   if (!tu_doris_enabled())
++      return;
++   std::unique_lock lock(sys.mutex, std::try_to_lock);
++   if (!lock.owns_lock())
++      return;
++   uint64_t now = os_time_get_nano();
++   if (!sys.window_start_ns)
++      sys.window_start_ns = now;
++   if (now - sys.last_sample_ns >= 1'000'000'000ull) {
++      sys.last_sample_ns = now;
++      sample_gpu();
++   }
++   if (now - sys.window_start_ns >= WINDOW_NS) {
++      write_system_line((now - sys.window_start_ns) / 1e9);
++      sys.clock_sum = sys.busy_sum = 0;
++      sys.clock_min = ~0u;
++      sys.clock_max = 0;
++      sys.samples = sys.busy_samples = 0;
++      sys.window_start_ns = now;
++   }
++}
+diff --git a/src/freedreno/vulkan/tu_doris.h b/src/freedreno/vulkan/tu_doris.h
+new file mode 100644
+index 00000000000..6303de03059
+--- /dev/null
++++ b/src/freedreno/vulkan/tu_doris.h
+@@ -0,0 +1,34 @@
++/*
++ * Copyright © 2026 Eden (Doris)
++ * SPDX-License-Identifier: MIT
++ */
++
++/* Eden (Doris): a report for Tears of the Kingdom on Eden, written to apex_doris.txt in Eden's
++ * log folder (off in every other app): every 10 seconds the GPU clock and load and temperatures
++ * (from the kernel's files that apps may read), and the autotuner's render pass report.
++ */
++
++#ifndef TU_DORIS_H
++#define TU_DORIS_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++struct tu_device;
++
++/* True when the process is Eden; the report file is open. */
++bool tu_doris_enabled(void);
++
++/* Opens the report (once per process) and writes a header for a new device. */
++void tu_doris_device_init(struct tu_device *device);
++
++/* Eden reports the engine "yuzu Emulator". */
++bool tu_doris_is_eden_engine(const char *engine_name);
++
++/* Appends to the report (thread safe). */
++void tu_doris_printf(const char *format, ...) __attribute__((format(printf, 1, 2)));
++
++/* Called on every queue submit: GPU clock/load sampling and the 10-second system line. */
++void tu_doris_tick(void);
++
++#endif /* TU_DORIS_H */
+diff --git a/src/freedreno/vulkan/tu_image.cc b/src/freedreno/vulkan/tu_image.cc
+index 6c68838e338..a43f49fec69 100644
+--- a/src/freedreno/vulkan/tu_image.cc
++++ b/src/freedreno/vulkan/tu_image.cc
+@@ -8,6 +8,7 @@
+  */
+ 
+ #include "tu_image.h"
++#include "tu_doris.h"
+ 
+ #include "drm-uapi/drm_fourcc.h"
+ 
+@@ -651,6 +652,20 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
+             bool r8g8_r16 = format_list_reinterprets_r8g8_r16(vk_format_to_pipe_format(image->vk.format), fmt_list);
+             bool fmt_list_has_swaps = format_list_has_swaps(fmt_list);
+ 
++            /* Eden (Doris): Eden gives every 32-bit color image a view format list with all 19
++             * formats of its size class, BGRA8 among them, so on A740 (no all-formats-compatible
++             * UBWC) every 32-bit render target and texture became LINEAR: all of TotK's
++             * RGBA8/RGB10A2/RG16F/R11G11B10F/R32 targets were drawn and sampled untiled. Keep them
++             * tiled (still without UBWC). A tiled image ignores the swap in both the CCU and the
++             * TP, so a view with a swapped format reads the same channels as the image's own
++             * format instead of R and B exchanged; Eden only makes such a view when the guest
++             * reinterprets RGBA as BGRA in place. R8G8 vs R16 still needs linear (different tiled
++             * layouts), so that stays.
++             */
++            if (fmt_list_has_swaps && !r8g8_r16 &&
++                tu_doris_is_eden_engine(device->instance->vk.app_info.engine_name))
++               fmt_list_has_swaps = false;
++
+             if (r8g8_r16 || fmt_list_has_swaps) {
+                ubwc_enabled = false;
+                force_linear_tile = true;
+diff --git a/src/freedreno/vulkan/tu_queue.cc b/src/freedreno/vulkan/tu_queue.cc
+index 3e6cd0afdff..6bc234a5354 100644
+--- a/src/freedreno/vulkan/tu_queue.cc
++++ b/src/freedreno/vulkan/tu_queue.cc
+@@ -8,6 +8,7 @@
+  */
+ 
+ #include "tu_queue.h"
++#include "tu_doris.h"
+ 
+ #include "vk_util.h"
+ 
+@@ -592,6 +593,7 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
+    pthread_cond_broadcast(&queue->device->timeline_cond);
+ 
+    u_trace_context_process(&device->trace_context, false);
++   tu_doris_tick();
+ 
+ out:
+    tu_submit_finish(device, submit);
+-- 
+2.43.0
+
