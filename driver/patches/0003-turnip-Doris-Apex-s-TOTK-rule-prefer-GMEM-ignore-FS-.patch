@@ -1,0 +1,37 @@
+From 25733a0f26406a3b0de3cb0a89c513410c2e7697 Mon Sep 17 00:00:00 2001
+From: "Eden (Doris) build" <doris@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 12:07:12 -0500
+Subject: [PATCH] turnip (Doris): Apex's TOTK rule (prefer GMEM, ignore FS
+ depth direction) applied to Eden
+
+Apex v2 matches its "TOTK grass/blocky-ground fix (#8)" against the application name .*(totk).*;
+Eden's application and engine name is "yuzu Emulator", so it never applied there. Apply the same
+two options to the engine "yuzu Emulator".
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014Ps8wnhVXtSU7d88gGtyHX
+---
+ src/freedreno/vulkan/00-turnip-defaults.conf | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/freedreno/vulkan/00-turnip-defaults.conf b/src/freedreno/vulkan/00-turnip-defaults.conf
+index a51e7c486a3..7c194313f6a 100644
+--- a/src/freedreno/vulkan/00-turnip-defaults.conf
++++ b/src/freedreno/vulkan/00-turnip-defaults.conf
+@@ -8,6 +8,13 @@
+             <option name="tu_allow_oob_indirect_ubo_loads" value="true" />
+             <option name="tu_dont_care_as_load" value="true" />
+         </engine>
++        <!-- Eden (Doris): Apex's TOTK rule (#8) for Eden. Apex matches it against the application name
++             ".*(totk).*", but Eden reports "yuzu Emulator" as both application and engine name, so the
++             rule never applied in Eden. Same options, matched to Eden's engine name. -->
++        <engine engine_name_match="yuzu Emulator">
++            <option name="tu_autotune_algorithm" value="prefer_gmem" />
++            <option name="tu_ignore_frag_depth_direction" value="true" />
++        </engine>
+         <engine engine_name_match="rpcsx|armsx|rpcs3">
+             <option name="tu_restrict_subgroup_size_64" value="false" />
+             <option name="tu_autotune_algorithm" value="prefer_gmem" />
+-- 
+2.43.0
+

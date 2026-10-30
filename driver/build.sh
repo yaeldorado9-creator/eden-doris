@@ -40,7 +40,7 @@ if [ ! -f "$OUT/build/build.ninja" ]; then
     -Dbuildtype=release -Doptimization=3 -Db_ndebug=true -Dstrip=true \
     -Dplatforms=android -Dplatform-sdk-version=$API -Dandroid-stub=true \
     -Dandroid-libbacktrace=disabled -Dgallium-drivers= -Dvulkan-drivers=freedreno \
-    -Dfreedreno-kmds=kgsl -Dvulkan-beta=true -Degl=disabled -Dgles1=disabled -Dgles2=disabled \
+    -Dfreedreno-kmds=kgsl -Dvulkan-beta=false -Degl=disabled -Dgles1=disabled -Dgles2=disabled \
     -Dopengl=false -Dglx=disabled -Dllvm=disabled -Dzstd=disabled -Dexpat=disabled \
     -Dvalgrind=disabled -Dlibunwind=disabled -Dlmsensors=disabled -Dgbm=disabled \
     -Dshader-cache=enabled -Db_lto=false

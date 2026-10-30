@@ -12,11 +12,16 @@ Balemuni's **Apex v2 Ultimate** Turnip driver rebuilt from source, as the base f
 - ir3 global code motion on by default (`GCM=1`), 512 KiB pipeline and kgsl profiling suballocators, 4 GiB disk
   shader cache.
 
-`patches/0001` is that rebuild (the "as is" zip). Further patches are Doris changes (the "TotK tuned" zip):
+`patches/0001` is that rebuild (the "as is" zip). Further patches are Doris changes:
 
 - **0002**: for Eden, each render pass with 5+ draws is timed on the GPU in both SYSMEM and GMEM modes and the
   faster mode is used (Turnip's profiled autotuner) instead of the bandwidth estimate. The driver writes
   `log/apex_doris.txt` in Eden's folder every 10 s: GPU time of the timed render passes, SYSMEM vs GMEM, and the
   passes that cost the most with both modes' averages.
+
+- **0003** (separate zip, `-apexfix`): Apex's own TotK rule (#8: prefer GMEM, ignore the fragment shader's depth
+  direction) switched on for Eden by matching Eden's engine name. Not combined with 0002 (both set the render mode
+  choice). Eden's shaders declare no depth direction, so in practice this is "GMEM for every render pass with 5+
+  draws".
 
 Built by `.github/workflows/driver.yml` into a release `apex-doris-<n>`.
