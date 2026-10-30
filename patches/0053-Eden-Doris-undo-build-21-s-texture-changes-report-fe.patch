@@ -1,0 +1,301 @@
+From 4a52ced4af250abedde79cba5bbebf0945922a60 Mon Sep 17 00:00:00 2001
+From: "Eden (Doris) build" <doris@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 08:48:29 -0500
+Subject: [PATCH] Eden (Doris): undo build 21's texture changes; report fences
+ released before GPU-written data is copied back
+
+- Build 21 marked textures created from GPU drawings as GPU-drawn, copied newer drawings between
+  same-layout textures that Eden keeps apart, and brought textures up to date before the cleanup
+  copied them back. Its log shows TotK recycling texture memory at arbitrary offsets: those
+  copies moved one terrain tile's data into another, and a 320x180 RGBA8 drawing into a 320x180
+  B10G11R11 texture every frame. The ground glitch was unchanged and grass vanished; all three
+  are undone (the counters stay in the report).
+- Report: fences signalled, how many were released to the game at once while bytes the GPU
+  wrote into buffers before them were still to be copied back (GPU fence behaviour
+  "Immediate"), and how much was copied back at fences. Pairs of textures kept apart are
+  logged in full once per pair of shapes (the offsets vary as memory is reused).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014Ps8wnhVXtSU7d88gGtyHX
+---
+ src/common/doris_perf.cpp                     |  13 +--
+ src/common/doris_perf.h                       |  11 +-
+ src/video_core/buffer_cache/buffer_cache.h    |   2 +
+ src/video_core/fence_manager.h                |   6 ++
+ src/video_core/texture_cache/image_base.h     |   4 -
+ src/video_core/texture_cache/texture_cache.h  | 101 ++----------------
+ .../texture_cache/texture_cache_base.h        |   5 -
+ 7 files changed, 31 insertions(+), 111 deletions(-)
+
+diff --git a/src/common/doris_perf.cpp b/src/common/doris_perf.cpp
+index 881f66490..d7998ad8c 100644
+--- a/src/common/doris_perf.cpp
++++ b/src/common/doris_perf.cpp
+@@ -606,12 +606,13 @@ void ReportLoop() {
+                  gauge_of(Gauge::TextureCacheExpected), gauge_of(Gauge::TextureCacheCritical));
+         LOG_INFO(Frontend,
+                  "Doris perf: textures sharing memory: {} pairs kept apart as each new one was "
+-                 "created, {} created with copies of GPU drawings (now kept as GPU-drawn), {} "
+-                 "brought up to date from same-layout GPU drawings, {} uploaded again from guest "
+-                 "memory next to GPU drawings",
++                 "created, {} created with copies of GPU drawings, {} uploaded again from guest "
++                 "memory next to GPU drawings | fences {}, {} of them released to the game before "
++                 "the GPU-written data they cover was copied back ({:.2f} MiB copied back at fences)",
+                  count_of(Count::TextureBadOverlaps), count_of(Count::TextureCreatedFromGpuData),
+-                 count_of(Count::TextureSameLayoutSyncs),
+-                 count_of(Count::TextureUploadsBesideGpuData));
++                 count_of(Count::TextureUploadsBesideGpuData), count_of(Count::Fences),
++                 count_of(Count::FencesBeforeCopyBack),
++                 static_cast<double>(count_of(Count::FenceCopyBackBytes)) / (1024.0 * 1024.0));
+ 
+         // Which textures lost GPU-drawn contents, and how.
+         {
+@@ -626,7 +627,7 @@ void ReportLoop() {
+                 "removed with GPU-drawn contents lost",
+                 "GPU-drawn, then marked as changed as a whole",
+                 "created with copies of GPU drawings sharing their memory",
+-                "brought up to date from GPU drawings sharing their memory",
++                "brought up to date from GPU drawings sharing their memory (build 21)",
+                 "uploaded again from guest memory next to GPU drawings",
+                 "sharing memory but kept apart (why: as part of the other / the other as part of "
+                 "it)",
+diff --git a/src/common/doris_perf.h b/src/common/doris_perf.h
+index 2d7b177f7..090ad67f0 100644
+--- a/src/common/doris_perf.h
++++ b/src/common/doris_perf.h
+@@ -82,14 +82,19 @@ enum class Count : int {
+     /// Textures created with contents copied from GPU drawings sharing their memory (now kept
+     /// as GPU-drawn; Eden treated them as plain uploads).
+     TextureCreatedFromGpuData,
+-    /// Textures brought up to date from newer GPU drawings sharing their memory with the same
+-    /// layout, which Eden keeps apart ("bad overlap").
+-    TextureSameLayoutSyncs,
+     /// Textures uploaded again from guest memory while another texture sharing their memory
+     /// holds GPU drawings.
+     TextureUploadsBesideGpuData,
+     /// Textures sharing memory that Eden keeps apart ("bad overlap"), as each new one is created.
+     TextureBadOverlaps,
++    /// Fences the GPU emulation thread signalled (syncpoints and other waits of the game).
++    Fences,
++    /// ... released to the game at once ("GPU fence behaviour: Immediate"), while the bytes the
++    /// GPU wrote into buffers before it were still to be copied back to guest memory: until the
++    /// copy lands the game reads what was there before.
++    FencesBeforeCopyBack,
++    /// Bytes the GPU wrote into buffers, copied back to guest memory at fences.
++    FenceCopyBackBytes,
+     Max,
+ };
+ 
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index b80366a08..9223efdfc 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -14,6 +14,7 @@
+ #include <mutex>
+ #include <numeric>
+ 
++#include "common/doris_perf.h"
+ #include "common/range_sets.inc"
+ #include "video_core/buffer_cache/buffer_cache_base.h"
+ #include "video_core/guest_memory.h"
+@@ -762,6 +763,7 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
+         async_buffers.emplace_back(std::optional<Async_Buffer>{});
+         return;
+     }
++    Doris::Perf::Add(Doris::Perf::Count::FenceCopyBackBytes, total_size_bytes);
+     auto download_staging = runtime.DownloadStagingBuffer(total_size_bytes, true);
+     boost::container::small_vector<BufferCopy, 4> normalized_copies;
+     runtime.PreCopyBarrier();
+diff --git a/src/video_core/fence_manager.h b/src/video_core/fence_manager.h
+index 1a3a5435b..a0117a08f 100644
+--- a/src/video_core/fence_manager.h
++++ b/src/video_core/fence_manager.h
+@@ -76,6 +76,12 @@ public:
+     void SignalFence(std::function<void()>&& func) {
+         const bool delay_fence = Settings::IsGPUFenceBehaviorDefault() ? Settings::IsGPULevelHigh() : Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate() || Settings::IsGPUFenceBehaviorStrict();
+         const bool should_flush = ShouldFlush();
++        // Eden (Doris): for the report, how often the game is told the GPU is done while bytes
++        // the GPU wrote are still on their way back to guest memory.
++        Doris::Perf::Add(Doris::Perf::Count::Fences);
++        if (!delay_fence && should_flush) {
++            Doris::Perf::Add(Doris::Perf::Count::FencesBeforeCopyBack);
++        }
+         if constexpr (!can_async_check) {
+             TryReleasePendingFences<false>();
+         }
+diff --git a/src/video_core/texture_cache/image_base.h b/src/video_core/texture_cache/image_base.h
+index 6a444b26c..916caab12 100644
+--- a/src/video_core/texture_cache/image_base.h
++++ b/src/video_core/texture_cache/image_base.h
+@@ -131,10 +131,6 @@ struct ImageBase {
+ 
+     /// Eden (Doris): pages written by the game's code next to (or over) GPU-drawn contents.
+     std::vector<DorisTouchedPage> doris_touched_pages;
+-
+-    /// Eden (Doris): the newest modification of the images in overlapping_images already looked
+-    /// at for same-layout copies (nothing newer to look at while theirs are not above it).
+-    u64 doris_overlaps_seen_tick = 0;
+ };
+ 
+ struct ImageMapView {
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 7a0cf5483..6ec73633e 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -343,10 +343,6 @@ void TextureCache<P>::DorisRunGarbageCollector() {
+                     True(image.flags & ImageFlagBits::Sparse)) {
+                     return false;
+                 }
+-                // What the GPU drew since into textures sharing its memory goes into the copy
+-                // back too: some of those (single-level ones Eden keeps apart from others) are
+-                // removed without a copy back of their own, and their drawings were lost.
+-                DorisBringUpToDate(image_id);
+                 Doris::Perf::Add(Doris::Perf::Count::GcDownloaded);
+                 auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes, true);
+                 const auto copies = FixSmallVectorADL(FullDownloadCopies(image.info));
+@@ -2365,14 +2361,9 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
+             const AliasedImage& aliased = new_image.aliased_images[alias_pointer->second];
+             CopyImage(new_image_id, aliased.id, aliased.copies);
+             new_image.modification_tick = overlap.modification_tick;
+-            // Eden (Doris): the new image now holds what the GPU drew into the alias (only
+-            // GPU-drawn aliases are copied), which guest memory doesn't have. Eden left it
+-            // marked as a plain upload: the next write by the game's code anywhere on its pages
+-            // uploaded all of it again from guest memory, and the alias's drawing never came
+-            // back (it isn't newer than the image), until the game drew it again. Mark it as
+-            // GPU-drawn, as SynchronizeAliases does when it copies from an alias.
++            // Eden (Doris): counted for the report (build 21 also marked the new image as
++            // GPU-drawn here; undone in build 22, it changed nothing for TotK's ground).
+             if (False(new_image.flags & ImageFlagBits::GpuModified)) {
+-                new_image.flags |= ImageFlagBits::GpuModified;
+                 Doris::Perf::Add(Doris::Perf::Count::TextureCreatedFromGpuData);
+                 if (Doris::Perf::Enabled()) {
+                     Doris::Perf::NoteTexture(Doris::Perf::Note::CreatedFromGpuData,
+@@ -3236,82 +3227,6 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
+     }
+ }
+ 
+-template <class P>
+-void TextureCache<P>::DorisSyncOverlaps(ImageId image_id) {
+-    // Eden (Doris): images sharing memory that Eden can't join as one image or as aliases
+-    // ("bad overlap") never exchange contents, so what the GPU draws through one never reaches
+-    // the other (guest memory doesn't get it either). Where both lay the shared memory out the
+-    // same way, the newer drawing is copied over, as the memory itself would show it.
+-    Image& image = slot_images[image_id];
+-    const u64 seen_tick = (std::max)(image.modification_tick, image.doris_overlaps_seen_tick);
+-    boost::container::small_vector<ImageId, 8> sources;
+-    u64 newest_tick = seen_tick;
+-    for (const ImageId other_id : image.overlapping_images) {
+-        const Image& other = slot_images[other_id];
+-        if (other.modification_tick <= seen_tick) {
+-            continue;
+-        }
+-        newest_tick = (std::max)(newest_tick, other.modification_tick);
+-        if (other.IsSafeGpuCopy()) {
+-            sources.push_back(other_id);
+-        }
+-    }
+-    image.doris_overlaps_seen_tick = newest_tick;
+-    if (sources.empty()) {
+-        return;
+-    }
+-    // Converted images hold another host format than the guest's: left out.
+-    constexpr auto SKIPPED = ImageFlagBits::Sparse | ImageFlagBits::Rescaled |
+-                             ImageFlagBits::Converted;
+-    if (GetFormatType(image.info.format) != SurfaceType::ColorTexture ||
+-        True(image.flags & SKIPPED)) {
+-        return;
+-    }
+-    std::ranges::sort(sources, [this](ImageId lhs, ImageId rhs) {
+-        return slot_images[lhs].modification_tick < slot_images[rhs].modification_tick;
+-    });
+-    for (const ImageId source_id : sources) {
+-        Image& source = slot_images[source_id];
+-        if (GetFormatType(source.info.format) != SurfaceType::ColorTexture ||
+-            True(source.flags & SKIPPED)) {
+-            continue;
+-        }
+-        // The memory they share is what matters (both are contiguous: sparse ones are left out).
+-        std::vector<ImageCopy> copies =
+-            DorisSameLayoutCopies(image.info, image.cpu_addr, source.info, source.cpu_addr);
+-        if (copies.empty()) {
+-            continue;
+-        }
+-        // What the game's code wrote over the source since the GPU drew into it goes in first.
+-        if (!source.doris_touched_pages.empty()) {
+-            DorisResolveTouched(source_id, source);
+-            if (True(source.flags & ImageFlagBits::CpuModified)) {
+-                continue;
+-            }
+-        }
+-        if (Doris::Perf::Enabled()) {
+-            Doris::Perf::NoteTexture(Doris::Perf::Note::SameLayoutSynced,
+-                                     fmt::format("{} from {}", DorisDescribeImage(image),
+-                                                 DorisDescribeImage(source)));
+-        }
+-        Doris::Perf::Add(Doris::Perf::Count::TextureSameLayoutSyncs);
+-        CopyImage(image_id, source_id, std::move(copies));
+-        image.modification_tick = (std::max)(image.modification_tick, source.modification_tick);
+-        image.flags |= ImageFlagBits::GpuModified;
+-    }
+-}
+-
+-template <class P>
+-void TextureCache<P>::DorisBringUpToDate(ImageId image_id) {
+-    Image& image = slot_images[image_id];
+-    if (!image.aliased_images.empty()) {
+-        SynchronizeAliases(image_id);
+-    }
+-    if (!image.overlapping_images.empty()) {
+-        DorisSyncOverlaps(image_id);
+-    }
+-}
+-
+ template <class P>
+ void TextureCache<P>::DorisNoteBadOverlap(const ImageInfo& new_info, GPUVAddr new_addr,
+                                           const ImageBase& new_image_base,
+@@ -3333,10 +3248,13 @@ void TextureCache<P>::DorisNoteBadOverlap(const ImageInfo& new_info, GPUVAddr ne
+     std::string text = fmt::format(
+         "{} at {:+} of {}: {} / {}{}", DorisDescribeImage(new_image_base), offset,
+         DorisDescribeImage(overlap), as_part_of_other, other_as_part,
+-        same_layout ? " (same layout where shared: kept in step)" : "");
+-    // The first time a pair of shapes shows up, everything about both layouts goes to the log.
++        same_layout ? " (same layout where shared)" : "");
++    // The first time a pair of shapes shows up, everything about both layouts goes to the log
++    // (by shapes: the offsets vary as the game reuses memory).
+     static std::set<std::string> logged;
+-    if (logged.size() < 400 && logged.insert(text).second) {
++    std::string shapes = fmt::format("{} / {}", DorisDescribeImage(new_image_base),
++                                     DorisDescribeImage(overlap));
++    if (logged.size() < 300 && logged.insert(std::move(shapes)).second) {
+         LOG_INFO(HW_GPU, "Doris textures kept apart: new {} at {:#x} (guest {} bytes) / existing {} "
+                          "at {:#x} (guest {} bytes): {}",
+                  DorisDescribeLayout(new_info), new_addr, new_image_base.guest_size_bytes,
+@@ -3361,9 +3279,6 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool
+         if (!image.aliased_images.empty()) {
+             SynchronizeAliases(image_id);
+         }
+-        if (!image.overlapping_images.empty()) {
+-            DorisSyncOverlaps(image_id);
+-        }
+     }
+     if (is_modification) {
+         MarkModification(image);
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index dd64c1fd2..9c28889be 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -429,11 +429,6 @@ private:
+     /// Eden (Doris): changes the page tracking count over a non-sparse image, except on its
+     /// written-to pages (which are not tracked for it).
+     void DorisUpdateImagePages(ImageBase& image, s32 delta);
+-    /// Eden (Doris): copies into the image what newer GPU drawings in images sharing its memory
+-    /// that Eden keeps apart ("bad overlap") hold, where the guest layout is the same in both.
+-    void DorisSyncOverlaps(ImageId image_id);
+-    /// Eden (Doris): the newest contents of the image's aliases and same-layout overlaps.
+-    void DorisBringUpToDate(ImageId image_id);
+     /// Eden (Doris): names in the report two images sharing memory that Eden keeps apart, and why.
+     void DorisNoteBadOverlap(const ImageInfo& new_info, GPUVAddr new_addr,
+                              const ImageBase& new_image_base, const ImageBase& overlap);
+-- 
+2.43.0
+

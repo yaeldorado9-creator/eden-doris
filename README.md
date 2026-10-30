@@ -63,7 +63,7 @@ effect the next time the game starts; the ones marked "right away" apply as soon
   contents were kept; and the textures (size and format) that were uploaded again over GPU-drawn contents, had their
   bytes changed by the game, or were removed by the cleanup with GPU-drawn contents lost; partial uploads; which path
   marked a GPU-drawn texture as changed as a whole; textures sharing memory (pairs Eden keeps apart and why, textures
-  created from drawings, same-layout updates); separate heap mappings (Android); every separate heap rebuild (all
+  created from drawings); fences, and how many were released before GPU-written data was copied back; separate heap mappings (Android); every separate heap rebuild (all
   memory protection changes wait for it) is logged with how long it took. It also lists the longest hitches
   (frames over 50 ms) of every 10 seconds, each with how long the GPU emulation thread was actually busy in it, how
   long it waited for the game's commands, for the GPU, for presentation, for GPU memory and for the cache locks, how
@@ -123,37 +123,31 @@ rest of the level) was replaced with old contents. From build 20:
   textures.
 * The block layout maths was checked on a PC against Eden's own unswizzling for 11 texture layouts.
 
-### Textures that share memory (build 21)
+### Textures that share memory (builds 21 and 22)
 
-Builds 19 and 20 protected what the GPU drew only in textures marked as GPU-drawn. The build 20 log showed the
-protection working (no GPU-drawn texture was uploaded again over its drawing) while the ground kept switching, so the
-drawings were being lost somewhere that mark doesn't reach. Eden keeps several textures over the same memory: the
-terrain tile that the game samples (260x260, 9 mip levels) and the render targets it draws each level through (288x260,
-160x130, 96x65, 32x16 and smaller, their widths rounded up to the memory layout). Three gaps between them:
+Build 21 tried three changes to textures that share memory: textures Eden creates from a render target's drawing were
+marked as GPU-drawn, the newer drawing was copied between textures Eden keeps apart where both lay the shared memory
+out the same way, and the cleanup brought a texture up to date from those before copying it back. The ground glitch
+was unchanged, and grass vanished across the map. The build 21 log showed why the copies were wrong: TotK hands
+texture memory to new textures at arbitrary offsets (terrain tiles overlapped older tiles at dozens of different
+offsets), so a "newer" texture over the same memory is often another tile, or a 320x180 RGBA8 drawing that the copies
+pushed into a 320x180 B10G11R11 texture every frame. Build 22 undoes all three; textures behave as in build 20.
 
-* **A texture made from a drawing wasn't marked as one.** When Eden creates a texture over memory that a render target
-  already drew into, it copies the drawing in, but marked the new texture as if it had been read from guest memory.
-  The game's next write anywhere on its 82 pages then uploaded all of it again from guest memory, which never got the
-  drawing (a dark tile), and the render targets never gave it back (they weren't newer), until the game drew that
-  tile again. GPU copies (blits, DMA) also read it from guest memory. Such textures are now marked as GPU-drawn, as
-  Eden already does when it updates a texture from a render target later on.
-* **Textures Eden can't join never exchanged contents.** Eden joins two textures over the same memory only when one
-  fits inside the other by its rules; the rest ("bad overlap") are kept apart, and a drawing in one never reaches the
-  other. Where both lay the shared memory out the same way (same bytes per texel, same row pitch, same block height,
-  starting whole block rows apart), the newer drawing is now copied into the other when it is used, which is what the
-  memory itself would show. Checked on a PC against Eden's own unswizzling, for the terrain tile against each of its
-  render targets (both ways, also with the render targets' block height as the game might set it), and for other
-  layouts that must and must not match.
-* **The cleanup could copy back an old drawing.** Before copying a texture back to guest memory and removing it, the
-  cleanup now first brings it up to date from the textures that share its memory. Render targets with one level that
-  share memory with more than one texture are removed without a copy back of their own (as in Eden); their drawings
-  now survive in the textures that were updated from them.
+The report keeps a line on textures sharing memory (pairs kept apart as each new texture is created, textures created
+from drawings, uploads next to drawings) and names the pairs Eden keeps apart, with the reason each one can't be part
+of the other; the first time a pair of shapes shows up, both layouts are written to the log in full. Formats are named
+instead of numbered. It also shows the GPU's temperature and the hottest CPU and GPU sensors, where the system lets apps
+read them.
 
-The report adds a line on textures sharing memory (pairs kept apart as each new texture is created, textures created
-from drawings, same-layout updates, uploads next to drawings) and names the pairs Eden keeps apart, with the reason
-each one can't be part of the other; the first time a pair shows up, both layouts are written to the log in full.
-Formats are named instead of numbered. It also shows the GPU's temperature and the hottest CPU and GPU sensors,
-where the system lets apps read them.
+### GPU fences (build 22)
+
+With **GPU Fence Behavior: Immediate** (Settings → Graphics → Advanced), Eden tells the game the GPU has finished its
+work as soon as the work is recorded, before the GPU has run it and before the bytes the GPU wrote into buffers are
+copied back to guest memory. Until that copy lands, the game's code reads what was there before; when it writes there,
+Doris (since build 18, Eden #4490/#4531) waits for the copy first, which the report has counted 100 to 260 times every
+10 seconds in TotK since then: the game uses data the GPU wrote within moments of the fence. "Balanced" releases each
+fence only once the GPU has run the work before it and the copy has landed, as the Switch does. The report now counts
+the fences, how many were released while GPU-written data was still on its way back, and how much was copied back.
 
 ## Fixes from newer Eden (build 18)
 
