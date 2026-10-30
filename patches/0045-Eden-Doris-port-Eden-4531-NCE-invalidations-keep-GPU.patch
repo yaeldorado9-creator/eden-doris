@@ -1,7 +1,7 @@
 From 79b237d3a5324be0c76325e17fc8fadfe2559561 Mon Sep 17 00:00:00 2001
 From: "Eden (Doris) build" <doris@users.noreply.github.com>
 Date: Thu, 29 Oct 2026 20:33:54 -0500
-Subject: [PATCH 45/51] Eden (Doris): port Eden #4531 (NCE invalidations keep
+Subject: [PATCH 45/50] Eden (Doris): port Eden #4531 (NCE invalidations keep
  GPU writes, final form) and #4528 (old upload logic without optimized vertex
  buffers)
 

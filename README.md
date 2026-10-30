@@ -6,6 +6,11 @@ A personal build of the [Eden](https://git.eden-emu.dev/eden-emu/eden) Nintendo 
 aimed at fixing the graphical problems that remain in *Tears of the Kingdom* on Snapdragon 8 Gen 2 / Adreno 740
 handhelds (AYN Thor Pro): distant terrain, structures and shadows that flicker or vanish for a moment.
 
+> **Build 24 is build 19 again.** Builds 20 to 23 tried further fixes for the ground switching texture; none
+> removed it, and they cost temperature and speed. Build 24 has exactly build 19's code (the build with the best
+> temperatures and performance), under a new build number so it installs over any later build and keeps the
+> app's data.
+
 ## Installs beside every other Eden
 
 | | Eden (Doris) | Official Eden | Eden Nightly (coexist) |
@@ -27,7 +32,6 @@ Eden. With its default settings Doris behaves like that build; fixes are added o
 Doris's own settings are under **Settings → Graphics → Eden (Doris) experiments** (globally or per game). Most take
 effect the next time the game starts; the ones marked "right away" apply as soon as they are changed.
 
-* **GPU fences** (default: Doris: wait for what the GPU wrote; right away). See [GPU fences](#gpu-fences-builds-22-and-23).
 * **GPU barriers** (default: Doris: real barriers where needed). Eden turns the game's "wait until the GPU is done"
   points into a Vulkan event wait that guarantees neither ordering nor visibility of earlier writes, and puts no
   barrier after compute work. On Adreno this lets draws read culling results, indirect draw arguments and vertex data
@@ -49,11 +53,11 @@ effect the next time the game starts; the ones marked "right away" apply as soon
   `doris_profile.txt` in the log folder every 20 seconds.
   Each release includes `libyuzu-android-symbols-<n>.zip` to turn the offsets into function names.
 * **Performance report** (default: off). While a game runs, writes a summary to the log every 10 seconds (with the
-  device's clock time, to match it with videos of the screen): frame times, how busy each emulator thread is (and on which core), CPU and GPU clocks, GPU load, battery temperature (and the GPU's and the hottest CPU and GPU sensors', where readable);
+  device's clock time, to match it with videos of the screen): frame times, how busy each emulator thread is (and on which core), CPU and GPU clocks, GPU load, battery temperature;
   per frame, the draws, dispatches, render passes and submits, new pipelines, how long the GPU thread waited for
   presentation and GPU fences and the Vulkan worker for shader builds, and the GPU time of the whole frame, of frame
   generation and of output scaling (GPU timestamps); how often the GPU thread and the Vulkan worker ran on prime,
-  middle or little cores; worker wake-ups, render passes cut by a submit (and all passes reopened on the same targets), memory-protection changes, wait-for-idles
+  middle or little cores; worker wake-ups, render passes cut by a submit, memory-protection changes, wait-for-idles
   (and how many redundant barriers were left out) and tiled-cache barriers per frame; texture uploads (and how many
   replaced GPU-drawn contents) and what the texture garbage collector removed, copied back or called off, with GPU
   memory against its thresholds; upload volume, new staging buffers and new GPU memory per frame, and the time the GPU
@@ -62,10 +66,7 @@ effect the next time the game starts; the ones marked "right away" apply as soon
   (copied back first) and how long it waited for that; how many wait-for-idles came inside a render pass and how many
   had no storage writes by draws before them; how often the game wrote next to GPU-drawn textures and whether their
   contents were kept; and the textures (size and format) that were uploaded again over GPU-drawn contents, had their
-  bytes changed by the game, or were removed by the cleanup with GPU-drawn contents lost; partial uploads; which path
-  marked a GPU-drawn texture as changed as a whole; textures sharing memory (pairs Eden keeps apart and why, textures
-  created from drawings); fences, and how many were released before GPU-written data was copied back; separate heap mappings (Android); every separate heap rebuild (all
-  memory protection changes wait for it) is logged with how long it took. It also lists the longest hitches
+  bytes changed by the game, or were removed by the cleanup with GPU-drawn contents lost. It also lists the longest hitches
   (frames over 50 ms) of every 10 seconds, each with how long the GPU emulation thread was actually busy in it, how
   long it waited for the game's commands, for the GPU, for presentation, for GPU memory and for the cache locks, how
   busy the game's own threads were, and the shaders, uploads, new memory, texture removals, draws and submits in that
@@ -106,56 +107,6 @@ a page, not where:
   game's write. Each copy waits for the GPU to finish everything queued, about 20 ms while a frame is in flight, and
   in the build 18 log the game then wrote the next pages of the same buffer, in bursts of 10 to 13 waits. Build 19
   copies back the GPU-written bytes of the surrounding 512 KiB at once, so those writes find none.
-
-### Only what changed is uploaded (build 20)
-
-The build 19 report named the textures that still lost what the GPU drew: one family, R8G8 textures of 260x260 with
-9 mip levels (256 plus a 2-pixel border on each side, the shape of a terrain tile) and the render targets of their
-levels, uploaded again from guest memory up to 141 times in 10 seconds. When the game's code changes any part of a
-texture, Eden uploads all of it again, so everything else the GPU drew in it (the other mip levels, the borders, the
-rest of the level) was replaced with old contents. From build 20:
-
-* A game write to a GPU-drawn texture keeps a copy of the texture's bytes on up to 64 pages per texture; at the
-  texture's next use (or the end of the frame) Doris finds the 512-byte blocks of the texture's memory layout whose
-  bytes changed and uploads only those. Everything else keeps what the GPU drew. Plain 2D textures, texture arrays
-  and mip levels are handled; other layouts, or writes over more than 64 pages (the game rewriting the whole
-  texture), are uploaded whole as in Eden.
-* DMA copies and inline uploads that Eden carries out on the CPU upload just the blocks they wrote into GPU-drawn
-  textures.
-* The block layout maths was checked on a PC against Eden's own unswizzling for 11 texture layouts.
-
-### Textures that share memory (builds 21 and 22)
-
-Build 21 tried three changes to textures that share memory: textures Eden creates from a render target's drawing were
-marked as GPU-drawn, the newer drawing was copied between textures Eden keeps apart where both lay the shared memory
-out the same way, and the cleanup brought a texture up to date from those before copying it back. The ground glitch
-was unchanged, and grass vanished across the map. The build 21 log showed why the copies were wrong: TotK hands
-texture memory to new textures at arbitrary offsets (terrain tiles overlapped older tiles at dozens of different
-offsets), so a "newer" texture over the same memory is often another tile, or a 320x180 RGBA8 drawing that the copies
-pushed into a 320x180 B10G11R11 texture every frame. Build 22 undoes all three; textures behave as in build 20.
-
-The report keeps a line on textures sharing memory (pairs kept apart as each new texture is created, textures created
-from drawings, uploads next to drawings) and names the pairs Eden keeps apart, with the reason each one can't be part
-of the other; the first time a pair of shapes shows up, both layouts are written to the log in full. Formats are named
-instead of numbered. It also shows the GPU's temperature and the hottest CPU and GPU sensors, where the system lets apps
-read them.
-
-### GPU fences (builds 22 and 23)
-
-With **GPU Fence Behavior: Immediate** (Settings → Graphics → Advanced), Eden tells the game the GPU has finished its
-work as soon as the work is recorded, before the GPU has run it and before the bytes the GPU wrote into buffers are
-copied back to guest memory. Until that copy lands, the game's code reads what was there before; when it writes there,
-Doris (since build 18, Eden #4490/#4531) waits for the copy first, which the report has counted up to about 300 times every
-10 seconds in TotK since then: the game uses data the GPU wrote within moments of the fence. "Balanced" releases each
-fence only once the GPU has run the work before it and the copy has landed, as the Switch does. The report now counts
-the fences, how many were released while GPU-written data was still on its way back, and how much was copied back.
-
-The build 22 log: about 4500 fences every 10 seconds, 2500 of them released before the GPU-written data they covered
-(about 15 MiB a second) was back. From build 23 the Doris setting **GPU fences** (default: "Doris: wait for what the
-GPU wrote") makes "Immediate", and "Default" below High GPU accuracy, behave as "Balanced": a fence is released once
-the GPU has run the work before it and the copy has landed, in order; fences with nothing to copy back still go at
-once. "As GPU Fence Behavior says" switches back. The game now waits for the GPU where it reads what the GPU wrote,
-which can cost speed; the report's frame times show it.
 
 ## Fixes from newer Eden (build 18)
 

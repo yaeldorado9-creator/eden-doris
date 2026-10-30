@@ -1,7 +1,7 @@
 From 7c4d2f6a813ba7ebb1c7cf5da56ffb201b1d147d Mon Sep 17 00:00:00 2001
 From: alvindimas05 <alvin.dimas.praditya@gmail.com>
 Date: Fri, 23 Oct 2026 00:11:29 +0700
-Subject: [PATCH 12/51] [renderer_vulkan] memoize last sampler variant in
+Subject: [PATCH 12/50] [renderer_vulkan] memoize last sampler variant in
  HandleFor
 
 (cherry picked from commit 0ae08024640438802703c666c4625260c95c82a8)

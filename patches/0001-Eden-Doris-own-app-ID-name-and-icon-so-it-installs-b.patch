@@ -1,7 +1,7 @@
 From a015a456f7a73d4bf90cb0169c3672413e149b86 Mon Sep 17 00:00:00 2001
 From: "Eden (Doris) build" <doris@users.noreply.github.com>
 Date: Thu, 29 Oct 2026 09:04:53 -0500
-Subject: [PATCH 01/51] Eden (Doris): own app ID, name and icon so it installs
+Subject: [PATCH 01/50] Eden (Doris): own app ID, name and icon so it installs
  beside every other Eden
 
 - new 'doris' product flavor: applicationId dev.eden.eden_doris, label 'Eden (Doris)'

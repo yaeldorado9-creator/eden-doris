@@ -1,7 +1,7 @@
 From 3d647a3834eb7a06fab4a9d4c639b33eb49abd80 Mon Sep 17 00:00:00 2001
 From: alvindimas05 <alvin.dimas.praditya@gmail.com>
 Date: Fri, 23 Oct 2026 00:27:32 +0700
-Subject: [PATCH 13/51] [renderer_vulkan] early-return PushImageDescriptors for
+Subject: [PATCH 13/50] [renderer_vulkan] early-return PushImageDescriptors for
  stages without textures
 
 (cherry picked from commit c6a27fae4fdca8f36f3c53679370be96c58b13bd)

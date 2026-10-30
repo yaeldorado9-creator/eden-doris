@@ -1,7 +1,7 @@
 From 2ce4cc637e66081f01ab669d5e841d7bdfb6d22b Mon Sep 17 00:00:00 2001
 From: xbzk <xbzk@eden-emu.dev>
 Date: Mon, 26 Oct 2026 17:24:45 +0100
-Subject: [PATCH 46/51] [nce] handles duplicate NCE interrupts (#4530)
+Subject: [PATCH 46/50] [nce] handles duplicate NCE interrupts (#4530)
 
 - [x] I have read and followed the [Contribution Guidelines](https://git.eden-emu.dev/eden-emu/eden/src/branch/master/CONTRIBUTING.md#code-contributions).
 - [x] I have read and followed the [AI Policy](https://git.eden-emu.dev/eden-emu/eden/src/branch/master/docs/policies/AI.md).

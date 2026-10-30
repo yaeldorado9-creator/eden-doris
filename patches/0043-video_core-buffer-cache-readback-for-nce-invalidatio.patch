@@ -1,7 +1,7 @@
 From bbe478d4ae85b3b0ebacd65d547f35b257d05fb8 Mon Sep 17 00:00:00 2001
 From: xbzk <xbzk@eden-emu.dev>
 Date: Wed, 30 Sep 2026 22:13:37 +0200
-Subject: [PATCH 43/51] [video_core] buffer cache readback for nce
+Subject: [PATCH 43/50] [video_core] buffer cache readback for nce
  invalidations (#4490)
 
 - [x] I have read and followed the [Contribution Guidelines](https://git.eden-emu.dev/eden-emu/eden/src/branch/master/CONTRIBUTING.md#code-contributions).

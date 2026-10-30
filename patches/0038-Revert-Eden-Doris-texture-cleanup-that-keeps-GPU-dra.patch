@@ -1,7 +1,7 @@
 From 4fc93ccb47b53a2bf813152ae16f9ff6c8107442 Mon Sep 17 00:00:00 2001
 From: "Eden (Doris) build" <doris@users.noreply.github.com>
 Date: Thu, 29 Oct 2026 18:02:16 -0500
-Subject: [PATCH 38/51] Revert "Eden (Doris): texture cleanup that keeps GPU
+Subject: [PATCH 38/50] Revert "Eden (Doris): texture cleanup that keeps GPU
  drawings (setting, on by default)"
 
 This reverts commit cc46dab0930714634aba894abae801740a824578.

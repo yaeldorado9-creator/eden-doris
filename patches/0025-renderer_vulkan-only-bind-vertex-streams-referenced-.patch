@@ -1,7 +1,7 @@
 From e41bdc0628dcc5886f2fbc222c85184d75a60920 Mon Sep 17 00:00:00 2001
 From: alvindimas05 <alvin.dimas.praditya@gmail.com>
 Date: Fri, 23 Oct 2026 11:22:08 +0700
-Subject: [PATCH 25/51] [renderer_vulkan] only bind vertex streams referenced
+Subject: [PATCH 25/50] [renderer_vulkan] only bind vertex streams referenced
  by an attribute
 
 (cherry picked from commit 23f7fbc930bb489c5a213fff627a16545c43ac91)
