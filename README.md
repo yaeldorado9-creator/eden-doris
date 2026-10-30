@@ -27,12 +27,17 @@ Eden. With its default settings Doris behaves like that build; fixes are added o
 Doris's own settings are under **Settings → Graphics → Eden (Doris) experiments** (globally or per game). Most take
 effect the next time the game starts; the ones marked "right away" apply as soon as they are changed.
 
-* **GPU barriers** (default: Doris: real barriers). Eden turns the game's "wait until the GPU is done" points into a
-  Vulkan event wait that guarantees neither ordering nor visibility of earlier writes, and puts no barrier after compute
-  work. On Adreno this lets draws read culling results, indirect draw arguments and vertex data that aren't finished
-  yet, so distant terrain, buildings and shadows can drop out for a frame. Doris uses real barriers. "Eden (as before)"
-  switches back, for comparison; "+ tiled-cache barriers" also makes the game's tiled-cache barriers real. A full
-  barrier that would follow another one with nothing recorded in between is left out (it would change nothing).
+* **GPU barriers** (default: Doris: real barriers where needed). Eden turns the game's "wait until the GPU is done"
+  points into a Vulkan event wait that guarantees neither ordering nor visibility of earlier writes, and puts no
+  barrier after compute work. On Adreno this lets draws read culling results, indirect draw arguments and vertex data
+  that aren't finished yet, so distant terrain, buildings and shadows can drop out for a frame. Doris puts a barrier
+  after every compute dispatch, and a full barrier at a wait point when a draw since the previous one wrote storage
+  buffers or images (or used transform feedback). In the build 18 log, 113 of TotK's 130 wait points per frame had no
+  such draw before them; from build 19 those stop neither the GPU nor the render pass (compute, uploads, copies and
+  render pass ends carry barriers of their own). "Real barriers at every wait (build 18)" keeps a full barrier at every
+  wait point; "Eden (as before)" switches back, for comparison; "+ tiled-cache barriers" also makes the game's
+  tiled-cache barriers real. A full barrier that would follow another one with nothing recorded in between is left
+  out (it would change nothing).
 * **Texture cleanup** (default: Doris; right away). See [Texture cleanup](#texture-cleanup). "Eden (as before)"
   switches back to build 15's behaviour.
 * **Core layout** (default: Let Android decide). "Doris" puts Eden's GPU emulation thread, the busiest one, on the
@@ -42,8 +47,8 @@ effect the next time the game starts; the ones marked "right away" apply as soon
   Vulkan worker spend their CPU time (with call stacks, and system-library function names) and writes the totals to
   `doris_profile.txt` in the log folder every 20 seconds.
   Each release includes `libyuzu-android-symbols-<n>.zip` to turn the offsets into function names.
-* **Performance report** (default: off). While a game runs, writes a summary to the log every 10 seconds: frame
-  times, how busy each emulator thread is (and on which core), CPU and GPU clocks, GPU load, battery temperature;
+* **Performance report** (default: off). While a game runs, writes a summary to the log every 10 seconds (with the
+  device's clock time, to match it with videos of the screen): frame times, how busy each emulator thread is (and on which core), CPU and GPU clocks, GPU load, battery temperature;
   per frame, the draws, dispatches, render passes and submits, new pipelines, how long the GPU thread waited for
   presentation and GPU fences and the Vulkan worker for shader builds, and the GPU time of the whole frame, of frame
   generation and of output scaling (GPU timestamps); how often the GPU thread and the Vulkan worker ran on prime,
@@ -54,7 +59,9 @@ effect the next time the game starts; the ones marked "right away" apply as soon
   thread spent getting or freeing GPU memory, waiting for the game's commands and waiting for the texture and buffer
   cache locks (and how long fence handling held them); how often the game wrote to pages holding GPU-written bytes
   (copied back first) and how long it waited for that; how many wait-for-idles came inside a render pass and how many
-  had no storage writes by draws before them. It also lists the longest hitches
+  had no storage writes by draws before them; how often the game wrote next to GPU-drawn textures and whether their
+  contents were kept; and the textures (size and format) that were uploaded again over GPU-drawn contents, had their
+  bytes changed by the game, or were removed by the cleanup with GPU-drawn contents lost. It also lists the longest hitches
   (frames over 50 ms) of every 10 seconds, each with how long the GPU emulation thread was actually busy in it, how
   long it waited for the game's commands, for the GPU, for presentation, for GPU memory and for the cache locks, how
   busy the game's own threads were, and the shaders, uploads, new memory, texture removals, draws and submits in that
@@ -77,6 +84,24 @@ effect the next time the game starts; the ones marked "right away" apply as soon
   4096, 8192 (default), no limit.
 * **Monster Hunter Rise record fix**: always (PR #4324, default), only in Monster Hunter Rise, or off. The log notes
   every time it rewrites a copy, and in which game.
+
+## GPU drawings and the game's own writes (build 19)
+
+The game's code and the GPU often keep data on the same 4 KiB page of memory. Eden only learns that the game wrote to
+a page, not where:
+
+* **Textures.** Eden treated every texture on a written page as changed by the game and, at its next use, uploaded it
+  again from guest memory. For a texture the GPU drew into, guest memory still holds what was there before, so the
+  drawing was replaced with old contents until the game drew it again (the build 18 log: up to 400 such uploads every
+  10 seconds; the likeliest cause of the ground switching material for half a second). From build 19, when the game
+  writes to a page shared with a GPU-drawn texture, Doris keeps a copy of the texture's own bytes on that page as
+  they were before the write and lets the write through. At the texture's next use (or the end of the frame) it
+  compares: if the game changed those bytes, the texture is uploaded again as in Eden; if it only wrote the data next
+  to it, what the GPU drew stays.
+* **Buffers.** Since build 18 (Eden #4490/#4531), bytes the GPU wrote on such a page are copied back before the
+  game's write. Each copy waits for the GPU to finish everything queued, about 20 ms while a frame is in flight, and
+  in the build 18 log the game then wrote the next pages of the same buffer, in bursts of 10 to 13 waits. Build 19
+  copies back the GPU-written bytes of the surrounding 512 KiB at once, so those writes find none.
 
 ## Fixes from newer Eden (build 18)
 

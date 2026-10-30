@@ -1,7 +1,7 @@
 From 8dce151eb832deb49677ba792a117b462767779d Mon Sep 17 00:00:00 2001
 From: "Eden (Doris) build" <doris@users.noreply.github.com>
 Date: Thu, 29 Oct 2026 18:04:23 -0500
-Subject: [PATCH 39/49] Eden (Doris): Eden's texture cleanup with one GPU wait
+Subject: [PATCH 39/50] Eden (Doris): Eden's texture cleanup with one GPU wait
  per pass; profiler off by default
 
 Build 14's texture cleanup (keep everything the GPU drew until memory is

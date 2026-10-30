@@ -1,7 +1,7 @@
 From fd9e3f3f3335ec23932326f3b16c89882c3affac Mon Sep 17 00:00:00 2001
 From: wildcard <wildcard@eden-emu.dev>
 Date: Mon, 26 Oct 2026 17:23:45 +0100
-Subject: [PATCH 42/49] [vulkan] Fix TOTK dark squares (#4565)
+Subject: [PATCH 42/50] [vulkan] Fix TOTK dark squares (#4565)
 
 Qualcomm and Turnip use different subpixel rounding for Vulkan texture
 gather coordinates than the Switch's Maxwell GPU. This can select the

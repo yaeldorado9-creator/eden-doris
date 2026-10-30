@@ -1,7 +1,7 @@
 From b9bb193b6d5038dbbe41a1fde6ca14382f769799 Mon Sep 17 00:00:00 2001
 From: alvindimas05 <alvin.dimas.praditya@gmail.com>
 Date: Fri, 23 Oct 2026 11:28:52 +0700
-Subject: [PATCH 26/49] [dma_pusher] batch runs of non-executable register
+Subject: [PATCH 26/50] [dma_pusher] batch runs of non-executable register
  writes
 
 (cherry picked from commit fbd10e52d6bb0292116c102466ba2efb0daa0aaf)
