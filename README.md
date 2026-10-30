@@ -144,7 +144,7 @@ read them.
 With **GPU Fence Behavior: Immediate** (Settings → Graphics → Advanced), Eden tells the game the GPU has finished its
 work as soon as the work is recorded, before the GPU has run it and before the bytes the GPU wrote into buffers are
 copied back to guest memory. Until that copy lands, the game's code reads what was there before; when it writes there,
-Doris (since build 18, Eden #4490/#4531) waits for the copy first, which the report has counted 100 to 260 times every
+Doris (since build 18, Eden #4490/#4531) waits for the copy first, which the report has counted up to about 300 times every
 10 seconds in TotK since then: the game uses data the GPU wrote within moments of the fence. "Balanced" releases each
 fence only once the GPU has run the work before it and the copy has landed, as the Switch does. The report now counts
 the fences, how many were released while GPU-written data was still on its way back, and how much was copied back.
