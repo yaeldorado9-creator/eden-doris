@@ -1,0 +1,317 @@
+From 5cbca9d2505eeeba3bc7ad39b35faa82f053e624 Mon Sep 17 00:00:00 2001
+From: "Eden (Doris) build" <doris@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 12:01:34 -0500
+Subject: [PATCH 2/2] turnip (Doris): measure SYSMEM vs GMEM for Eden's render
+ passes; report where the GPU time goes
+
+- driconf: for the engine "yuzu Emulator" (Eden), tu_autotune_algorithm=profiled: each render pass
+  with 5 or more draws is timed on the GPU in both modes and the faster one is used (locked once it
+  is clearly faster), instead of the bandwidth estimate.
+- autotune: when the process is Eden, every 10 seconds append to <app files>/log/apex_doris.txt
+  the GPU time of the timed render passes per second (SYSMEM and GMEM, binning), and the render
+  passes that took the most, with their size, draws, both modes' averages and the current choice;
+  the whole session every minute.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014Ps8wnhVXtSU7d88gGtyHX
+---
+ src/freedreno/vulkan/00-turnip-defaults.conf |   5 +
+ src/freedreno/vulkan/tu_autotune.cc          | 179 +++++++++++++++++++
+ src/freedreno/vulkan/tu_autotune.h           |   9 +
+ 3 files changed, 193 insertions(+)
+
+diff --git a/src/freedreno/vulkan/00-turnip-defaults.conf b/src/freedreno/vulkan/00-turnip-defaults.conf
+index a51e7c486a3..19f06c13895 100644
+--- a/src/freedreno/vulkan/00-turnip-defaults.conf
++++ b/src/freedreno/vulkan/00-turnip-defaults.conf
+@@ -8,6 +8,11 @@
+             <option name="tu_allow_oob_indirect_ubo_loads" value="true" />
+             <option name="tu_dont_care_as_load" value="true" />
+         </engine>
++        <!-- Eden (Doris): Eden reports the engine "yuzu Emulator". Pick SYSMEM or GMEM for each render pass by
++             measuring both on the GPU (the profiled autotuner) instead of estimating bandwidth. -->
++        <engine engine_name_match="yuzu Emulator">
++            <option name="tu_autotune_algorithm" value="profiled" />
++        </engine>
+         <engine engine_name_match="rpcsx|armsx|rpcs3">
+             <option name="tu_restrict_subgroup_size_64" value="false" />
+             <option name="tu_autotune_algorithm" value="prefer_gmem" />
+diff --git a/src/freedreno/vulkan/tu_autotune.cc b/src/freedreno/vulkan/tu_autotune.cc
+index 8274e010737..146efc6f27b 100644
+--- a/src/freedreno/vulkan/tu_autotune.cc
++++ b/src/freedreno/vulkan/tu_autotune.cc
+@@ -6,6 +6,9 @@
+ #include "tu_autotune.h"
+ 
+ #include <algorithm>
++#include <cstdio>
++#include <cstring>
++#include <sys/stat.h>
+ #include <array>
+ #include <atomic>
+ #include <cmath>
+@@ -23,6 +26,8 @@
+ #include "tu_image.h"
+ #include "tu_pass.h"
+ 
++#include "git_sha1.h"
++
+ /** Compile-time debug options **/
+ 
+ #define TU_AUTOTUNE_DEBUG_LOG_BASE      0
+@@ -527,6 +532,7 @@ struct tu_autotune::rp_entry {
+    bool sysmem;
+    uint32_t tile_count;
+    uint32_t draw_count;
++   uint32_t doris_width = 0, doris_height = 0; /* Eden (Doris): render area, for the report. */
+ 
+    rp_entry(struct tu_device *device, rp_history_handle &&history, config_t config, uint32_t draw_count)
+        : device(device), map(nullptr), history(std::move(history)), config(config), draw_count(draw_count)
+@@ -642,6 +648,13 @@ struct tu_autotune::rp_entry {
+ 
+    /** RP/Tile Timestamp Metric **/
+ 
++   /* Eden (Doris): the binning pass part of a GMEM render pass (0 for SYSMEM). */
++   uint64_t doris_binning_duration()
++   {
++      rp_gpu_data &gpu = get_gpu_data();
++      return gpu.ts_binning_end - gpu.ts_binning_start;
++   }
++
+    uint64_t get_rp_duration()
+    {
+       assert(config.test(metric_flag::TS));
+@@ -1199,6 +1212,10 @@ struct tu_autotune::rp_history {
+       }
+ 
+     public:
++      /* Eden (Doris): for the report. */
++      uint32_t doris_sysmem_probability() const { return sysmem_probability.load(std::memory_order_relaxed); }
++      bool doris_locked() const { return locked; }
++
+       render_mode get_optimal_mode(rp_history &history)
+       {
+          uint32_t l_sysmem_probability = sysmem_probability.load(std::memory_order_relaxed);
+@@ -1354,6 +1371,9 @@ struct tu_autotune::rp_history {
+          if (at_config.is_enabled(algorithm::PROFILED) || at_config.is_enabled(algorithm::PROFILED_IMM)) {
+             profiled.update(*this, at_config.is_enabled(algorithm::PROFILED_IMM));
+          }
++
++         if (at.doris)
++            at.doris_note(*this, entry);
+       }
+    }
+ };
+@@ -1545,6 +1565,9 @@ tu_autotune::process_entries()
+       active_batches.pop_front();
+    }
+ 
++   if (doris)
++      doris_maybe_write();
++
+    if (active_batches.size() > 10) {
+       at_log_base("high amount of active batches: %zu, fence: %" PRIu32 " < %" PRIu32, active_batches.size(),
+                   current_fence, active_batches.front()->fence);
+@@ -1660,9 +1683,160 @@ tu_autotune::on_submit(struct tu_cmd_buffer **cmd_buffers, uint32_t cmd_buffer_c
+    return fence_cs;
+ }
+ 
++/** Eden (Doris): render pass GPU time report **/
++
++/* Every 10 seconds, the GPU time of the render passes the autotuner timed (those with 5 or more draws), split
++ * into SYSMEM and GMEM, and the render passes that took the most, with both modes' averages as measured by the
++ * profiled algorithm. Written to <app files>/log/apex_doris.txt when the app is Eden. Only render passes have
++ * timestamps (with the profiled algorithm); copies, blits and compute work outside render passes are not in it.
++ */
++struct tu_autotune::doris_report {
++   struct rp_stats {
++      uint32_t width = 0, height = 0, draws = 0, bins = 0;
++      uint32_t sysmem_count = 0, gmem_count = 0;
++      uint64_t sysmem_ticks = 0, gmem_ticks = 0, binning_ticks = 0;
++      uint32_t probability = 50;
++      bool locked = false;
++   };
++
++   FILE *file = nullptr;
++   uint64_t start_ns = 0, window_start_ns = 0;
++   std::unordered_map<uint64_t, rp_stats> window;
++   std::unordered_map<uint64_t, rp_stats> session;
++
++   ~doris_report()
++   {
++      if (file)
++         fclose(file);
++   }
++};
++
++static std::string
++doris_process_name()
++{
++   char name[256] = {};
++   FILE *f = fopen("/proc/self/cmdline", "rb");
++   if (!f)
++      return {};
++   size_t n = fread(name, 1, sizeof(name) - 1, f);
++   fclose(f);
++   name[n] = 0;
++   std::string s(name);
++   size_t colon = s.find(':');
++   if (colon != std::string::npos)
++      s.resize(colon);
++   return s;
++}
++
++static void
++doris_open_report(tu_autotune &at);
++
++void
++tu_autotune::doris_note(const rp_history &history, const rp_entry &const_entry)
++{
++   rp_entry &entry = const_cast<rp_entry &>(const_entry);
++   uint64_t duration = entry.get_rp_duration();
++   uint64_t binning = entry.sysmem ? 0 : entry.doris_binning_duration();
++   for (auto *map : { &doris->window, &doris->session }) {
++      auto &st = (*map)[history.hash];
++      st.width = entry.doris_width;
++      st.height = entry.doris_height;
++      st.draws = entry.draw_count;
++      st.probability = history.profiled.doris_sysmem_probability();
++      st.locked = history.profiled.doris_locked();
++      if (entry.sysmem) {
++         st.sysmem_count++;
++         st.sysmem_ticks += duration;
++      } else {
++         st.gmem_count++;
++         st.gmem_ticks += duration;
++         st.binning_ticks += binning;
++         st.bins = entry.tile_count;
++      }
++   }
++}
++
++static void
++doris_write_table(FILE *f, const char *title, std::unordered_map<uint64_t, tu_autotune::doris_report::rp_stats> &map,
++                  double seconds, size_t top)
++{
++   uint64_t sysmem_ticks = 0, gmem_ticks = 0, binning_ticks = 0;
++   uint64_t sysmem_count = 0, gmem_count = 0;
++   std::vector<std::pair<uint64_t, const tu_autotune::doris_report::rp_stats *>> sorted;
++   for (auto &[hash, st] : map) {
++      sysmem_ticks += st.sysmem_ticks;
++      gmem_ticks += st.gmem_ticks;
++      binning_ticks += st.binning_ticks;
++      sysmem_count += st.sysmem_count;
++      gmem_count += st.gmem_count;
++      sorted.emplace_back(hash, &st);
++   }
++   std::sort(sorted.begin(), sorted.end(), [](auto &a, auto &b) {
++      return a.second->sysmem_ticks + a.second->gmem_ticks > b.second->sysmem_ticks + b.second->gmem_ticks;
++   });
++   auto ms_per_s = [&](uint64_t ticks) { return ticks / GPU_TICKS_PER_US / 1000.0 / MAX2(seconds, 0.001); };
++   fprintf(f,
++           "%s: %.1f s | timed render passes (5+ draws) %.1f ms of GPU per second: SYSMEM %" PRIu64 " passes "
++           "%.1f ms/s, GMEM %" PRIu64 " passes %.1f ms/s (binning %.1f ms/s) | %zu different passes\n",
++           title, seconds, ms_per_s(sysmem_ticks + gmem_ticks), sysmem_count, ms_per_s(sysmem_ticks), gmem_count,
++           ms_per_s(gmem_ticks), ms_per_s(binning_ticks), map.size());
++   for (size_t i = 0; i < sorted.size() && i < top; i++) {
++      const auto &st = *sorted[i].second;
++      double sys_avg = st.sysmem_count ? st.sysmem_ticks / GPU_TICKS_PER_US / st.sysmem_count : 0;
++      double gmem_avg = st.gmem_count ? st.gmem_ticks / GPU_TICKS_PER_US / st.gmem_count : 0;
++      fprintf(f,
++              "  %016" PRIx64 " %4ux%-4u %4u draws: %.1f ms/s | SYSMEM %5u x %7.0f us | GMEM %5u x %7.0f us "
++              "(%u bins, binning %.0f us) | now SYSMEM %u%%%s\n",
++              sorted[i].first, st.width, st.height, st.draws, ms_per_s(st.sysmem_ticks + st.gmem_ticks),
++              st.sysmem_count, sys_avg, st.gmem_count, gmem_avg, st.bins,
++              st.gmem_count ? st.binning_ticks / GPU_TICKS_PER_US / st.gmem_count : 0.0, st.probability,
++              st.locked ? " (locked)" : "");
++   }
++}
++
++void
++tu_autotune::doris_maybe_write()
++{
++   uint64_t now = os_time_get_nano();
++   if (now - doris->window_start_ns < 10'000'000'000ull)
++      return;
++   double window_s = (now - doris->window_start_ns) / 1e9;
++   double session_s = (now - doris->start_ns) / 1e9;
++   if (!doris->window.empty()) {
++      fprintf(doris->file, "== %.0f s, algorithm %s\n", session_s, active_config.load().to_string().c_str());
++      doris_write_table(doris->file, "last window", doris->window, window_s, 12);
++      /* The whole session every minute. */
++      if ((uint64_t) session_s / 60 != (uint64_t) (session_s - window_s) / 60)
++         doris_write_table(doris->file, "session", doris->session, session_s, 25);
++      fflush(doris->file);
++   }
++   doris->window.clear();
++   doris->window_start_ns = now;
++}
++
++static void
++doris_open_report(tu_autotune &at)
++{
++   std::string name = doris_process_name();
++   if (name.find("eden") == std::string::npos)
++      return;
++   std::string path = "/storage/emulated/0/Android/data/" + name + "/files/log/apex_doris.txt";
++   struct stat st;
++   const char *mode = (stat(path.c_str(), &st) == 0 && st.st_size > 4 * 1024 * 1024) ? "w" : "a";
++   FILE *f = fopen(path.c_str(), mode);
++   if (!f)
++      return;
++   at.doris = std::make_unique<tu_autotune::doris_report>();
++   at.doris->file = f;
++   at.doris->start_ns = at.doris->window_start_ns = os_time_get_nano();
++   fprintf(f, "\n#### Apex Doris render pass report (" PACKAGE_VERSION MESA_GIT_SHA1 "), device opened\n");
++   fflush(f);
++}
++
+ tu_autotune::tu_autotune(struct tu_device *device, VkResult &result)
+     : device(device), supported_mod_flags(get_supported_mod_flags(device)), active_config(get_env_config())
+ {
++   doris_open_report(*this);
+    tu_bo_suballocator_init(&suballoc, device, 128 * 1024, TU_BO_ALLOC_INTERNAL_RESOURCE, "autotune_suballoc");
+ 
+    if (supports_preempt_latency_tracking()) {
+@@ -1711,6 +1885,7 @@ tu_autotune::~tu_autotune()
+    }
+ 
+    active_batches.clear();
++   doris.reset();
+    tu_bo_suballocator_finish(&suballoc);
+ 
+    fd_perfcntr_release(device->perfcntrs, preemption_latency_counter);
+@@ -1898,6 +2073,10 @@ tu_autotune::get_optimal_mode(struct tu_cmd_buffer *cmd_buffer, rp_ctx_t *rp_ctx
+       }
+    }
+    *rp_ctx = cb_ctx.attach_rp_entry(device, history, config, rp_state->drawcall_count);
++   if (doris) {
++      (*rp_ctx)->doris_width = cmd_state->render_areas[0].extent.width;
++      (*rp_ctx)->doris_height = cmd_state->render_areas[0].extent.height;
++   }
+ 
+    if (config.test(mod_flag::PREEMPT_OPTIMIZE) && history.preempt_optimize.is_latency_sensitive()) {
+       /* Try to mitigate the risk of high preemption latency by always using GMEM, which should break up any larger
+diff --git a/src/freedreno/vulkan/tu_autotune.h b/src/freedreno/vulkan/tu_autotune.h
+index a935c505fcf..3fbe6870fb3 100644
+--- a/src/freedreno/vulkan/tu_autotune.h
++++ b/src/freedreno/vulkan/tu_autotune.h
+@@ -170,6 +170,15 @@ struct tu_autotune {
+    struct rp_history;
+    struct rp_history_handle;
+ 
++   /** Eden (Doris): a report of where the GPU time of render passes goes, written to Eden's log folder. **/
++ public:
++   struct doris_report;
++   std::unique_ptr<doris_report> doris;
++
++ private:
++   void doris_note(const rp_history &history, const rp_entry &entry);
++   void doris_maybe_write();
++
+    /* A strongly typed key which generates a hash to uniquely identify a renderpass instance. This hash is expected to
+     * be stable across runs, so it can be used to identify the same renderpass instance consistently.
+     *
+-- 
+2.43.0
+

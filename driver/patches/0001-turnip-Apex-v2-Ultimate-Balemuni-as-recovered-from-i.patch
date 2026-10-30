@@ -1,0 +1,131 @@
+From 88585a643bbc9654186a3fede1e08912e5f4936e Mon Sep 17 00:00:00 2001
+From: "Eden (Doris) build" <doris@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 11:56:08 -0500
+Subject: [PATCH 1/2] turnip: Apex v2 Ultimate (Balemuni) as recovered from its
+ binary
+
+Same Mesa commit (b9a2bf372b) and the same changes as Balemuni's Apex v2 Ultimate, recovered from
+its vulkan.freedreno.so (the driconf tables, the GCM default, the suballocator sizes):
+- driconf: engine rules for emulators (Eden: fast border color for undefined formats, D3D texture
+  coordinate rounding, OOB indirect UBO loads allowed, DONT_CARE loaded), rpcs3 and xenia rules,
+  and the TOTK/BOTW application rules (application name match, so not active in Eden);
+- ir3: global code motion on by default (GCM=1);
+- pipeline and kgsl profiling suballocators: 512 KiB blocks;
+- disk shader cache: 4 GiB by default;
+- driver name and info name the Doris rebuild.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014Ps8wnhVXtSU7d88gGtyHX
+---
+ src/freedreno/ir3/ir3_nir.c                  |  2 +-
+ src/freedreno/vulkan/00-turnip-defaults.conf | 24 ++++++++++++++++++++
+ src/freedreno/vulkan/tu_device.cc            |  8 +++----
+ src/util/disk_cache.c                        |  2 +-
+ 4 files changed, 30 insertions(+), 6 deletions(-)
+
+diff --git a/src/freedreno/ir3/ir3_nir.c b/src/freedreno/ir3/ir3_nir.c
+index 55503cf2655..76a12fb8bcb 100644
+--- a/src/freedreno/ir3/ir3_nir.c
++++ b/src/freedreno/ir3/ir3_nir.c
+@@ -319,7 +319,7 @@ ir3_optimize_loop(struct ir3_compiler *compiler,
+ 
+       static int gcm = -1;
+       if (gcm == -1)
+-         gcm = debug_get_num_option("GCM", 0);
++         gcm = debug_get_num_option("GCM", 1); /* Apex v2: global code motion on by default */
+       if (gcm == 1)
+          progress |= OPT(s, nir_opt_gcm, true, true);
+       else if (gcm == 2)
+diff --git a/src/freedreno/vulkan/00-turnip-defaults.conf b/src/freedreno/vulkan/00-turnip-defaults.conf
+index 0596f6c0e56..a51e7c486a3 100644
+--- a/src/freedreno/vulkan/00-turnip-defaults.conf
++++ b/src/freedreno/vulkan/00-turnip-defaults.conf
+@@ -1,6 +1,21 @@
+ <?xml version="1.0"?>
+ <driconf>
+     <device driver="turnip">
++        <!-- Apex v2 (Balemuni): emulators. Eden reports the engine "yuzu Emulator". -->
++        <engine engine_name_match="eden|citron|yuzu|suyu|sudachi|skyline|strato|winlator|box64|fex|mobox|hangover|rpcsx|armsx|rpcs3|xenia|ryujinx|dolphin|cemu|nethersx2|aethersx2|pcsx2|ppsspp|vita3k|melonds|azahar|citra|flycast|gamenative|termux">
++            <option name="tu_enable_fast_border_color_for_undefined_formats" value="true" />
++            <option name="tu_use_tex_coord_round_nearest_even_mode" value="true" />
++            <option name="tu_allow_oob_indirect_ubo_loads" value="true" />
++            <option name="tu_dont_care_as_load" value="true" />
++        </engine>
++        <engine engine_name_match="rpcsx|armsx|rpcs3">
++            <option name="tu_restrict_subgroup_size_64" value="false" />
++            <option name="tu_autotune_algorithm" value="prefer_gmem" />
++        </engine>
++        <engine engine_name_match="xenia">
++            <option name="tu_restrict_subgroup_size_64" value="false" />
++            <option name="tu_autotune_algorithm" value="prefer_sysmem" />
++        </engine>
+         <!-- Up to DXVK version 2.3.0 -->
+         <engine engine_name_match="DXVK" engine_versions="0:8400896">
+             <!--
+@@ -73,6 +88,15 @@
+              -->
+             <option name="tu_allow_oob_indirect_ubo_loads" value="true" />
+         </engine>
++        <!-- Apex v2 (Balemuni): matched against the application name, which Eden reports as
++             "yuzu Emulator", so these two never apply in Eden. -->
++        <application name="TOTK grass/blocky-ground fix (#8)" application_name_match=".*(totk).*">
++            <option name="tu_autotune_algorithm" value="prefer_gmem" />
++            <option name="tu_ignore_frag_depth_direction" value="true" />
++        </application>
++        <application name="BOTW water/shrine (#4)" application_name_match=".*(botw).*">
++            <option name="tu_autotune_algorithm" value="prefer_gmem" />
++        </application>
+         <application name="Sons Of The Forest" application_name_match="SonsOfTheForest.exe">
+             <option name="tu_ignore_frag_depth_direction" value="true" />
+         </application>
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index 3ccc34c9891..b554a5b024c 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -1018,10 +1018,10 @@ tu_get_physical_device_properties_1_2(struct tu_physical_device *pdevice,
+    p->driverID = VK_DRIVER_ID_MESA_TURNIP;
+    memset(p->driverName, 0, sizeof(p->driverName));
+    snprintf(p->driverName, VK_MAX_DRIVER_NAME_SIZE,
+-            "turnip Mesa driver");
++            "Turnip (Apex v2 Ultimate, Doris)");
+    memset(p->driverInfo, 0, sizeof(p->driverInfo));
+    snprintf(p->driverInfo, VK_MAX_DRIVER_INFO_SIZE,
+-            "Mesa " PACKAGE_VERSION MESA_GIT_SHA1);
++            "Mesa " PACKAGE_VERSION MESA_GIT_SHA1 " (Apex v2 Ultimate by Balemuni, rebuilt for Eden Doris)");
+    if (pdevice->info->chip >= 7) {
+       p->conformanceVersion = (VkConformanceVersion) {
+          .major = 1,
+@@ -3043,7 +3043,7 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
+       global_size += TU_BORDER_COLOR_COUNT * sizeof(struct bcolor_entry);
+ 
+    tu_bo_suballocator_init(
+-      &device->pipeline_suballoc, device, 128 * 1024,
++      &device->pipeline_suballoc, device, 512 * 1024, /* Apex v2: 128 KiB -> 512 KiB */
+       (enum tu_bo_alloc_flags) (TU_BO_ALLOC_GPU_READ_ONLY |
+                                 TU_BO_ALLOC_ALLOW_DUMP |
+                                 TU_BO_ALLOC_INTERNAL_RESOURCE |
+@@ -3051,7 +3051,7 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
+       "pipeline_suballoc");
+    if (is_kgsl(physical_device->instance)) {
+       tu_bo_suballocator_init(&device->kgsl_profiling_suballoc, device,
+-                              128 * 1024, TU_BO_ALLOC_INTERNAL_RESOURCE,
++                              512 * 1024, TU_BO_ALLOC_INTERNAL_RESOURCE, /* Apex v2 */
+                               "kgsl_profiling_suballoc");
+    }
+ 
+diff --git a/src/util/disk_cache.c b/src/util/disk_cache.c
+index 1f4338820dd..868c19b96f5 100644
+--- a/src/util/disk_cache.c
++++ b/src/util/disk_cache.c
+@@ -282,7 +282,7 @@ disk_cache_create(const char *gpu_name, const char *driver_id,
+ 
+    /* Default to 1GB for maximum cache size. */
+    if (max_size == 0) {
+-      max_size = 1024*1024*1024;
++      max_size = 4ull*1024*1024*1024; /* Apex v2: 4 GiB */
+    }
+ 
+    /* Create main writable cache. */
+-- 
+2.43.0
+
