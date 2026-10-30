@@ -6,10 +6,8 @@ A personal build of the [Eden](https://git.eden-emu.dev/eden-emu/eden) Nintendo 
 aimed at fixing the graphical problems that remain in *Tears of the Kingdom* on Snapdragon 8 Gen 2 / Adreno 740
 handhelds (AYN Thor Pro): distant terrain, structures and shadows that flicker or vanish for a moment.
 
-> **Build 27 is build 19 plus one CPU-only change:** the Vulkan worker is woken every 64 draws instead of 16
-> (about a quarter of the wake-ups; same GPU commands, same submits). Build 26's NCE read protection is removed: with
-> it on the game froze at start, and with it off build 26 ran exactly build 19's code (same GPU and CPU load in the
-> logs).
+> **Build 28 is build 26 again** (build 19's code plus the NCE read protection, now off by default because it
+> froze the game at start). Build 27's change (Vulkan worker woken every 64 draws) is dropped.
 
 ## Installs beside every other Eden
 
