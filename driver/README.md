@@ -19,9 +19,13 @@ Balemuni's **Apex v2 Ultimate** Turnip driver rebuilt from source, as the base f
   `log/apex_doris.txt` in Eden's folder every 10 s: GPU time of the timed render passes, SYSMEM vs GMEM, and the
   passes that cost the most with both modes' averages.
 
-- **0003** (separate zip, `-apexfix`): Apex's own TotK rule (#8: prefer GMEM, ignore the fragment shader's depth
-  direction) switched on for Eden by matching Eden's engine name. Not combined with 0002 (both set the render mode
-  choice). Eden's shaders declare no depth direction, so in practice this is "GMEM for every render pass with 5+
-  draws".
+- **0003**: the report times every GPU operation for 3 s of every 10 s (Mesa's GPU tracepoints, through a Doris
+  hook in u_trace): render passes by size, mode and draws, what inside them takes the time, uploads, downloads,
+  copies, blits, clears, compute and the time between operations; and every 10 s the GPU clock and load and the
+  battery, GPU and CPU temperatures. The profiled autotuner locks a pass's mode sooner (10 samples, 10 s, passes
+  from 0.15 ms).
+
+Apex's own TotK rule switched on for Eden (prefer GMEM; zip `-apexfix` in apex-doris-3) did not fix the grass or
+the ground and is no longer built; its patch is in the history.
 
 Built by `.github/workflows/driver.yml` into a release `apex-doris-<n>`.

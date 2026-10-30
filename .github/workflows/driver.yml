@@ -2,9 +2,8 @@ name: Build Apex Doris driver
 
 # Builds the Doris Turnip driver (Balemuni's Apex v2 Ultimate rebuilt from source, plus Doris
 # changes for Tears of the Kingdom on Eden) from Mesa at driver/MESA_COMMIT with driver/patches,
-# and publishes three zips for Eden's driver manager as a release (apex-doris-<number>):
-#   Apex-Doris-<n>.zip          patches 0001 + 0002 (TotK tuned: measured render modes, GPU report)
-#   Apex-Doris-<n>-apexfix.zip  patches 0001 + 0003 (Apex's TotK rule switched on for Eden)
+# and publishes two zips for Eden's driver manager as a release (apex-doris-<number>):
+#   Apex-Doris-<n>.zip          all patches (TotK tuned: measured render modes, GPU report)
 #   Apex-Doris-<n>-asis.zip     patch 0001 only (Apex v2 Ultimate as it is)
 on:
   push:
@@ -72,25 +71,23 @@ jobs:
           cd mesa && git am -q ../driver/patches/0001-*.patch && git tag apex && cd ..
           driver/build.sh mesa ndk/android-ndk-${NDK_VERSION} out "$NUM" "Apex-Doris-${NUM}-asis.zip" "Apex v2 Ultimate as is"
 
-      - name: Build "Apex TotK fix on" (patches 0001 + 0003)
+      - name: Build "TotK tuned" (all patches)
         run: |
-          cd mesa && git am -q ../driver/patches/0003-*.patch && cd ..
-          driver/build.sh mesa ndk/android-ndk-${NDK_VERSION} out "$NUM" "Apex-Doris-${NUM}-apexfix.zip" "Apex TotK fix on in Eden"
-
-      - name: Build "TotK tuned" (patches 0001 + 0002)
-        run: |
-          cd mesa && git reset -q --hard apex && git am -q ../driver/patches/0002-*.patch && cd ..
+          cd mesa && for p in ../driver/patches/*.patch; do
+            case "$(basename "$p")" in 0001-*) continue;; esac
+            git am -q "$p"
+          done && cd ..
           driver/build.sh mesa ndk/android-ndk-${NDK_VERSION} out "$NUM" "Apex-Doris-${NUM}.zip" "TotK tuned"
           ccache -s | head -5
 
       - name: Check and checksum
         run: |
           cd out
-          for z in Apex-Doris-${NUM}.zip Apex-Doris-${NUM}-apexfix.zip Apex-Doris-${NUM}-asis.zip; do
+          for z in Apex-Doris-${NUM}.zip Apex-Doris-${NUM}-asis.zip; do
             unzip -l "$z"
             unzip -p "$z" vulkan.freedreno.so | strings | grep -m1 "Apex v2 Ultimate, Doris"
           done
-          sha256sum Apex-Doris-${NUM}.zip Apex-Doris-${NUM}-apexfix.zip Apex-Doris-${NUM}-asis.zip > SHA256SUMS.txt
+          sha256sum Apex-Doris-${NUM}.zip Apex-Doris-${NUM}-asis.zip > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Publish
@@ -99,5 +96,5 @@ jobs:
         run: |
           gh release create "apex-doris-${NUM}" --target "${GITHUB_SHA}" \
             --title "Apex Doris ${NUM} (driver)" \
-            --notes "Turnip driver for Eden (Doris): Balemuni's Apex v2 Ultimate rebuilt from source (Mesa $(cut -c1-10 driver/MESA_COMMIT)), plus Doris changes. Apex-Doris-${NUM}.zip is the TotK tuned driver (render modes measured, GPU report); Apex-Doris-${NUM}-apexfix.zip is Apex with its TotK rule switched on for Eden; Apex-Doris-${NUM}-asis.zip is Apex v2 Ultimate as it is. Install in Eden: GPU driver manager, install, pick the zip." \
-            out/Apex-Doris-${NUM}.zip out/Apex-Doris-${NUM}-apexfix.zip out/Apex-Doris-${NUM}-asis.zip out/SHA256SUMS.txt
+            --notes "Turnip driver for Eden (Doris): Balemuni's Apex v2 Ultimate rebuilt from source (Mesa $(cut -c1-10 driver/MESA_COMMIT)), plus Doris changes. Apex-Doris-${NUM}.zip is the TotK tuned driver (render modes measured, GPU report); Apex-Doris-${NUM}-asis.zip is Apex v2 Ultimate as it is. Install in Eden: GPU driver manager, install, pick the zip." \
+            out/Apex-Doris-${NUM}.zip out/Apex-Doris-${NUM}-asis.zip out/SHA256SUMS.txt
