@@ -1,0 +1,674 @@
+From 6efb83a0285d81ec72cd6c73aab7f4899ea1c409 Mon Sep 17 00:00:00 2001
+From: "Eden (Doris) build" <doris@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 02:03:41 -0500
+Subject: [PATCH] Eden (Doris): textures created from GPU drawings stay
+ GPU-drawn; same-layout textures sharing memory kept in step; cleanup copies
+ back the newest drawing; report names textures kept apart and why, and chip
+ temperatures
+
+- JoinImages copies what the GPU drew into an alias (only GPU-drawn aliases are copied) into
+  a new image, but left the new image marked as a plain upload. Its next write by the game's
+  code anywhere on its pages then uploaded all of it again from guest memory (which never got
+  the drawing), and SynchronizeAliases never brought the drawing back (the alias isn't newer),
+  until the game drew it again. Blits and DMA copies also read it from guest memory. The new
+  image is now marked GPU-drawn, as SynchronizeAliases does.
+- Images sharing memory that Eden can't join ("bad overlap") never exchanged contents. Where
+  both lay the shared memory out the same way (bytes per texel, pitch in GOBs, GOBs per block,
+  a whole number of block rows apart), the newer GPU drawing is now copied over when the other
+  is used (checked on a PC against Eden's own unswizzling).
+- The texture cleanup brings a texture up to date from its aliases and same-layout overlaps
+  before copying it back, so drawings in single-level ones (removed without a copy back of
+  their own) are not lost.
+- Report: each pair of textures kept apart, with why each can't be part of the other (logged
+  in full the first time), textures created from GPU drawings, same-layout updates, uploads
+  next to GPU drawings, format names, and the GPU and hottest CPU/GPU sensor temperatures.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014Ps8wnhVXtSU7d88gGtyHX
+---
+ src/common/doris_perf.cpp                     |  69 ++++++-
+ src/common/doris_perf.h                       |  19 ++
+ src/video_core/texture_cache/image_base.h     |   4 +
+ src/video_core/texture_cache/texture_cache.h  | 153 +++++++++++++-
+ .../texture_cache/texture_cache_base.h        |   8 +
+ src/video_core/texture_cache/util.cpp         | 194 ++++++++++++++++++
+ src/video_core/texture_cache/util.h           |  24 +++
+ 7 files changed, 464 insertions(+), 7 deletions(-)
+
+diff --git a/src/common/doris_perf.cpp b/src/common/doris_perf.cpp
+index 06f2b0f01..881f66490 100644
+--- a/src/common/doris_perf.cpp
++++ b/src/common/doris_perf.cpp
+@@ -265,10 +265,51 @@ std::string ReadGpu() {
+ 
+ std::string ReadBatteryTemperature() {
+     const std::string raw = ReadFirstLine("/sys/class/power_supply/battery/temp");
+-    if (raw.empty()) {
+-        return "n/a";
++    std::string out = raw.empty() ? "n/a" : fmt::format("{:.1f} C", std::atof(raw.c_str()) / 10.0);
++    // Eden (Doris): the chip's own temperatures, where the kernel lets apps read them (values
++    // in millidegrees, or degrees on some kernels).
++    const auto to_celsius = [](const std::string& text) {
++        const double value = std::atof(text.c_str());
++        return value > 1000.0 ? value / 1000.0 : value;
++    };
++    const std::string gpu = ReadFirstLine("/sys/class/kgsl/kgsl-3d0/temp");
++    if (!gpu.empty()) {
++        out += fmt::format(", GPU {:.1f} C", to_celsius(gpu));
++    }
++    double hottest_cpu = 0.0;
++    double hottest_gpu = 0.0;
++    for (int zone = 0; zone < 128; ++zone) {
++        const std::string base = fmt::format("/sys/class/thermal/thermal_zone{}/", zone);
++        const std::string type = ReadFirstLine(base + "type");
++        if (type.empty()) {
++            if (zone > 8) {
++                break;
++            }
++            continue;
++        }
++        const bool is_cpu = type.find("cpu") != std::string::npos;
++        const bool is_gpu = type.find("gpu") != std::string::npos;
++        if (!is_cpu && !is_gpu) {
++            continue;
++        }
++        const std::string temp = ReadFirstLine(base + "temp");
++        if (temp.empty()) {
++            continue;
++        }
++        const double celsius = to_celsius(temp);
++        if (celsius <= 0.0 || celsius > 150.0) {
++            continue;
++        }
++        double& hottest = is_gpu ? hottest_gpu : hottest_cpu;
++        hottest = (std::max)(hottest, celsius);
+     }
+-    return fmt::format("{:.1f} C", std::atof(raw.c_str()) / 10.0);
++    if (hottest_cpu > 0.0) {
++        out += fmt::format(", hottest CPU sensor {:.1f} C", hottest_cpu);
++    }
++    if (hottest_gpu > 0.0) {
++        out += fmt::format(", hottest GPU sensor {:.1f} C", hottest_gpu);
++    }
++    return out;
+ }
+ 
+ /// Kind of every CPU: 0 little, 1 middle, 2 prime (by each cluster's highest clock).
+@@ -563,6 +604,14 @@ void ReportLoop() {
+                  gauge_of(Gauge::TextureCacheMemory),
+                  gauges_max[static_cast<size_t>(Gauge::TextureCacheMemory)],
+                  gauge_of(Gauge::TextureCacheExpected), gauge_of(Gauge::TextureCacheCritical));
++        LOG_INFO(Frontend,
++                 "Doris perf: textures sharing memory: {} pairs kept apart as each new one was "
++                 "created, {} created with copies of GPU drawings (now kept as GPU-drawn), {} "
++                 "brought up to date from same-layout GPU drawings, {} uploaded again from guest "
++                 "memory next to GPU drawings",
++                 count_of(Count::TextureBadOverlaps), count_of(Count::TextureCreatedFromGpuData),
++                 count_of(Count::TextureSameLayoutSyncs),
++                 count_of(Count::TextureUploadsBesideGpuData));
+ 
+         // Which textures lost GPU-drawn contents, and how.
+         {
+@@ -576,6 +625,11 @@ void ReportLoop() {
+                 "own bytes changed by the game's code",
+                 "removed with GPU-drawn contents lost",
+                 "GPU-drawn, then marked as changed as a whole",
++                "created with copies of GPU drawings sharing their memory",
++                "brought up to date from GPU drawings sharing their memory",
++                "uploaded again from guest memory next to GPU drawings",
++                "sharing memory but kept apart (why: as part of the other / the other as part of "
++                "it)",
+             };
+             for (size_t kind = 0; kind < taken.size(); ++kind) {
+                 if (taken[kind].empty()) {
+@@ -586,10 +640,13 @@ void ReportLoop() {
+                 std::ranges::sort(sorted, [](const auto& a, const auto& b) {
+                     return a.second > b.second;
+                 });
++                const bool long_entries = kind == static_cast<size_t>(Note::NotJoined);
++                const size_t shown = long_entries ? 16 : 8;
+                 std::string list;
+-                for (size_t i = 0; i < sorted.size() && i < 8; ++i) {
+-                    list += fmt::format("{}{} x{}", list.empty() ? "" : ", ", sorted[i].first,
+-                                        sorted[i].second);
++                for (size_t i = 0; i < sorted.size() && i < shown; ++i) {
++                    list += fmt::format("{}{} x{}",
++                                        list.empty() ? "" : (long_entries ? " || " : ", "),
++                                        sorted[i].first, sorted[i].second);
+                 }
+                 LOG_INFO(Frontend, "Doris textures {}: {}", NOTE_NAMES[kind], list);
+             }
+diff --git a/src/common/doris_perf.h b/src/common/doris_perf.h
+index ad14e4997..2d7b177f7 100644
+--- a/src/common/doris_perf.h
++++ b/src/common/doris_perf.h
+@@ -79,6 +79,17 @@ enum class Count : int {
+     WaitForIdleNoDrawWrites,
+     /// The game's tiled-cache barriers.
+     TiledCacheBarriers,
++    /// Textures created with contents copied from GPU drawings sharing their memory (now kept
++    /// as GPU-drawn; Eden treated them as plain uploads).
++    TextureCreatedFromGpuData,
++    /// Textures brought up to date from newer GPU drawings sharing their memory with the same
++    /// layout, which Eden keeps apart ("bad overlap").
++    TextureSameLayoutSyncs,
++    /// Textures uploaded again from guest memory while another texture sharing their memory
++    /// holds GPU drawings.
++    TextureUploadsBesideGpuData,
++    /// Textures sharing memory that Eden keeps apart ("bad overlap"), as each new one is created.
++    TextureBadOverlaps,
+     Max,
+ };
+ 
+@@ -138,6 +149,14 @@ enum class Note : int {
+     GcLostGpuData,
+     /// GPU-drawn, then marked as changed by the CPU as a whole (all of it uploaded again).
+     CpuWrittenWhole,
++    /// Created with contents copied from GPU drawings sharing its memory.
++    CreatedFromGpuData,
++    /// Brought up to date from GPU drawings sharing its memory with the same layout.
++    SameLayoutSynced,
++    /// Uploaded again from guest memory while another texture sharing it holds GPU drawings.
++    UploadBesideGpuData,
++    /// Shares memory with another texture but Eden keeps them apart, and why.
++    NotJoined,
+     Max,
+ };
+ 
+diff --git a/src/video_core/texture_cache/image_base.h b/src/video_core/texture_cache/image_base.h
+index 916caab12..6a444b26c 100644
+--- a/src/video_core/texture_cache/image_base.h
++++ b/src/video_core/texture_cache/image_base.h
+@@ -131,6 +131,10 @@ struct ImageBase {
+ 
+     /// Eden (Doris): pages written by the game's code next to (or over) GPU-drawn contents.
+     std::vector<DorisTouchedPage> doris_touched_pages;
++
++    /// Eden (Doris): the newest modification of the images in overlapping_images already looked
++    /// at for same-layout copies (nothing newer to look at while theirs are not above it).
++    u64 doris_overlaps_seen_tick = 0;
+ };
+ 
+ struct ImageMapView {
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 72a5261a9..7a0cf5483 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -13,6 +13,8 @@
+ #include <thread>
+ #include <optional>
+ #include <bit>
++#include <set>
++#include <string>
+ #include <ankerl/unordered_dense.h>
+ #include <boost/container/small_vector.hpp>
+ 
+@@ -57,7 +59,7 @@ using namespace Common::Literals;
+     if (info.num_samples > 1) {
+         text += fmt::format(" MSAA{}", info.num_samples);
+     }
+-    return fmt::format("{} {}", text, info.format);
++    return fmt::format("{} {}", text, DorisFormatName(info.format));
+ }
+ 
+ template <class P>
+@@ -341,6 +343,10 @@ void TextureCache<P>::DorisRunGarbageCollector() {
+                     True(image.flags & ImageFlagBits::Sparse)) {
+                     return false;
+                 }
++                // What the GPU drew since into textures sharing its memory goes into the copy
++                // back too: some of those (single-level ones Eden keeps apart from others) are
++                // removed without a copy back of their own, and their drawings were lost.
++                DorisBringUpToDate(image_id);
+                 Doris::Perf::Add(Doris::Perf::Count::GcDownloaded);
+                 auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes, true);
+                 const auto copies = FixSmallVectorADL(FullDownloadCopies(image.info));
+@@ -1701,6 +1707,21 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
+             Doris::Perf::NoteTexture(Doris::Perf::Note::UploadOverGpuData,
+                                      DorisDescribeImage(image));
+         }
++    } else if (Doris::Perf::Enabled()) {
++        // Eden (Doris): another texture sharing its memory holds GPU drawings the upload
++        // doesn't have (guest memory never got them).
++        const auto gpu_drawn = [this](ImageId other_id) {
++            return True(slot_images[other_id].flags & ImageFlagBits::GpuModified);
++        };
++        const bool beside_gpu_data =
++            std::ranges::any_of(image.aliased_images,
++                                [&](const AliasedImage& alias) { return gpu_drawn(alias.id); }) ||
++            std::ranges::any_of(image.overlapping_images, gpu_drawn);
++        if (beside_gpu_data) {
++            Doris::Perf::Add(Doris::Perf::Count::TextureUploadsBesideGpuData);
++            Doris::Perf::NoteTexture(Doris::Perf::Note::UploadBesideGpuData,
++                                     DorisDescribeImage(image));
++        }
+     }
+ 
+     TrackImage(image, image_id);
+@@ -2216,6 +2237,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
+             join_copies_to_do.emplace_back(JoinCopy{true, overlap_id});
+         } else {
+             join_bad_overlap_ids.push_back(overlap_id);
++            DorisNoteBadOverlap(new_info, gpu_addr, new_image_base, overlap);
+         }
+     };
+     ForEachImageInRegion(cpu_addr, size_bytes, region_check);
+@@ -2343,6 +2365,22 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
+             const AliasedImage& aliased = new_image.aliased_images[alias_pointer->second];
+             CopyImage(new_image_id, aliased.id, aliased.copies);
+             new_image.modification_tick = overlap.modification_tick;
++            // Eden (Doris): the new image now holds what the GPU drew into the alias (only
++            // GPU-drawn aliases are copied), which guest memory doesn't have. Eden left it
++            // marked as a plain upload: the next write by the game's code anywhere on its pages
++            // uploaded all of it again from guest memory, and the alias's drawing never came
++            // back (it isn't newer than the image), until the game drew it again. Mark it as
++            // GPU-drawn, as SynchronizeAliases does when it copies from an alias.
++            if (False(new_image.flags & ImageFlagBits::GpuModified)) {
++                new_image.flags |= ImageFlagBits::GpuModified;
++                Doris::Perf::Add(Doris::Perf::Count::TextureCreatedFromGpuData);
++                if (Doris::Perf::Enabled()) {
++                    Doris::Perf::NoteTexture(Doris::Perf::Note::CreatedFromGpuData,
++                                             fmt::format("{} from {}",
++                                                         DorisDescribeImage(new_image),
++                                                         DorisDescribeImage(overlap)));
++                }
++            }
+             continue;
+         }
+         if (True(overlap.flags & ImageFlagBits::GpuModified)) {
+@@ -3198,6 +3236,116 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
+     }
+ }
+ 
++template <class P>
++void TextureCache<P>::DorisSyncOverlaps(ImageId image_id) {
++    // Eden (Doris): images sharing memory that Eden can't join as one image or as aliases
++    // ("bad overlap") never exchange contents, so what the GPU draws through one never reaches
++    // the other (guest memory doesn't get it either). Where both lay the shared memory out the
++    // same way, the newer drawing is copied over, as the memory itself would show it.
++    Image& image = slot_images[image_id];
++    const u64 seen_tick = (std::max)(image.modification_tick, image.doris_overlaps_seen_tick);
++    boost::container::small_vector<ImageId, 8> sources;
++    u64 newest_tick = seen_tick;
++    for (const ImageId other_id : image.overlapping_images) {
++        const Image& other = slot_images[other_id];
++        if (other.modification_tick <= seen_tick) {
++            continue;
++        }
++        newest_tick = (std::max)(newest_tick, other.modification_tick);
++        if (other.IsSafeGpuCopy()) {
++            sources.push_back(other_id);
++        }
++    }
++    image.doris_overlaps_seen_tick = newest_tick;
++    if (sources.empty()) {
++        return;
++    }
++    // Converted images hold another host format than the guest's: left out.
++    constexpr auto SKIPPED = ImageFlagBits::Sparse | ImageFlagBits::Rescaled |
++                             ImageFlagBits::Converted;
++    if (GetFormatType(image.info.format) != SurfaceType::ColorTexture ||
++        True(image.flags & SKIPPED)) {
++        return;
++    }
++    std::ranges::sort(sources, [this](ImageId lhs, ImageId rhs) {
++        return slot_images[lhs].modification_tick < slot_images[rhs].modification_tick;
++    });
++    for (const ImageId source_id : sources) {
++        Image& source = slot_images[source_id];
++        if (GetFormatType(source.info.format) != SurfaceType::ColorTexture ||
++            True(source.flags & SKIPPED)) {
++            continue;
++        }
++        // The memory they share is what matters (both are contiguous: sparse ones are left out).
++        std::vector<ImageCopy> copies =
++            DorisSameLayoutCopies(image.info, image.cpu_addr, source.info, source.cpu_addr);
++        if (copies.empty()) {
++            continue;
++        }
++        // What the game's code wrote over the source since the GPU drew into it goes in first.
++        if (!source.doris_touched_pages.empty()) {
++            DorisResolveTouched(source_id, source);
++            if (True(source.flags & ImageFlagBits::CpuModified)) {
++                continue;
++            }
++        }
++        if (Doris::Perf::Enabled()) {
++            Doris::Perf::NoteTexture(Doris::Perf::Note::SameLayoutSynced,
++                                     fmt::format("{} from {}", DorisDescribeImage(image),
++                                                 DorisDescribeImage(source)));
++        }
++        Doris::Perf::Add(Doris::Perf::Count::TextureSameLayoutSyncs);
++        CopyImage(image_id, source_id, std::move(copies));
++        image.modification_tick = (std::max)(image.modification_tick, source.modification_tick);
++        image.flags |= ImageFlagBits::GpuModified;
++    }
++}
++
++template <class P>
++void TextureCache<P>::DorisBringUpToDate(ImageId image_id) {
++    Image& image = slot_images[image_id];
++    if (!image.aliased_images.empty()) {
++        SynchronizeAliases(image_id);
++    }
++    if (!image.overlapping_images.empty()) {
++        DorisSyncOverlaps(image_id);
++    }
++}
++
++template <class P>
++void TextureCache<P>::DorisNoteBadOverlap(const ImageInfo& new_info, GPUVAddr new_addr,
++                                          const ImageBase& new_image_base,
++                                          const ImageBase& overlap) {
++    Doris::Perf::Add(Doris::Perf::Count::TextureBadOverlaps);
++    if (!Doris::Perf::Enabled()) {
++        return;
++    }
++    constexpr auto options = RelaxedOptions::Size | RelaxedOptions::Format;
++    const std::string as_part_of_other =
++        DorisWhyNotSubresource(new_info, overlap, new_addr, options);
++    const std::string other_as_part =
++        DorisWhyNotSubresource(overlap.info, new_image_base, overlap.gpu_addr, options);
++    const bool same_layout = !DorisSameLayoutCopies(new_info, new_image_base.cpu_addr,
++                                                    overlap.info, overlap.cpu_addr)
++                                  .empty();
++    const s64 offset = static_cast<s64>(new_image_base.cpu_addr) -
++                       static_cast<s64>(overlap.cpu_addr);
++    std::string text = fmt::format(
++        "{} at {:+} of {}: {} / {}{}", DorisDescribeImage(new_image_base), offset,
++        DorisDescribeImage(overlap), as_part_of_other, other_as_part,
++        same_layout ? " (same layout where shared: kept in step)" : "");
++    // The first time a pair of shapes shows up, everything about both layouts goes to the log.
++    static std::set<std::string> logged;
++    if (logged.size() < 400 && logged.insert(text).second) {
++        LOG_INFO(HW_GPU, "Doris textures kept apart: new {} at {:#x} (guest {} bytes) / existing {} "
++                         "at {:#x} (guest {} bytes): {}",
++                 DorisDescribeLayout(new_info), new_addr, new_image_base.guest_size_bytes,
++                 DorisDescribeLayout(overlap.info), overlap.gpu_addr, overlap.guest_size_bytes,
++                 text);
++    }
++    Doris::Perf::NoteTexture(Doris::Perf::Note::NotJoined, std::move(text));
++}
++
+ template <class P>
+ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool invalidate) {
+     Image& image = slot_images[image_id];
+@@ -3213,6 +3361,9 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool
+         if (!image.aliased_images.empty()) {
+             SynchronizeAliases(image_id);
+         }
++        if (!image.overlapping_images.empty()) {
++            DorisSyncOverlaps(image_id);
++        }
+     }
+     if (is_modification) {
+         MarkModification(image);
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index 0ec526a78..dd64c1fd2 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -429,6 +429,14 @@ private:
+     /// Eden (Doris): changes the page tracking count over a non-sparse image, except on its
+     /// written-to pages (which are not tracked for it).
+     void DorisUpdateImagePages(ImageBase& image, s32 delta);
++    /// Eden (Doris): copies into the image what newer GPU drawings in images sharing its memory
++    /// that Eden keeps apart ("bad overlap") hold, where the guest layout is the same in both.
++    void DorisSyncOverlaps(ImageId image_id);
++    /// Eden (Doris): the newest contents of the image's aliases and same-layout overlaps.
++    void DorisBringUpToDate(ImageId image_id);
++    /// Eden (Doris): names in the report two images sharing memory that Eden keeps apart, and why.
++    void DorisNoteBadOverlap(const ImageInfo& new_info, GPUVAddr new_addr,
++                             const ImageBase& new_image_base, const ImageBase& overlap);
+ 
+     /// Remove image views references from the cache
+     void RemoveImageViewReferences(std::span<const ImageViewId> removed_views);
+diff --git a/src/video_core/texture_cache/util.cpp b/src/video_core/texture_cache/util.cpp
+index 4d309322b..25a6c0c0b 100644
+--- a/src/video_core/texture_cache/util.cpp
++++ b/src/video_core/texture_cache/util.cpp
+@@ -1086,6 +1086,200 @@ std::optional<std::vector<BufferImageCopy>> DorisGobCopies(
+     return copies;
+ }
+ 
++namespace {
++
++/// Eden (Doris): where a mip level sits in guest memory and how it is laid out there, the way
++/// UnswizzleImage and SwizzleImage read and write it.
++struct DorisLevelPlacement {
++    u32 offset;       ///< From the image's start.
++    u32 size;         ///< Guest bytes of the level.
++    u32 gobs_in_x;    ///< Row pitch in GOBs.
++    u32 block_height; ///< log2 of the GOBs per block.
++    u32 width;        ///< Texels.
++    u32 height;       ///< Texels.
++};
++
++bool DorisLevelPlacements(const ImageInfo& info,
++                          std::array<DorisLevelPlacement, MAX_MIP_LEVELS>& placements) {
++    if (info.type != ImageType::e2D || info.tile_width_spacing != 0 || info.num_samples != 1 ||
++        info.size.depth != 1 || info.block.width != 0 || info.block.depth != 0 ||
++        info.resources.layers != 1) {
++        return false;
++    }
++    const Extent2D tile_size = DefaultBlockSize(info.format);
++    if (tile_size.width != 1 || tile_size.height != 1) {
++        return false;
++    }
++    const u32 num_levels = static_cast<u32>(info.resources.levels);
++    if (num_levels == 0 || num_levels > MAX_MIP_LEVELS) {
++        return false;
++    }
++    const u32 bpp_log2 = BytesPerBlockLog2(info.format);
++    const LevelInfo level_info = MakeLevelInfo(info);
++    const std::array level_sizes = CalculateLevelSizes(level_info, num_levels);
++    const Extent2D gob = GobSize(bpp_log2, info.block.height, info.tile_width_spacing);
++    u32 offset = 0;
++    for (u32 level = 0; level < num_levels; ++level) {
++        const Extent3D level_size = AdjustMipSize(info.size, static_cast<s32>(level));
++        const Extent3D num_tiles = AdjustTileSize(level_size, tile_size);
++        const Extent3D block =
++            AdjustMipBlockSize(num_tiles, level_info.block, level, level_info.num_levels);
++        const u32 stride_alignment = StrideAlignment(num_tiles, info.block, gob, bpp_log2);
++        const u32 stride = Common::AlignUpLog2(num_tiles.width, stride_alignment) << bpp_log2;
++        placements[level] = DorisLevelPlacement{
++            .offset = offset,
++            .size = level_sizes[level],
++            .gobs_in_x = Common::DivCeilLog2(stride, GOB_SIZE_X_SHIFT),
++            .block_height = block.height,
++            .width = level_size.width,
++            .height = level_size.height,
++        };
++        offset += level_sizes[level];
++    }
++    return true;
++}
++
++} // Anonymous namespace
++
++std::vector<ImageCopy> DorisSameLayoutCopies(const ImageInfo& dst, GPUVAddr dst_addr,
++                                             const ImageInfo& src, GPUVAddr src_addr) {
++    std::vector<ImageCopy> copies;
++    if (BytesPerBlock(dst.format) != BytesPerBlock(src.format)) {
++        return copies;
++    }
++    std::array<DorisLevelPlacement, MAX_MIP_LEVELS> dst_levels{};
++    std::array<DorisLevelPlacement, MAX_MIP_LEVELS> src_levels{};
++    if (!DorisLevelPlacements(dst, dst_levels) || !DorisLevelPlacements(src, src_levels)) {
++        return copies;
++    }
++    for (s32 dst_level = 0; dst_level < dst.resources.levels; ++dst_level) {
++        const DorisLevelPlacement& d = dst_levels[dst_level];
++        const u64 d_begin = dst_addr + d.offset;
++        const u64 d_end = d_begin + d.size;
++        for (s32 src_level = 0; src_level < src.resources.levels; ++src_level) {
++            const DorisLevelPlacement& s = src_levels[src_level];
++            const u64 s_begin = src_addr + s.offset;
++            const u64 s_end = s_begin + s.size;
++            if (s_begin >= d_end || d_begin >= s_end || d.gobs_in_x != s.gobs_in_x) {
++                continue;
++            }
++            // One GOB wide, the GOBs simply follow each other downwards whatever the block
++            // height; wider, the blocks must be equally tall.
++            const bool one_column = d.gobs_in_x == 1;
++            if (!one_column && d.block_height != s.block_height) {
++                continue;
++            }
++            const s64 unit = one_column
++                                 ? static_cast<s64>(GOB_SIZE)
++                                 : static_cast<s64>(u64{d.gobs_in_x}
++                                                    << (GOB_SIZE_SHIFT + d.block_height));
++            const s64 rows_per_unit =
++                one_column ? s64{GOB_SIZE_Y} : (s64{GOB_SIZE_Y} << d.block_height);
++            const s64 delta = static_cast<s64>(s_begin) - static_cast<s64>(d_begin);
++            if (delta % unit != 0) {
++                continue;
++            }
++            // The source's row 0 is the destination's row dy.
++            const s64 dy = delta / unit * rows_per_unit;
++            const s64 y0 = (std::max)(s64{0}, dy);
++            const s64 y1 = (std::min)(static_cast<s64>(d.height), dy + static_cast<s64>(s.height));
++            const u32 width = (std::min)(d.width, s.width);
++            if (y0 >= y1 || width == 0) {
++                continue;
++            }
++            copies.push_back(ImageCopy{
++                .src_subresource = {.base_level = src_level, .base_layer = 0, .num_layers = 1},
++                .dst_subresource = {.base_level = dst_level, .base_layer = 0, .num_layers = 1},
++                .src_offset = {0, static_cast<s32>(y0 - dy), 0},
++                .dst_offset = {0, static_cast<s32>(y0), 0},
++                .extent = {width, static_cast<u32>(y1 - y0), 1},
++            });
++        }
++    }
++    return copies;
++}
++
++std::string DorisWhyNotSubresource(const ImageInfo& candidate, const ImageBase& image,
++                                   GPUVAddr candidate_addr, RelaxedOptions options) {
++    const ImageInfo& existing = image.info;
++    if (candidate_addr < image.gpu_addr) {
++        return "starts before it";
++    }
++    const u64 diff = candidate_addr - image.gpu_addr;
++    if (diff > image.guest_size_bytes) {
++        return fmt::format("starts {} bytes in, past its {}", diff, image.guest_size_bytes);
++    }
++    const std::optional<SubresourceBase> base = image.TryFindBase(candidate_addr);
++    if (!base) {
++        return fmt::format("+{} is no level or layer start (layer stride {})", diff,
++                           existing.layer_stride);
++    }
++    if (True(options & RelaxedOptions::Format)) {
++        if (BytesPerBlock(existing.format) != BytesPerBlock(candidate.format)) {
++            return fmt::format("bytes per texel {} vs {}", BytesPerBlock(existing.format),
++                               BytesPerBlock(candidate.format));
++        }
++    }
++    if (!IsLayerStrideCompatible(existing, candidate)) {
++        return fmt::format("layer stride {}/{} vs {}/{}", existing.layer_stride,
++                           existing.maybe_unaligned_layer_stride, candidate.layer_stride,
++                           candidate.maybe_unaligned_layer_stride);
++    }
++    if (existing.type != candidate.type) {
++        return fmt::format("type {} vs {}", static_cast<int>(existing.type),
++                           static_cast<int>(candidate.type));
++    }
++    if (False(options & RelaxedOptions::Samples) && existing.num_samples != candidate.num_samples) {
++        return fmt::format("samples {} vs {}", existing.num_samples, candidate.num_samples);
++    }
++    if (existing.resources.levels < candidate.resources.levels + base->level) {
++        return fmt::format("level {} + {} levels, has {}", base->level, candidate.resources.levels,
++                           existing.resources.levels);
++    }
++    if (existing.type == ImageType::e3D) {
++        const u32 mip_depth = AdjustMipSize(existing.size.depth, base->level);
++        if (mip_depth < candidate.size.depth + base->layer) {
++            return fmt::format("depth {} at slice {}, has {}", candidate.size.depth, base->layer,
++                               mip_depth);
++        }
++    } else if (existing.resources.layers < candidate.resources.layers + base->layer) {
++        return fmt::format("layer {} + {} layers, has {}", base->layer,
++                           candidate.resources.layers, existing.resources.layers);
++    }
++    const bool strict_size = False(options & RelaxedOptions::Size);
++    if (!IsBlockLinearSizeCompatible(existing, candidate, base->level, 0, strict_size)) {
++        const Extent3D lhs = strict_size ? AdjustMipSize(existing.size, base->level)
++                                         : BlockLinearAlignedSize(existing, base->level);
++        const Extent3D rhs =
++            strict_size ? AdjustMipSize(candidate.size, 0) : BlockLinearAlignedSize(candidate, 0);
++        return fmt::format("size at level {} {}x{} vs {}x{}", base->level, lhs.width, lhs.height,
++                           rhs.width, rhs.height);
++    }
++    return "ok";
++}
++
++const char* DorisFormatName(PixelFormat format) noexcept {
++    switch (format) {
++#define PIXEL_FORMAT_ELEM(name, ...)                                                               \
++    case PixelFormat::name:                                                                        \
++        return #name;
++        PIXEL_FORMAT_LIST
++#undef PIXEL_FORMAT_ELEM
++    default:
++        return "invalid";
++    }
++}
++
++std::string DorisDescribeLayout(const ImageInfo& info) {
++    return fmt::format("{} {}x{}x{} type {} levels {} layers {} samples {} block {}/{}/{} "
++                       "tile spacing {} layer stride {}/{} pitch {}",
++                       DorisFormatName(info.format), info.size.width, info.size.height,
++                       info.size.depth, static_cast<int>(info.type), info.resources.levels,
++                       info.resources.layers, info.num_samples, info.block.width,
++                       info.block.height, info.block.depth, info.tile_width_spacing,
++                       info.layer_stride, info.maybe_unaligned_layer_stride, info.pitch);
++}
++
+ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8> output,
+                   std::span<BufferImageCopy> copies) {
+     u32 output_offset = 0;
+diff --git a/src/video_core/texture_cache/util.h b/src/video_core/texture_cache/util.h
+index 07ae4278d..8d502ea9f 100644
+--- a/src/video_core/texture_cache/util.h
++++ b/src/video_core/texture_cache/util.h
+@@ -8,6 +8,7 @@
+ 
+ #include <optional>
+ #include <span>
++#include <string>
+ #include <utility>
+ #include <vector>
+ #include <boost/container/small_vector.hpp>
+@@ -83,6 +84,29 @@ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8
+     const ImageInfo& info, std::span<const BufferImageCopy> level_copies,
+     std::span<const std::pair<u32, u32>> ranges, size_t max_copies);
+ 
++/// Eden (Doris): copies between two block-linear images over the memory they share, for the
++/// levels whose guest layout there is the same in both (same bytes per texel, same row pitch in
++/// GOBs and same GOBs per block, starting a whole number of block rows apart): what one of them
++/// holds there is exactly what the other would read from guest memory. Empty when they share no
++/// such region, or when either isn't a plain single-layer 2D image (one sample, uncompressed).
++[[nodiscard]] std::vector<ImageCopy> DorisSameLayoutCopies(const ImageInfo& dst,
++                                                           GPUVAddr dst_addr,
++                                                           const ImageInfo& src,
++                                                           GPUVAddr src_addr);
++
++/// Eden (Doris): why FindSubresource(candidate, image, candidate_addr, options) finds nothing
++/// ("ok" when it does), for the report.
++[[nodiscard]] std::string DorisWhyNotSubresource(const ImageInfo& candidate,
++                                                 const ImageBase& image,
++                                                 GPUVAddr candidate_addr,
++                                                 RelaxedOptions options);
++
++/// Eden (Doris): the pixel format's name.
++[[nodiscard]] const char* DorisFormatName(VideoCore::Surface::PixelFormat format) noexcept;
++
++/// Eden (Doris): everything about an image's guest layout, for the log.
++[[nodiscard]] std::string DorisDescribeLayout(const ImageInfo& info);
++
+ [[nodiscard]] boost::container::small_vector<BufferImageCopy, 16> FullDownloadCopies(
+     const ImageInfo& info);
+ 
+-- 
+2.43.0
+
