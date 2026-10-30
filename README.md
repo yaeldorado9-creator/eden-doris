@@ -27,6 +27,7 @@ Eden. With its default settings Doris behaves like that build; fixes are added o
 Doris's own settings are under **Settings → Graphics → Eden (Doris) experiments** (globally or per game). Most take
 effect the next time the game starts; the ones marked "right away" apply as soon as they are changed.
 
+* **GPU fences** (default: Doris: wait for what the GPU wrote; right away). See [GPU fences](#gpu-fences-builds-22-and-23).
 * **GPU barriers** (default: Doris: real barriers where needed). Eden turns the game's "wait until the GPU is done"
   points into a Vulkan event wait that guarantees neither ordering nor visibility of earlier writes, and puts no
   barrier after compute work. On Adreno this lets draws read culling results, indirect draw arguments and vertex data
@@ -52,7 +53,7 @@ effect the next time the game starts; the ones marked "right away" apply as soon
   per frame, the draws, dispatches, render passes and submits, new pipelines, how long the GPU thread waited for
   presentation and GPU fences and the Vulkan worker for shader builds, and the GPU time of the whole frame, of frame
   generation and of output scaling (GPU timestamps); how often the GPU thread and the Vulkan worker ran on prime,
-  middle or little cores; worker wake-ups, render passes cut by a submit, memory-protection changes, wait-for-idles
+  middle or little cores; worker wake-ups, render passes cut by a submit (and all passes reopened on the same targets), memory-protection changes, wait-for-idles
   (and how many redundant barriers were left out) and tiled-cache barriers per frame; texture uploads (and how many
   replaced GPU-drawn contents) and what the texture garbage collector removed, copied back or called off, with GPU
   memory against its thresholds; upload volume, new staging buffers and new GPU memory per frame, and the time the GPU
@@ -139,7 +140,7 @@ of the other; the first time a pair of shapes shows up, both layouts are written
 instead of numbered. It also shows the GPU's temperature and the hottest CPU and GPU sensors, where the system lets apps
 read them.
 
-### GPU fences (build 22)
+### GPU fences (builds 22 and 23)
 
 With **GPU Fence Behavior: Immediate** (Settings → Graphics → Advanced), Eden tells the game the GPU has finished its
 work as soon as the work is recorded, before the GPU has run it and before the bytes the GPU wrote into buffers are
@@ -148,6 +149,13 @@ Doris (since build 18, Eden #4490/#4531) waits for the copy first, which the rep
 10 seconds in TotK since then: the game uses data the GPU wrote within moments of the fence. "Balanced" releases each
 fence only once the GPU has run the work before it and the copy has landed, as the Switch does. The report now counts
 the fences, how many were released while GPU-written data was still on its way back, and how much was copied back.
+
+The build 22 log: about 4500 fences every 10 seconds, 2500 of them released before the GPU-written data they covered
+(about 15 MiB a second) was back. From build 23 the Doris setting **GPU fences** (default: "Doris: wait for what the
+GPU wrote") makes "Immediate", and "Default" below High GPU accuracy, behave as "Balanced": a fence is released once
+the GPU has run the work before it and the copy has landed, in order; fences with nothing to copy back still go at
+once. "As GPU Fence Behavior says" switches back. The game now waits for the GPU where it reads what the GPU wrote,
+which can cost speed; the report's frame times show it.
 
 ## Fixes from newer Eden (build 18)
 
