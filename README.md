@@ -6,10 +6,8 @@ A personal build of the [Eden](https://git.eden-emu.dev/eden-emu/eden) Nintendo 
 aimed at fixing the graphical problems that remain in *Tears of the Kingdom* on Snapdragon 8 Gen 2 / Adreno 740
 handhelds (AYN Thor Pro): distant terrain, structures and shadows that flicker or vanish for a moment.
 
-> **Build 24 is build 19 again.** Builds 20 to 23 tried further fixes for the ground switching texture; none
-> removed it, and they cost temperature and speed. Build 24 has exactly build 19's code (the build with the best
-> temperatures and performance), under a new build number so it installs over any later build and keeps the
-> app's data.
+> **Build 25 is build 19 plus one change:** with NCE, the game now reads the GPU's drawings instead of the stale
+> memory under them (see below). Build 24 is build 19 unchanged, kept as the fallback. Builds 20 to 23 are retired.
 
 ## Installs beside every other Eden
 
@@ -89,6 +87,19 @@ effect the next time the game starts; the ones marked "right away" apply as soon
   4096, 8192 (default), no limit.
 * **Monster Hunter Rise record fix**: always (PR #4324, default), only in Monster Hunter Rise, or off. The log notes
   every time it rewrites a copy, and in which game.
+
+## The game's reads of GPU drawings with NCE (build 25)
+
+With the JIT, Eden copies a texture the GPU drew back into guest memory before the game's code reads it there
+(reactive flushing). With NCE the game's code runs natively and reads guest memory directly, so it saw what was there
+before the drawing. TotK reads GPU drawings back; reports of ground corrupting into other ground and grass vanishing
+on NCE that go away on the JIT with reactive flushing point here.
+
+Build 25 makes the pages of a texture the GPU has drawn unreadable for NCE code. When the game touches one, the
+drawing is copied in first (the first time it waits for the GPU, afterwards Eden copies it at fences ahead of time),
+then the read goes on; a write goes on to Eden's usual invalidation. The report's upload line counts the pages, the
+game's reads and writes there, and how long the game waited. Setting: *Game reads of GPU drawings (NCE)* next to the
+other Doris settings; *Eden (as before)* turns it off (takes effect the next time the game starts).
 
 ## GPU drawings and the game's own writes (build 19)
 
