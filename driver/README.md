@@ -27,6 +27,12 @@ Balemuni's **Apex v2 Ultimate** Turnip driver rebuilt from source, as the base f
   sooner (10 samples, 10 s, passes from 0.15 ms). (Apex Doris 4's per-operation timing is removed: it cost
   performance and wrote nothing.)
 
+- **0004**: every 30 s, the GPU time of every operation during one second (Mesa's GPU tracepoints through a
+  Doris hook in u_trace; turnip's tracepoints are plain markers, which is why Apex Doris 4's version wrote
+  nothing): render passes by size, mode and draws, what inside them takes the time, depth culling (LRZ) on/off
+  and why, why GMEM was not possible, uploads, downloads, copies, blits, clears, compute and the time between
+  operations.
+
 Apex's own TotK rule switched on for Eden (prefer GMEM; zip `-apexfix` in apex-doris-3) did not fix the grass or
 the ground and is no longer built; its patch is in the history.
 
