@@ -6,9 +6,12 @@ A personal build of the [Eden](https://git.eden-emu.dev/eden-emu/eden) Nintendo 
 aimed at fixing the graphical problems that remain in *Tears of the Kingdom* on Snapdragon 8 Gen 2 / Adreno 740
 handhelds (AYN Thor Pro): distant terrain, structures and shadows that flicker or vanish for a moment.
 
-> **Build 29 has two APKs.** `Eden-Doris-29.apk` is build 28 (the current Doris). `Eden-Doris-29-no-newer-eden.apk`
-> is the same without the fixes carried over from newer Eden in build 18 (see `variants/no-newer-eden`). Both have the
-> same versionCode, so either installs over the other and keeps the app's data.
+> **From build 30, Doris is back to build 6** — the flicker fixes (patches 0001–0005) plus the eden-lun speed-ups
+> (0006–0028), nothing after. The APKs of a release are listed in `RELEASE`:
+> `Eden-Doris-<n>.apk` is build 6 exactly; `Eden-Doris-<n>-water-fix.apk` is build 6 plus only the two later fixes for
+> water vanishing (old patch 0031) and stale memory runs (old 0032), see `variants/build6-water-fix`. Both have the same
+> versionCode, so either installs over the other and keeps the app's data. Patches 0029–0053 stay in `patches/` as
+> history but are no longer built, so the settings they added (and parts of the description below) don't apply.
 
 ## Installs beside every other Eden
 

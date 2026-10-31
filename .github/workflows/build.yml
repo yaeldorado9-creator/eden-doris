@@ -1,12 +1,12 @@
 name: Build Eden (Doris)
 
-# Every push to main builds the APK and publishes it as a release (doris-<number>).
-# The Eden source comes from the official GitHub mirror at the commit pinned in UPSTREAM;
-# everything Doris changes is in patches/ and is applied on top, in order.
+# Every push to main builds the APKs listed in RELEASE and publishes them as a release (doris-<number>).
+# The Eden source is the PR #4324 build pinned in UPSTREAM; each APK applies its patch sets (from
+# patches/ and variants/) on top, in order. All APKs of a release share one versionCode.
 on:
   push:
     branches: [main]
-    paths: [UPSTREAM, 'patches/**', 'upstream/**', 'variants/**', '.github/workflows/build.yml']
+    paths: [UPSTREAM, RELEASE, 'patches/**', 'upstream/**', 'variants/**', '.github/workflows/build.yml']
   workflow_dispatch:
 
 permissions:
@@ -48,7 +48,7 @@ jobs:
       - name: One versionCode for every APK of this release
         run: echo "DORIS_VERSION_CODE=$(( ($(date +%s) - 1451606400) / 10 ))" >> "$GITHUB_ENV"
 
-      - name: Eden source (the PR #4324 build) + Doris patches
+      - name: Eden source (the PR #4324 build)
         run: |
           val() { awk -v k="$1" '$1 == k { print $2 }' UPSTREAM; }
           SHA=$(val commit); SERVER=$(val server); PR_REF=$(val pr_ref)
@@ -67,9 +67,6 @@ jobs:
             echo "Eden source: mirror $BASE + PR #4324 patch" | tee ../source.txt
           fi
           git rev-parse HEAD > ../base.txt
-          $AM ../patches/*.patch
-          git log --oneline -n 6 > ../patch-log.txt
-          cat ../patch-log.txt
 
       - name: Restore downloaded dependencies
         uses: actions/cache@v4
@@ -78,58 +75,55 @@ jobs:
           key: cpm-${{ hashFiles('UPSTREAM', 'patches/**') }}
           restore-keys: cpm-
 
-      - name: Build the APK
+      # RELEASE: one APK per line, "<suffix or -> <patch set> [<patch set> ...]", where a patch set is a
+      # folder (all its patches) or "patches:<first>-<last>" (patches/ by number).
+      - name: Build the APKs
         env:
           GIT_TAG_NAME: ${{ env.DORIS_TAG }}
-        run: |
-          cd eden/src/android
-          chmod +x gradlew
-          ./gradlew assembleDorisRelease --no-daemon --stacktrace \
-            -PYUZU_ANDROID_ARGS="-DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache"
-          sccache -s || true
-
-      - name: Collect the APK
         run: |
           mkdir -p out
-          APK=$(find eden/src/android/app/build/outputs/apk/doris/release -name '*.apk' | head -n 1)
-          test -n "$APK"
-          cp -v "$APK" "out/Eden-Doris-${{ github.run_number }}.apk"
-          sha256sum out/*.apk | tee out/SHA256SUMS.txt
-          # Unstripped library, for turning Doris profiler offsets into function names.
-          SYM=$(find eden/src/android/app/build/intermediates -name libyuzu-android.so -path '*arm64-v8a*' \
-                  -not -path '*stripped*' | head -n 1)
-          if [ -n "$SYM" ]; then
-            echo "symbols from $SYM"; ls -la "$SYM"
-            readelf -S "$SYM" | grep -E "\.symtab|\.debug_info" || echo "(no .symtab/.debug_info)"
-            (cd "$(dirname "$SYM")" && zip -9 -q "$GITHUB_WORKSPACE/out/libyuzu-android-symbols-${{ github.run_number }}.zip" libyuzu-android.so)
-          fi
-
-      # Second APK of the release: every Doris change, but without the fixes carried over from newer
-      # Eden in build 18 (patches 0042-0048); Doris' later patches are rebased in variants/no-newer-eden.
-      - name: Eden source without the newer Eden fixes
-        run: |
-          cd eden
-          AM="git -c user.name=Eden-Doris -c user.email=doris@localhost am -3"
-          git reset -q --hard "$(cat ../base.txt)"
-          for p in ../patches/*.patch; do
-            n=$(basename "$p" | cut -c1-4)
-            if [ $((10#$n)) -le 41 ]; then $AM "$p"; fi
+          : > notes-variants.md
+          first=1
+          grep -v '^[[:space:]]*#' RELEASE | grep -v '^[[:space:]]*$' | while read -r suffix sets; do
+            [ "$suffix" = "-" ] && suffix=""
+            name="Eden-Doris-${{ github.run_number }}${suffix}.apk"
+            echo "::group::$name: $sets"
+            ( cd eden
+              AM="git -c user.name=Eden-Doris -c user.email=doris@localhost am -3"
+              git am --abort >/dev/null 2>&1 || true
+              git reset -q --hard "$(cat ../base.txt)"
+              for set in $sets; do
+                case "$set" in
+                  patches:*)
+                    range=${set#patches:}; lo=${range%-*}; hi=${range#*-}
+                    for p in ../patches/*.patch; do
+                      n=$(basename "$p" | cut -c1-4)
+                      if [ $((10#$n)) -ge "$lo" ] && [ $((10#$n)) -le "$hi" ]; then $AM "$p"; fi
+                    done ;;
+                  *) $AM ../"$set"/*.patch ;;
+                esac
+              done
+              { echo "$name ($sets):"; echo '```'; git log --oneline -n 8; echo '```'; echo; } >> ../notes-variants.md )
+            ( cd eden/src/android
+              chmod +x gradlew
+              ./gradlew assembleDorisRelease --no-daemon --stacktrace \
+                -PYUZU_ANDROID_ARGS="-DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache" )
+            APK=$(find eden/src/android/app/build/outputs/apk/doris/release -name '*.apk' | head -n 1)
+            test -n "$APK"
+            cp -v "$APK" "out/$name"
+            if [ "$first" = 1 ]; then
+              # Unstripped library of the first APK, for turning profiler offsets into function names.
+              SYM=$(find eden/src/android/app/build/intermediates -name libyuzu-android.so -path '*arm64-v8a*' \
+                      -not -path '*stripped*' | head -n 1)
+              if [ -n "$SYM" ]; then
+                (cd "$(dirname "$SYM")" && zip -9 -q "$GITHUB_WORKSPACE/out/libyuzu-android-symbols-${{ github.run_number }}.zip" libyuzu-android.so)
+              fi
+              first=0
+            fi
+            echo "::endgroup::"
           done
-          $AM ../variants/no-newer-eden/*.patch
-          git log --oneline -n 6 > ../patch-log-no-newer-eden.txt
-          cat ../patch-log-no-newer-eden.txt
-
-      - name: Build the APK without the newer Eden fixes
-        env:
-          GIT_TAG_NAME: ${{ env.DORIS_TAG }}
-        run: |
-          cd eden/src/android
-          ./gradlew assembleDorisRelease --no-daemon --stacktrace \
-            -PYUZU_ANDROID_ARGS="-DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache"
-          APK=$(find app/build/outputs/apk/doris/release -name '*.apk' | head -n 1)
-          test -n "$APK"
-          cp -v "$APK" "$GITHUB_WORKSPACE/out/Eden-Doris-${{ github.run_number }}-no-newer-eden.apk"
-          cd "$GITHUB_WORKSPACE/out" && sha256sum *.apk | tee SHA256SUMS.txt
+          sccache -s || true
+          cd out && sha256sum *.apk | tee SHA256SUMS.txt
 
       - uses: actions/upload-artifact@v4
         with:
@@ -143,20 +137,11 @@ jobs:
         run: |
           {
             echo "Eden (Doris) build ${{ github.run_number }} — package dev.eden.eden_doris (installs beside every other Eden)."
+            echo "All APKs of this release have versionCode $DORIS_VERSION_CODE: each installs over the other and keeps the app's data."
             echo
             cat source.txt
             echo
-            echo "Doris changes in this build:"
-            echo '```'
-            cat patch-log.txt
-            echo '```'
-            echo
-            echo "Eden-Doris-${{ github.run_number }}-no-newer-eden.apk: the same, without the fixes from newer Eden"
-            echo "(build 18: Eden #4565, #4490, #4473, #4531/#4528, #4530, #4551, #4508). Same versionCode"
-            echo "($DORIS_VERSION_CODE): either APK installs over the other and keeps the app's data."
-            echo '```'
-            cat patch-log-no-newer-eden.txt
-            echo '```'
+            cat notes-variants.md
           } > notes.md
           shopt -s nullglob
           gh release create "$DORIS_TAG" out/*.apk out/SHA256SUMS.txt out/*.zip \

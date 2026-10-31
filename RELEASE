@@ -1,0 +1,7 @@
+# APKs built for each release: "<suffix or -> <patch set> [<patch set> ...]".
+# A patch set is a folder (all its .patch files, in order) or "patches:<first>-<last>" (patches/ by number).
+# Every APK starts again from the Eden source in UPSTREAM; all share one versionCode.
+#
+# Release 30+: back to build 6 (flicker fixes 0001-0005 + eden-lun speed-ups 0006-0028).
+-            patches:1-28 variants/build6
+-water-fix   patches:1-28 variants/build6-water-fix
