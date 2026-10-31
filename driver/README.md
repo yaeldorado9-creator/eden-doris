@@ -33,6 +33,11 @@ Balemuni's **Apex v2 Ultimate** Turnip driver rebuilt from source, as the base f
   and why, why GMEM was not possible, uploads, downloads, copies, blits, clears, compute and the time between
   operations.
 
+- **0005**: the profiled autotuner picks GMEM only when it is at least 15% faster (the SYSMEM/GMEM CCU switch is
+  paid outside the timed pass). The report leaves out tracepoints recorded inside render passes (their copies
+  added a wait-for-idle per pass), labels figures per second, and counts views of Eden's mutable color images in
+  another format (to decide whether UBWC can be turned on for them).
+
 Apex's own TotK rule switched on for Eden (prefer GMEM; zip `-apexfix` in apex-doris-3) did not fix the grass or
 the ground and is no longer built; its patch is in the history.
 
