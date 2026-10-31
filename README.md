@@ -6,8 +6,9 @@ A personal build of the [Eden](https://git.eden-emu.dev/eden-emu/eden) Nintendo 
 aimed at fixing the graphical problems that remain in *Tears of the Kingdom* on Snapdragon 8 Gen 2 / Adreno 740
 handhelds (AYN Thor Pro): distant terrain, structures and shadows that flicker or vanish for a moment.
 
-> **Build 28 is build 26 again** (build 19's code plus the NCE read protection, now off by default because it
-> froze the game at start). Build 27's change (Vulkan worker woken every 64 draws) is dropped.
+> **Build 29 has two APKs.** `Eden-Doris-29.apk` is build 28 (the current Doris). `Eden-Doris-29-no-newer-eden.apk`
+> is the same without the fixes carried over from newer Eden in build 18 (see `variants/no-newer-eden`). Both have the
+> same versionCode, so either installs over the other and keeps the app's data.
 
 ## Installs beside every other Eden
 

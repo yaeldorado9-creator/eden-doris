@@ -1,0 +1,808 @@
+From 474af02277d6ff034509b329b5dfb8f05191946b Mon Sep 17 00:00:00 2001
+From: "Eden (Doris) build" <doris@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 00:07:39 -0500
+Subject: [PATCH 43/46] Eden (Doris): GPU drawings survive game writes next to
+ them; copy-backs cover 512 KiB; barriers only where needed; report names
+ textures and shows the clock
+
+- Eden marks every texture on a page the game's code writes to as CPU-written and uploads it
+  again from guest memory, which still holds what was there before the GPU drew into it (build
+  18: up to 400 such uploads every 10 s in TotK). On an NCE write fault, a GPU-drawn texture's
+  bytes on that page are kept as they were before the write and the page is released; at the
+  texture's next use (or the end of the frame) they are compared: if the game changed them the
+  texture is uploaded again as in Eden, otherwise what the GPU drew stays. Also when the buffer
+  cache copies GPU-written bytes back first.
+- Copying back GPU-written buffer bytes before a game write (Eden #4490/#4531) waits for the GPU
+  to finish everything queued, about 20 ms while a frame is in flight, and TotK then writes the
+  next pages of the same buffer (bursts of 10 to 13 waits). The copy back now covers the
+  surrounding 512 KiB. BufferCache::DownloadMemory limits each buffer's download to the part of
+  the range inside it.
+- GPU barriers default 3: a wait-for-idle with no draw since the previous one that wrote storage
+  buffers or images (or used transform feedback) records nothing and keeps the render pass open
+  (build 18: 113 of 130 per frame). 1 keeps a barrier at every wait-for-idle.
+- Report: the device's clock time on every 10-second window, and the textures (size, format)
+  that were uploaded again over GPU-drawn contents, had their bytes changed by the game, or were
+  removed with GPU-drawn contents lost.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014Ps8wnhVXtSU7d88gGtyHX
+(cherry picked from commit 7687e034d35039d294aa1f760ce4b38e3ddafe12)
+---
+ .../app/src/main/res/values/arrays.xml        |   2 +
+ .../app/src/main/res/values/strings.xml       |   5 +-
+ src/common/doris_perf.cpp                     |  66 +++++-
+ src/common/doris_perf.h                       |  21 ++
+ src/common/settings.h                         |   6 +-
+ src/core/memory.cpp                           |   3 +-
+ src/video_core/buffer_cache/buffer_cache.h    |   8 +-
+ src/video_core/gpu.cpp                        |   9 +
+ src/video_core/gpu.h                          |   3 +
+ src/video_core/rasterizer_interface.h         |   6 +
+ .../renderer_vulkan/vk_rasterizer.cpp         |  31 ++-
+ .../renderer_vulkan/vk_rasterizer.h           |   1 +
+ src/video_core/texture_cache/image_base.h     |  11 +
+ src/video_core/texture_cache/texture_cache.h  | 204 +++++++++++++++++-
+ .../texture_cache/texture_cache_base.h        |  20 ++
+ 15 files changed, 383 insertions(+), 13 deletions(-)
+
+diff --git a/src/android/app/src/main/res/values/arrays.xml b/src/android/app/src/main/res/values/arrays.xml
+index 5d7b52cc4..548576103 100644
+--- a/src/android/app/src/main/res/values/arrays.xml
++++ b/src/android/app/src/main/res/values/arrays.xml
+@@ -668,12 +668,14 @@
+     </integer-array>
+ 
+     <string-array name="dorisGpuBarriersEntries">
++        <item>@string/doris_barriers_needed</item>
+         <item>@string/doris_barriers_full</item>
+         <item>@string/doris_barriers_tiled</item>
+         <item>@string/doris_barriers_eden</item>
+     </string-array>
+ 
+     <integer-array name="dorisGpuBarriersValues">
++        <item>3</item>
+         <item>1</item>
+         <item>2</item>
+         <item>0</item>
+diff --git a/src/android/app/src/main/res/values/strings.xml b/src/android/app/src/main/res/values/strings.xml
+index 2bacb742f..9501a8b38 100644
+--- a/src/android/app/src/main/res/values/strings.xml
++++ b/src/android/app/src/main/res/values/strings.xml
+@@ -613,9 +613,10 @@
+     <string name="doris_texture_cleanup_doris">Doris: no waits, fewer re-uploads</string>
+     <string name="doris_texture_cleanup_eden">Eden (as before)</string>
+     <string name="doris_gpu_barriers">GPU barriers</string>
+-    <string name="doris_gpu_barriers_description">How the game\'s \"wait until the GPU is done\" points are carried out. Eden\'s way lets later drawing read results that aren\'t finished yet on Adreno, which can make distant terrain, buildings and shadows drop out for a frame. Doris uses real barriers. Takes effect the next time the game starts.</string>
++    <string name="doris_gpu_barriers_description">How the game\'s \"wait until the GPU is done\" points are carried out. Eden\'s way lets later drawing read results that aren\'t finished yet on Adreno, which can make distant terrain, buildings and shadows drop out for a frame. Doris uses real barriers; by default only where something drawn since the previous wait needs one (most of the game\'s waits follow nothing of the kind), which spares the GPU work. Takes effect the next time the game starts.</string>
+     <string name="doris_barriers_eden">Eden (as before)</string>
+-    <string name="doris_barriers_full">Doris: real barriers</string>
++    <string name="doris_barriers_needed">Doris: real barriers where needed (default)</string>
++    <string name="doris_barriers_full">Doris: real barriers at every wait (build 18)</string>
+     <string name="doris_barriers_tiled">Doris: real barriers + tiled-cache barriers</string>
+     <string name="doris_async_shader_wait">Wait for new shaders</string>
+     <string name="doris_async_shader_wait_description">Only matters with asynchronous shaders on. Eden hides anything whose shader is still compiling, so new places flicker as things pop in. Doris first waits up to this long per frame for the shader to finish: fewer pop-ins, at the cost of short pauses while new shaders compile.</string>
+diff --git a/src/common/doris_perf.cpp b/src/common/doris_perf.cpp
+index 6a10d0713..5e6aec81b 100644
+--- a/src/common/doris_perf.cpp
++++ b/src/common/doris_perf.cpp
+@@ -49,6 +49,9 @@ std::once_flag start_flag;
+ 
+ std::array<std::atomic<std::uint64_t>, static_cast<size_t>(Count::Max)> counters{};
+ std::array<std::atomic<std::uint64_t>, static_cast<size_t>(Wait::Max)> wait_ns{};
++// Texture events named in the report (see NoteTexture).
++std::mutex note_mutex;
++std::array<std::map<std::string, std::uint32_t>, static_cast<size_t>(Note::Max)> notes;
+ std::array<std::atomic<std::uint64_t>, static_cast<size_t>(GpuPart::Max)> gpu_ns{};
+ std::array<std::atomic<std::uint64_t>, static_cast<size_t>(Gauge::Max)> gauge_now{};
+ std::array<std::atomic<std::uint64_t>, static_cast<size_t>(Gauge::Max)> gauge_max{};
+@@ -410,10 +413,19 @@ void ReportLoop() {
+             return frame_ms[std::min(frame_ms.size() - 1,
+                                      static_cast<size_t>(p * static_cast<double>(frame_ms.size())))];
+         };
++        // The device's clock time, to match the report with videos of the screen.
++        char clock_text[16] = "?";
++        {
++            const std::time_t now_time = std::time(nullptr);
++            std::tm local{};
++            if (localtime_r(&now_time, &local) != nullptr) {
++                std::strftime(clock_text, sizeof(clock_text), "%H:%M:%S", &local);
++            }
++        }
+         LOG_INFO(Frontend,
+                  "Doris perf: {:.1f} fps | frame ms p50 {:.1f} p95 {:.1f} p99 {:.1f} max {:.1f} | "
+-                 "frames over 40 ms: {}",
+-                 fps, pct(0.50), pct(0.95), pct(0.99), frame_ms.back(), slow);
++                 "frames over 40 ms: {} | clock {}",
++                 fps, pct(0.50), pct(0.95), pct(0.99), frame_ms.back(), slow, clock_text);
+ 
+ #ifdef DORIS_PERF_PROCFS
+         // CPU time per thread name over the interval, as % of one core; last core it ran on.
+@@ -522,8 +534,9 @@ void ReportLoop() {
+                  "submit, {:.1f} protection changes, {:.1f} wait-for-idles ({:.1f} redundant "
+                  "barriers skipped, {:.1f} in an open render pass, {:.1f} with no storage writes by "
+                  "draws since the previous one), {:.1f} tiled-cache barriers | textures: {} "
+-                 "uploads ({} over "
+-                 "GPU-drawn contents), garbage collector removed {} ({} copies back started, {} "
++                 "uploads ({} over GPU-drawn contents), game writes next to GPU-drawn ones {} "
++                 "(contents kept {}, changed {}), garbage collector removed {} ({} copies back "
++                 "started, {} "
+                  "removals called off, {} with GPU-drawn contents lost) | GPU memory {} MiB (max "
+                  "{}), collection from {} MiB, aggressive from {} MiB",
+                  per_frame(count_of(Count::WorkerWakeups)),
+@@ -534,13 +547,45 @@ void ReportLoop() {
+                  per_frame(count_of(Count::WaitForIdleInRenderPass)),
+                  per_frame(count_of(Count::WaitForIdleNoDrawWrites)),
+                  per_frame(count_of(Count::TiledCacheBarriers)), count_of(Count::TextureUploads),
+-                 count_of(Count::TextureUploadsOverGpuData), count_of(Count::GcRemoved),
++                 count_of(Count::TextureUploadsOverGpuData),
++                 count_of(Count::TextureNeighbourWrites), count_of(Count::TextureNeighbourKept),
++                 count_of(Count::TextureNeighbourChanged), count_of(Count::GcRemoved),
+                  count_of(Count::GcDownloaded), count_of(Count::GcCancelled),
+                  count_of(Count::GcDroppedGpuData),
+                  gauge_of(Gauge::TextureCacheMemory),
+                  gauges_max[static_cast<size_t>(Gauge::TextureCacheMemory)],
+                  gauge_of(Gauge::TextureCacheExpected), gauge_of(Gauge::TextureCacheCritical));
+ 
++        // Which textures lost GPU-drawn contents, and how.
++        {
++            std::array<std::map<std::string, std::uint32_t>, static_cast<size_t>(Note::Max)> taken;
++            {
++                std::scoped_lock lock{note_mutex};
++                taken.swap(notes);
++            }
++            static constexpr std::array<const char*, static_cast<size_t>(Note::Max)> NOTE_NAMES{
++                "uploaded again over GPU-drawn contents",
++                "own bytes changed by the game's code",
++                "removed with GPU-drawn contents lost",
++            };
++            for (size_t kind = 0; kind < taken.size(); ++kind) {
++                if (taken[kind].empty()) {
++                    continue;
++                }
++                std::vector<std::pair<std::string, std::uint32_t>> sorted(taken[kind].begin(),
++                                                                          taken[kind].end());
++                std::ranges::sort(sorted, [](const auto& a, const auto& b) {
++                    return a.second > b.second;
++                });
++                std::string list;
++                for (size_t i = 0; i < sorted.size() && i < 8; ++i) {
++                    list += fmt::format("{}{} x{}", list.empty() ? "" : ", ", sorted[i].first,
++                                        sorted[i].second);
++                }
++                LOG_INFO(Frontend, "Doris textures {}: {}", NOTE_NAMES[kind], list);
++            }
++        }
++
+         // The longest hitches, in the order they happened.
+         std::ranges::sort(window_hitches,
+                           [](const Hitch& a, const Hitch& b) { return a.frame_ms > b.frame_ms; });
+@@ -615,6 +660,17 @@ ScopedWait::~ScopedWait() {
+                                                 std::memory_order_relaxed);
+ }
+ 
++void NoteTexture(Note kind, std::string description) {
++    if (!Enabled()) {
++        return;
++    }
++    std::scoped_lock lock{note_mutex};
++    auto& map = notes[static_cast<size_t>(kind)];
++    if (map.size() < 256 || map.contains(description)) {
++        ++map[std::move(description)];
++    }
++}
++
+ void SetGauge(Gauge gauge, std::uint64_t value) {
+     const auto index = static_cast<size_t>(gauge);
+     gauge_now[index].store(value, std::memory_order_relaxed);
+diff --git a/src/common/doris_perf.h b/src/common/doris_perf.h
+index efb0fd9a1..4b0ccea92 100644
+--- a/src/common/doris_perf.h
++++ b/src/common/doris_perf.h
+@@ -4,6 +4,7 @@
+ #pragma once
+ 
+ #include <chrono>
++#include <string>
+ #include <cstdint>
+ 
+ namespace Doris::Perf {
+@@ -39,6 +40,12 @@ enum class Count : int {
+     GcDownloaded,
+     /// ... that the GPU had drawn into but could not be copied back (their contents are lost).
+     GcDroppedGpuData,
++    /// The game's code wrote to a page shared with a GPU-drawn texture (NCE write fault).
++    TextureNeighbourWrites,
++    /// ... and at the texture's next use its own bytes were unchanged (GPU contents kept).
++    TextureNeighbourKept,
++    /// ... or changed (uploaded again from guest memory, as Eden always did).
++    TextureNeighbourChanged,
+     /// Doris cleanup: removals called off because the texture was used or changed meanwhile.
+     GcCancelled,
+     /// Full barriers skipped because nothing was recorded since the previous one.
+@@ -109,6 +116,20 @@ enum class Wait : int {
+     Max,
+ };
+ 
++/// Kinds of texture events the report names textures for (size and format, most frequent first).
++enum class Note : int {
++    /// Uploaded again from guest memory over contents the GPU had drawn.
++    UploadOverGpuData,
++    /// The game's code changed bytes of a GPU-drawn texture (on a page it wrote to).
++    NeighbourChanged,
++    /// Removed by the garbage collector with GPU-drawn contents that could not be copied back.
++    GcLostGpuData,
++    Max,
++};
++
++/// Notes a texture event (does nothing while the report is off).
++void NoteTexture(Note kind, std::string description);
++
+ /// Measures wall time spent in a scope: on the GPU emulation thread only, or on any thread when
+ /// any_thread is true.
+ class ScopedWait {
+diff --git a/src/common/settings.h b/src/common/settings.h
+index 09f4e586b..2d1013467 100644
+--- a/src/common/settings.h
++++ b/src/common/settings.h
+@@ -601,7 +601,11 @@ struct Values {
+     // 1 = Doris: wait-for-idle is a full memory barrier, and every compute dispatch is followed
+     //     by a barrier that makes its writes visible to draws, indirect arguments and copies,
+     // 2 = Doris as 1, plus the game's tiled-cache barriers (a no-op in Eden) become full barriers.
+-    SwitchableSetting<u32> doris_gpu_barriers{linkage, 1, "doris_gpu_barriers",
++    // 3 = Doris as 1, except that a wait-for-idle with no draw since the previous one that wrote
++    //     storage buffers or images (or used transform feedback) records nothing and leaves the
++    //     render pass open: compute, uploads, copies and render pass ends have barriers of their
++    //     own (build 18: 113 of TotK's 130 wait-for-idles per frame were like that).
++    SwitchableSetting<u32> doris_gpu_barriers{linkage, 3, "doris_gpu_barriers",
+                                               Category::RendererAdvanced};
+     // Texture cleanup. 0 = Eden's rules (copies back wait for the GPU once per cleanup pass).
+     // 1 = Doris: copies back never wait for the GPU (a texture is removed once its copy is done,
+diff --git a/src/core/memory.cpp b/src/core/memory.cpp
+index 013e83562..9f84b0361 100644
+--- a/src/core/memory.cpp
++++ b/src/core/memory.cpp
+@@ -757,7 +757,8 @@ struct Memory::Impl {
+         };
+         auto& gpu = system.GPU();
+         gpu_device_memory->ApplyOpOnPointer(
+-            p, scratch_buffers[core], [&](DAddr address) { gpu.InvalidateRegion(address, size); });
++            p, scratch_buffers[core],
++            [&](DAddr address) { gpu.DorisInvalidateFromFault(address, size); });
+     }
+ 
+     Core::System& system;
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 6f3bd92f6..0af568863 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -180,7 +180,13 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
+ template <class P>
+ void BufferCache<P>::DownloadMemory(DAddr device_addr, u64 size) {
+     ForEachBufferInRange(device_addr, size, [&](BufferId, Buffer& buffer) {
+-        DownloadBufferMemory(buffer, device_addr, size);
++        // Eden (Doris): only the part of the range inside this buffer (the download offsets are
++        // relative to it, and the rest belongs to the next buffer's turn).
++        const DAddr begin = (std::max)(device_addr, buffer.CpuAddr());
++        const DAddr end = (std::min)(device_addr + size, buffer.CpuAddr() + buffer.SizeBytes());
++        if (begin < end) {
++            DownloadBufferMemory(buffer, begin, end - begin);
++        }
+     });
+ }
+ 
+diff --git a/src/video_core/gpu.cpp b/src/video_core/gpu.cpp
+index baa8c39d2..14e15dbb3 100644
+--- a/src/video_core/gpu.cpp
++++ b/src/video_core/gpu.cpp
+@@ -231,6 +231,11 @@ struct GPU::Impl {
+         gpu_thread.InvalidateRegion(addr, size);
+     }
+ 
++    /// Eden (Doris): invalidation for a write fault of the game's (NCE) code.
++    void DorisInvalidateFromFault(DAddr addr, u64 size) {
++        renderer->ReadRasterizer()->DorisInvalidateFromFault(addr, size);
++    }
++
+     bool OnCPUWrite(DAddr addr, u64 size) {
+         return renderer->ReadRasterizer()->OnCPUWrite(addr, size);
+     }
+@@ -520,6 +525,10 @@ void GPU::InvalidateRegion(DAddr addr, u64 size) {
+     impl->InvalidateRegion(addr, size);
+ }
+ 
++void GPU::DorisInvalidateFromFault(DAddr addr, u64 size) {
++    impl->DorisInvalidateFromFault(addr, size);
++}
++
+ bool GPU::OnCPUWrite(DAddr addr, u64 size) {
+     return impl->OnCPUWrite(addr, size);
+ }
+diff --git a/src/video_core/gpu.h b/src/video_core/gpu.h
+index 75956ea19..c4e9371d4 100644
+--- a/src/video_core/gpu.h
++++ b/src/video_core/gpu.h
+@@ -250,6 +250,9 @@ public:
+     /// Notify rasterizer that any caches of the specified region should be invalidated
+     void InvalidateRegion(DAddr addr, u64 size);
+ 
++    /// Eden (Doris): invalidation for a write fault of the game's (NCE) code.
++    void DorisInvalidateFromFault(DAddr addr, u64 size);
++
+     /// Notify rasterizer that CPU is trying to write this area. It returns true if the area is
+     /// sensible, false otherwise, addr and size must be a valid combination
+     bool OnCPUWrite(DAddr addr, u64 size);
+diff --git a/src/video_core/rasterizer_interface.h b/src/video_core/rasterizer_interface.h
+index 481efbf53..07f8c9b94 100644
+--- a/src/video_core/rasterizer_interface.h
++++ b/src/video_core/rasterizer_interface.h
+@@ -96,6 +96,12 @@ public:
+ 
+     virtual RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) = 0;
+ 
++    /// Eden (Doris): the invalidation for a write fault of the game's (NCE) code: the write is
++    /// still waiting, so caches can still see the bytes as they were before it.
++    virtual void DorisInvalidateFromFault(DAddr addr, u64 size) {
++        OnCacheInvalidation(addr, size);
++    }
++
+     /// Notify rasterizer that any caches of the specified region should be invalidated
+     virtual void InvalidateRegion(DAddr addr, u64 size,
+                                   VideoCommon::CacheType which = VideoCommon::CacheType::All) = 0;
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index ecda08755..12e3780f7 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -812,6 +812,24 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
+     pipeline_cache.InvalidateRegion(addr, size);
+ }
+ 
++void RasterizerVulkan::DorisInvalidateFromFault(DAddr addr, u64 size) {
++    if (addr == 0 || size == 0) {
++        return;
++    }
++    {
++        std::scoped_lock lock{texture_cache.mutex};
++        // Eden (Doris): GPU-drawn images on the page keep their contents unless the write
++        // changes their own bytes (the game's write is still waiting, so the images' bytes are
++        // seen as they were before it).
++        texture_cache.DorisWriteMemoryFromFault(addr, size);
++    }
++    {
++        std::scoped_lock lock{buffer_cache.mutex};
++        buffer_cache.WriteMemory(addr, size);
++    }
++    pipeline_cache.InvalidateRegion(addr, size);
++}
++
+ void RasterizerVulkan::InvalidateGPUCache() {
+     gpu.InvalidateGPUCache();
+ }
+@@ -916,10 +934,19 @@ void RasterizerVulkan::WaitForIdle() {
+     if (scheduler.IsRenderPassActive()) {
+         Doris::Perf::Add(Doris::Perf::Count::WaitForIdleInRenderPass);
+     }
+-    if (!doris_draw_writes_since_wfi) {
++    const bool draw_writes = doris_draw_writes_since_wfi;
++    if (!draw_writes) {
+         Doris::Perf::Add(Doris::Perf::Count::WaitForIdleNoDrawWrites);
+     }
+     doris_draw_writes_since_wfi = false;
++    if (Settings::values.doris_gpu_barriers.GetValue() == 3 && !draw_writes) {
++        // Eden (Doris): nothing written since the previous wait-for-idle needs this barrier to
++        // be seen (compute dispatches, uploads, copies and render pass ends carry their own),
++        // so the GPU is not stopped and the render pass stays open.
++        query_cache.NotifyWFI();
++        fence_manager.SignalOrdering();
++        return;
++    }
+     if (Settings::values.doris_gpu_barriers.GetValue() != 0) {
+         // Eden (Doris): the event wait below has TOP_OF_PIPE as its destination and no memory
+         // barrier, so Vulkan guarantees neither ordering nor visibility of earlier writes. On
+@@ -960,7 +987,7 @@ void RasterizerVulkan::FragmentBarrier() {
+ void RasterizerVulkan::TiledCacheBarrier() {
+     Doris::Perf::Add(Doris::Perf::Count::TiledCacheBarriers);
+     // TODO: Implementing tiled barriers requires rewriting a good chunk of the Vulkan backend
+-    if (Settings::values.doris_gpu_barriers.GetValue() >= 2) {
++    if (Settings::values.doris_gpu_barriers.GetValue() == 2) {
+         DorisFullBarrier();
+     }
+ }
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index ac4df0d6a..74aa0a75c 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -106,6 +106,7 @@ public:
+                           VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
+     void InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) override;
+     void OnCacheInvalidation(DAddr addr, u64 size) override;
++    void DorisInvalidateFromFault(DAddr addr, u64 size) override;
+     bool OnCPUWrite(DAddr addr, u64 size) override;
+     void InvalidateGPUCache() override;
+     void UnmapMemory(DAddr addr, u64 size) override;
+diff --git a/src/video_core/texture_cache/image_base.h b/src/video_core/texture_cache/image_base.h
+index ad1399aee..916caab12 100644
+--- a/src/video_core/texture_cache/image_base.h
++++ b/src/video_core/texture_cache/image_base.h
+@@ -57,6 +57,14 @@ struct AliasedImage {
+ 
+ struct NullImageParams {};
+ 
++/// Eden (Doris): a page the game's code wrote to (NCE write fault) while the GPU had drawn into
++/// the image. Holds the image's bytes on that page as they were just before the write; the page
++/// stays untracked for this image until its next use decides whether the write reached them.
++struct DorisTouchedPage {
++    VAddr page;
++    std::vector<u8> before;
++};
++
+ struct ImageBase {
+     explicit ImageBase(const ImageInfo& info, GPUVAddr gpu_addr, VAddr cpu_addr);
+     explicit ImageBase(const NullImageParams&);
+@@ -120,6 +128,9 @@ struct ImageBase {
+     std::vector<AliasedImage> aliased_images;
+     std::vector<ImageId> overlapping_images;
+     ImageMapId map_view_id{};
++
++    /// Eden (Doris): pages written by the game's code next to (or over) GPU-drawn contents.
++    std::vector<DorisTouchedPage> doris_touched_pages;
+ };
+ 
+ struct ImageMapView {
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index fd6d6c0c6..51917f35e 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -25,6 +25,7 @@
+ #include "video_core/engines/kepler_compute.h"
+ #include "video_core/guest_memory.h"
+ #include "video_core/host1x/gpu_device_memory_manager.h"
++#include "video_core/texture_cache/formatter.h"
+ #include "video_core/texture_cache/image_view_base.h"
+ #include "video_core/texture_cache/samples_helper.h"
+ #include "video_core/texture_cache/texture_cache_base.h"
+@@ -40,6 +41,25 @@ using VideoCore::Surface::PixelFormat;
+ using VideoCore::Surface::SurfaceType;
+ using namespace Common::Literals;
+ 
++/// Eden (Doris): a texture's shape and format for the performance report.
++[[nodiscard]] inline std::string DorisDescribeImage(const ImageBase& image) {
++    const ImageInfo& info = image.info;
++    std::string text = info.type == ImageType::e3D
++                           ? fmt::format("{}x{}x{}", info.size.width, info.size.height,
++                                         info.size.depth)
++                           : fmt::format("{}x{}", info.size.width, info.size.height);
++    if (info.resources.layers > 1) {
++        text += fmt::format(" L{}", info.resources.layers);
++    }
++    if (info.resources.levels > 1) {
++        text += fmt::format(" M{}", info.resources.levels);
++    }
++    if (info.num_samples > 1) {
++        text += fmt::format(" MSAA{}", info.num_samples);
++    }
++    return fmt::format("{} {}", text, info.format);
++}
++
+ template <class P>
+ TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManager& device_memory_)
+     : runtime{runtime_}, device_memory{device_memory_} {
+@@ -187,6 +207,7 @@ void TextureCache<P>::EdenRunGarbageCollector() {
+         Doris::Perf::Add(Doris::Perf::Count::GcRemoved);
+         if (!must_download && True(image.flags & ImageFlagBits::GpuModified)) {
+             Doris::Perf::Add(Doris::Perf::Count::GcDroppedGpuData);
++            DorisNoteGcLost(image);
+         }
+         if (must_download) {
+             Doris::Perf::Add(Doris::Perf::Count::GcDownloaded);
+@@ -256,6 +277,19 @@ void TextureCache<P>::EdenRunGarbageCollector() {
+     }
+ }
+ 
++template <class P>
++void TextureCache<P>::DorisNoteGcLost(const ImageBase& image) {
++    if (!Doris::Perf::Enabled()) {
++        return;
++    }
++    const char* const why = True(image.flags & ImageFlagBits::CpuModified) ? "CPU-written"
++                            : True(image.flags & ImageFlagBits::BadOverlap) ? "bad overlap"
++                            : image.info.num_samples > 1                    ? "MSAA"
++                                                                            : "other";
++    Doris::Perf::NoteTexture(Doris::Perf::Note::GcLostGpuData,
++                             fmt::format("{} ({})", DorisDescribeImage(image), why));
++}
++
+ template <class P>
+ void TextureCache<P>::DorisRunGarbageCollector() {
+     // Eden (Doris) texture cleanup. Same rules as Eden's, except:
+@@ -326,6 +360,7 @@ void TextureCache<P>::DorisRunGarbageCollector() {
+         Doris::Perf::Add(Doris::Perf::Count::GcRemoved);
+         if (True(image.flags & ImageFlagBits::GpuModified)) {
+             Doris::Perf::Add(Doris::Perf::Count::GcDroppedGpuData);
++            DorisNoteGcLost(image);
+         }
+         if (True(image.flags & ImageFlagBits::Tracked)) {
+             UntrackImage(image, image_id);
+@@ -426,6 +461,8 @@ bool TextureCache<P>::DorisIsPendingRemoval(ImageId image_id) const noexcept {
+ 
+ template <class P>
+ void TextureCache<P>::TickFrame() {
++    // Eden (Doris): settle pending writes next to GPU drawings before the cleanup looks at them.
++    DorisResolveAllTouched();
+     // If we can obtain the memory info, use it instead of the estimate.
+     if (runtime.CanReportMemoryUsage()) {
+         total_used_memory = runtime.GetDeviceMemoryUsage();
+@@ -865,6 +902,152 @@ void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
+     });
+ }
+ 
++template <class P>
++void TextureCache<P>::DorisWriteMemoryFromFault(DAddr cpu_addr, size_t size) {
++    // Eden (Doris): Eden marks every image on a written page as changed by the CPU, and at its
++    // next use uploads it again from guest memory. For an image the GPU drew into, guest memory
++    // holds old contents, so a write by the game's code anywhere on a page the image shares
++    // (with other data next to it) replaced what the GPU had drawn with those old contents
++    // (TotK: up to 40 times a second). Here the image's bytes on the page are kept as they were
++    // before the write, the page is released for the write, and the image's next use compares:
++    // only if its own bytes changed is it uploaded again, as in Eden.
++    constexpr u64 PAGE = Core::DEVICE_PAGESIZE;
++    constexpr size_t MAX_TOUCHED_PAGES = 8;
++    const DAddr write_begin = Common::AlignDown(cpu_addr, PAGE);
++    const DAddr write_end = Common::AlignUp(cpu_addr + size, PAGE);
++    ForEachImageInRegion(cpu_addr, size, [&](ImageId image_id, Image& image) {
++        if (True(image.flags & ImageFlagBits::CpuModified)) {
++            return;
++        }
++        const VAddr image_end = image.cpu_addr + image.guest_size_bytes;
++        const bool can_keep = True(image.flags & ImageFlagBits::GpuModified) &&
++                              True(image.flags & ImageFlagBits::Tracked) &&
++                              False(image.flags & ImageFlagBits::Sparse) &&
++                              image.cpu_addr < ~(1ULL << 40);
++        if (can_keep) {
++            const bool listed = !image.doris_touched_pages.empty();
++            bool overflow = false;
++            const DAddr begin = (std::max)(write_begin, Common::AlignDown(image.cpu_addr, PAGE));
++            const DAddr end = (std::min)(write_end, Common::AlignUp(image_end, PAGE));
++            for (DAddr page = begin; page < end; page += PAGE) {
++                if (std::ranges::any_of(image.doris_touched_pages, [page](const auto& touched) {
++                        return touched.page == page;
++                    })) {
++                    continue;
++                }
++                if (image.doris_touched_pages.size() >= MAX_TOUCHED_PAGES) {
++                    overflow = true;
++                    break;
++                }
++                const VAddr bytes_begin = (std::max)(page, image.cpu_addr);
++                const VAddr bytes_end = (std::min)(page + PAGE, image_end);
++                DorisTouchedPage touched{.page = page, .before = {}};
++                touched.before.resize(bytes_end - bytes_begin);
++                device_memory.ReadBlockUnsafe(bytes_begin, touched.before.data(),
++                                              touched.before.size());
++                image.doris_touched_pages.push_back(std::move(touched));
++                // Release the page for the write (this image no longer tracks it).
++                device_memory.UpdatePagesCachedCount(page, PAGE, -1);
++            }
++            if (!overflow) {
++                if (!listed && !image.doris_touched_pages.empty()) {
++                    doris_touched_images.push_back(image_id);
++                }
++                Doris::Perf::Add(Doris::Perf::Count::TextureNeighbourWrites);
++                return;
++            }
++        }
++        image.flags |= ImageFlagBits::CpuModified;
++        if (True(image.flags & ImageFlagBits::Tracked)) {
++            UntrackImage(image, image_id);
++        }
++    });
++}
++
++template <class P>
++bool TextureCache<P>::DorisResolveTouched(ImageId image_id, ImageBase& image) {
++    if (image.doris_touched_pages.empty()) {
++        return false;
++    }
++    constexpr u64 PAGE = Core::DEVICE_PAGESIZE;
++    std::vector<DorisTouchedPage> pages = std::move(image.doris_touched_pages);
++    image.doris_touched_pages.clear();
++    // Track the pages again before looking: a write after this point faults (and waits for the
++    // texture cache lock), so none can slip through unseen.
++    for (const DorisTouchedPage& touched : pages) {
++        device_memory.UpdatePagesCachedCount(touched.page, PAGE, 1);
++    }
++    std::array<u8, PAGE> now;
++    bool changed = false;
++    for (const DorisTouchedPage& touched : pages) {
++        const VAddr bytes_begin = (std::max)(touched.page, image.cpu_addr);
++        device_memory.ReadBlockUnsafe(bytes_begin, now.data(), touched.before.size());
++        if (std::memcmp(now.data(), touched.before.data(), touched.before.size()) != 0) {
++            changed = true;
++            break;
++        }
++    }
++    if (!changed) {
++        // Only data next to the image was written: what the GPU drew stays.
++        Doris::Perf::Add(Doris::Perf::Count::TextureNeighbourKept);
++        return false;
++    }
++    Doris::Perf::Add(Doris::Perf::Count::TextureNeighbourChanged);
++    if (Doris::Perf::Enabled()) {
++        Doris::Perf::NoteTexture(Doris::Perf::Note::NeighbourChanged, DorisDescribeImage(image));
++    }
++    image.flags |= ImageFlagBits::CpuModified;
++    if (True(image.flags & ImageFlagBits::Tracked)) {
++        UntrackImage(image, image_id);
++    }
++    return true;
++}
++
++template <class P>
++void TextureCache<P>::DorisResolveAllTouched() {
++    if (doris_touched_images.empty()) {
++        return;
++    }
++    std::vector<ImageId> images = std::move(doris_touched_images);
++    doris_touched_images.clear();
++    for (const ImageId image_id : images) {
++        DorisResolveTouched(image_id, slot_images[image_id]);
++    }
++}
++
++template <class P>
++void TextureCache<P>::DorisDropTouched(ImageBase& image) {
++    for (const DorisTouchedPage& touched : image.doris_touched_pages) {
++        device_memory.UpdatePagesCachedCount(touched.page, Core::DEVICE_PAGESIZE, 1);
++    }
++    image.doris_touched_pages.clear();
++}
++
++template <class P>
++void TextureCache<P>::DorisUpdateImagePages(ImageBase& image, s32 delta) {
++    if (image.doris_touched_pages.empty()) {
++        device_memory.UpdatePagesCachedCount(image.cpu_addr, image.guest_size_bytes, delta);
++        return;
++    }
++    constexpr u64 PAGE = Core::DEVICE_PAGESIZE;
++    boost::container::small_vector<VAddr, 8> pages;
++    for (const DorisTouchedPage& touched : image.doris_touched_pages) {
++        pages.push_back(touched.page);
++    }
++    std::ranges::sort(pages);
++    const VAddr image_end = image.cpu_addr + image.guest_size_bytes;
++    VAddr cursor = image.cpu_addr;
++    for (const VAddr page : pages) {
++        if (page > cursor) {
++            device_memory.UpdatePagesCachedCount(cursor, page - cursor, delta);
++        }
++        cursor = (std::max)(cursor, page + PAGE);
++    }
++    if (cursor < image_end) {
++        device_memory.UpdatePagesCachedCount(cursor, image_end - cursor, delta);
++    }
++}
++
+ template <class P>
+ bool TextureCache<P>::IsDownloadable(const ImageBase& image) const noexcept {
+     if (!image.IsSafeGpuCopy()) {
+@@ -882,6 +1065,7 @@ bool TextureCache<P>::IsDownloadable(const ImageBase& image) const noexcept {
+ 
+ template <class P>
+ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
++    DorisResolveAllTouched();
+     boost::container::small_vector<ImageId, 16> images;
+     ForEachImageInRegion(cpu_addr, size, [this, &images](ImageId image_id, ImageBase& image) {
+         if (!IsDownloadable(image)) {
+@@ -1383,6 +1567,9 @@ void TextureCache<P>::DownloadImageIntoBuffer(typename TextureCache<P>::Image* i
+ 
+ template <class P>
+ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
++    if (!image.doris_touched_pages.empty()) {
++        DorisResolveTouched(image_id, image);
++    }
+     if (False(image.flags & ImageFlagBits::CpuModified)) {
+         // Only upload modified images
+         return;
+@@ -1392,6 +1579,10 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
+     Doris::Perf::Add(Doris::Perf::Count::TextureUploads);
+     if (True(image.flags & ImageFlagBits::GpuModified)) {
+         Doris::Perf::Add(Doris::Perf::Count::TextureUploadsOverGpuData);
++        if (Doris::Perf::Enabled()) {
++            Doris::Perf::NoteTexture(Doris::Perf::Note::UploadOverGpuData,
++                                     DorisDescribeImage(image));
++        }
+     }
+ 
+     TrackImage(image, image_id);
+@@ -1851,6 +2042,8 @@ ImageId TextureCache<P>::InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
+ 
+ template <class P>
+ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DAddr cpu_addr) {
++    // Eden (Doris): overlapping images are copied into the new one; settle their pending writes.
++    DorisResolveAllTouched();
+     ImageInfo new_info = info;
+     const size_t size_bytes = CalculateGuestSizeInBytes(new_info);
+     const bool broken_views = runtime.HasBrokenTextureViewFormats();
+@@ -2667,8 +2860,10 @@ void TextureCache<P>::UntrackImage(ImageBase& image, ImageId image_id) {
+     image.flags &= ~ImageFlagBits::Tracked;
+     if (False(image.flags & ImageFlagBits::Sparse)) {
+         if (image.cpu_addr < ~(1ULL << 40)) {
+-            device_memory.UpdatePagesCachedCount(image.cpu_addr, image.guest_size_bytes, -1);
++            // Eden (Doris): pages written next to GPU drawings are already untracked.
++            DorisUpdateImagePages(image, -1);
+         }
++        image.doris_touched_pages.clear();
+         return;
+     }
+     ASSERT(True(image.flags & ImageFlagBits::Registered));
+@@ -2687,7 +2882,12 @@ template <class P>
+ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
+     // Eden (Doris): a texture waiting for its copy back can also be deleted another way.
+     DorisForgetPendingRemoval(image_id);
++    std::erase(doris_touched_images, image_id);
+     ImageBase& image = slot_images[image_id];
++    if (!image.doris_touched_pages.empty()) {
++        // Still tracked (callers untrack first), so this only happens if it was not tracked.
++        image.doris_touched_pages.clear();
++    }
+     if (image.HasScaled()) {
+         total_used_memory -= GetScaledImageSizeBytes(image);
+     }
+@@ -2876,6 +3076,8 @@ template <class P>
+ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool invalidate) {
+     Image& image = slot_images[image_id];
+     if (invalidate) {
++        // Eden (Doris): fully overwritten now, so earlier writes next to it no longer matter.
++        DorisDropTouched(image);
+         image.flags &= ~(ImageFlagBits::CpuModified | ImageFlagBits::GpuModified);
+         if (False(image.flags & ImageFlagBits::Tracked)) {
+             TrackImage(image, image_id);
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index b8371aa3f..e829bb05d 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -206,6 +206,11 @@ public:
+     /// Mark images in a range as modified from the CPU
+     void WriteMemory(DAddr cpu_addr, size_t size);
+ 
++    /// Eden (Doris): the game's code is about to write to [cpu_addr, cpu_addr + size) (an NCE
++    /// write fault on a tracked page). Images the GPU drew into keep their contents unless the
++    /// write turns out to have changed their own bytes (checked at their next use).
++    void DorisWriteMemoryFromFault(DAddr cpu_addr, size_t size);
++
+     /// Download contents of host images to guest memory in a region
+     void DownloadMemory(DAddr cpu_addr, size_t size);
+ 
+@@ -395,8 +400,21 @@ private:
+     void DorisForgetPendingRemoval(ImageId image_id);
+     /// Eden (Doris): true if the image is waiting for its copy back before removal.
+     [[nodiscard]] bool DorisIsPendingRemoval(ImageId image_id) const noexcept;
++    /// Eden (Doris): names a texture removed with GPU-drawn contents lost in the report.
++    void DorisNoteGcLost(const ImageBase& image);
+     /// Eden (Doris): memory use above which the garbage collector is under pressure.
+     [[nodiscard]] u64 DorisPressureThreshold() const noexcept;
++    /// Eden (Doris): decides for an image with written-to pages whether the game's writes
++    /// changed its bytes (then it is CPU-modified, as in Eden) or only their neighbours (then
++    /// its GPU-drawn contents stay). The pages are tracked again either way. True if changed.
++    bool DorisResolveTouched(ImageId image_id, ImageBase& image);
++    /// Eden (Doris): DorisResolveTouched for every image that has written-to pages.
++    void DorisResolveAllTouched();
++    /// Eden (Doris): forgets the written-to pages (the image is about to be fully overwritten).
++    void DorisDropTouched(ImageBase& image);
++    /// Eden (Doris): changes the page tracking count over a non-sparse image, except on its
++    /// written-to pages (which are not tracked for it).
++    void DorisUpdateImagePages(ImageBase& image, s32 delta);
+ 
+     /// Remove image views references from the cache
+     void RemoveImageViewReferences(std::span<const ImageViewId> removed_views);
+@@ -482,6 +500,8 @@ private:
+     };
+     std::vector<DorisPendingRemoval> doris_pending_removals;
+     size_t doris_pending_bytes = 0;
++    /// Eden (Doris): images that may have written-to pages (see DorisWriteMemoryFromFault).
++    std::vector<ImageId> doris_touched_images;
+ 
+     bool has_deleted_images = false;
+     bool is_rescaling = false;
+-- 
+2.43.0
+

@@ -1,0 +1,383 @@
+From 0dc9b700b010c7f525fbf97c013d7e9650a45ad3 Mon Sep 17 00:00:00 2001
+From: "Eden (Doris) build" <doris@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 20:50:49 -0500
+Subject: [PATCH 42/46] Eden (Doris): undo build 17's extra texture-removal
+ cancelling; report cache lock waits, copies of GPU-written bytes and
+ wait-for-idle details
+
+- Build 17 also called off a pending texture removal whenever another texture over the same
+  memory was created, removed or drawn into. In TotK that loop started 1850 copies back every
+  10 seconds (build 16: 156) and called most of them off again. Back to build 16's rules (sparse
+  textures still skipped, pressure threshold stays 2.45 GiB).
+- Report: GPU thread time waiting for the texture/buffer cache locks in draws, how long fence
+  handling holds them, how often the game wrote to pages with GPU-written bytes (Eden
+  #4490/#4531 copy those back first) and how long it waited; how many wait-for-idles came
+  inside a render pass and how many had no storage writes by draws before them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014Ps8wnhVXtSU7d88gGtyHX
+(cherry picked from commit 2008c1ec4c75c43db34d85adc32da226c2c6d9f1)
+---
+ src/common/doris_perf.cpp                     | 27 +++++++---
+ src/common/doris_perf.h                       | 17 +++++++
+ src/video_core/fence_manager.h                |  3 ++
+ .../renderer_vulkan/vk_graphics_pipeline.cpp  |  7 +++
+ .../renderer_vulkan/vk_graphics_pipeline.h    |  6 +++
+ .../renderer_vulkan/vk_rasterizer.cpp         | 18 ++++++-
+ .../renderer_vulkan/vk_rasterizer.h           |  2 +
+ src/video_core/texture_cache/texture_cache.h  | 49 ++-----------------
+ .../texture_cache/texture_cache_base.h        |  6 ---
+ 9 files changed, 76 insertions(+), 59 deletions(-)
+
+diff --git a/src/common/doris_perf.cpp b/src/common/doris_perf.cpp
+index 301369344..6a10d0713 100644
+--- a/src/common/doris_perf.cpp
++++ b/src/common/doris_perf.cpp
+@@ -487,7 +487,9 @@ void ReportLoop() {
+         LOG_INFO(Frontend,
+                  "Doris perf: per frame {:.2f} MiB uploaded, {:.2f} new staging buffers ({:.2f} "
+                  "MiB), {:.2f} MiB new GPU memory, GPU thread {:.2f} ms getting/freeing GPU "
+-                 "memory and {:.1f} ms waiting for the game's commands",
++                 "memory, {:.1f} ms waiting for the game's commands and {:.2f} ms for the cache "
++                 "locks (held {:.2f} ms by fence handling) | game wrote to pages with GPU-written "
++                 "bytes {} times (copied back first; the game waited {:.1f} ms in all)",
+                  static_cast<double>(counted[static_cast<size_t>(Count::UploadBytes)]) /
+                      (1024.0 * 1024.0) / frame_count,
+                  per_frame(counted[static_cast<size_t>(Count::StagingCreated)]),
+@@ -497,7 +499,11 @@ void ReportLoop() {
+                      counted[static_cast<size_t>(Count::GpuMemoryAllocatedBytes)]) /
+                      (1024.0 * 1024.0) / frame_count,
+                  ms_per_frame(waited[static_cast<size_t>(Wait::GpuMemory)]),
+-                 ms_per_frame(waited[static_cast<size_t>(Wait::GameCommands)]));
++                 ms_per_frame(waited[static_cast<size_t>(Wait::GameCommands)]),
++                 ms_per_frame(waited[static_cast<size_t>(Wait::CacheLock)]),
++                 ms_per_frame(waited[static_cast<size_t>(Wait::FenceFlushes)]),
++                 counted[static_cast<size_t>(Count::GpuWritesKept)],
++                 static_cast<double>(waited[static_cast<size_t>(Wait::KeepGpuWrites)]) / 1e6);
+         LOG_INFO(Frontend,
+                  "Doris perf: GPU work per frame {:.1f} ms (frame generation {:.1f} ms, output "
+                  "scaling {:.1f} ms) | cores: {}",
+@@ -514,7 +520,9 @@ void ReportLoop() {
+         LOG_INFO(Frontend,
+                  "Doris perf: per frame {:.0f} worker wake-ups, {:.1f} render passes cut by a "
+                  "submit, {:.1f} protection changes, {:.1f} wait-for-idles ({:.1f} redundant "
+-                 "barriers skipped), {:.1f} tiled-cache barriers | textures: {} uploads ({} over "
++                 "barriers skipped, {:.1f} in an open render pass, {:.1f} with no storage writes by "
++                 "draws since the previous one), {:.1f} tiled-cache barriers | textures: {} "
++                 "uploads ({} over "
+                  "GPU-drawn contents), garbage collector removed {} ({} copies back started, {} "
+                  "removals called off, {} with GPU-drawn contents lost) | GPU memory {} MiB (max "
+                  "{}), collection from {} MiB, aggressive from {} MiB",
+@@ -523,6 +531,8 @@ void ReportLoop() {
+                  per_frame(count_of(Count::ProtectCalls)),
+                  per_frame(count_of(Count::WaitForIdle)),
+                  per_frame(count_of(Count::BarriersSkipped)),
++                 per_frame(count_of(Count::WaitForIdleInRenderPass)),
++                 per_frame(count_of(Count::WaitForIdleNoDrawWrites)),
+                  per_frame(count_of(Count::TiledCacheBarriers)), count_of(Count::TextureUploads),
+                  count_of(Count::TextureUploadsOverGpuData), count_of(Count::GcRemoved),
+                  count_of(Count::GcDownloaded), count_of(Count::GcCancelled),
+@@ -551,8 +561,11 @@ void ReportLoop() {
+                      "Doris hitch: {:.0f} ms frame ({:.1f} s before this line; {} over {:.0f} ms "
+                      "in this window) | GPU thread busy {:.0f} ms, waited for the game's "
+                      "commands {:.0f} ms, for the GPU {:.1f} ms, for presentation {:.1f} ms, "
+-                     "getting/freeing GPU memory {:.1f} ms; game threads busy {:.0f} ms; Vulkan "
+-                     "worker waited for shaders {:.1f} ms | {} new pipelines, {} texture uploads, "
++                     "getting/freeing GPU memory {:.1f} ms, for the cache locks {:.1f} ms (fence "
++                     "handling held them {:.1f} ms); game threads busy {:.0f} ms, waited {:.1f} ms "
++                     "for {} copies of GPU-written bytes; "
++                     "Vulkan worker waited for shaders {:.1f} ms | {} new pipelines, {} texture "
++                     "uploads, "
+                      "{:.1f} MiB uploaded, {} new staging buffers ({:.0f} MiB), {:.0f} MiB new "
+                      "GPU memory, {} textures removed ({} copies back started), {} draws, {} "
+                      "dispatches, {} render passes, {} submits, {} wait-for-idles, {} protection "
+@@ -560,7 +573,9 @@ void ReportLoop() {
+                      hitch.frame_ms, std::chrono::duration<double>(now - hitch.end).count(),
+                      window_hitch_count, HITCH_MS, hitch.gpu_thread_cpu_ms, w(Wait::GameCommands),
+                      w(Wait::GpuFence), w(Wait::PresentFrame), w(Wait::GpuMemory),
+-                     hitch.game_cpu_ms, w(Wait::Shaders), c(Count::NewPipelines),
++                     w(Wait::CacheLock), w(Wait::FenceFlushes), hitch.game_cpu_ms,
++                     w(Wait::KeepGpuWrites),
++                     c(Count::GpuWritesKept), w(Wait::Shaders), c(Count::NewPipelines),
+                      c(Count::TextureUploads), mib(Count::UploadBytes), c(Count::StagingCreated),
+                      mib(Count::StagingCreatedBytes), mib(Count::GpuMemoryAllocatedBytes),
+                      c(Count::GcRemoved), c(Count::GcDownloaded), c(Count::Draws),
+diff --git a/src/common/doris_perf.h b/src/common/doris_perf.h
+index 26e763deb..efb0fd9a1 100644
+--- a/src/common/doris_perf.h
++++ b/src/common/doris_perf.h
+@@ -50,10 +50,18 @@ enum class Count : int {
+     StagingCreatedBytes,
+     /// GPU memory allocated for textures and buffers.
+     GpuMemoryAllocatedBytes,
++    /// The game's code wrote to a page holding GPU-written bytes, which were copied back first
++    /// (Eden #4531; not in this build without the newer Eden fixes, stays 0).
++    GpuWritesKept,
+     /// Memory protection changes for CPU write tracking.
+     ProtectCalls,
+     /// The game's "wait for idle" GPU commands.
+     WaitForIdle,
++    /// ... that came while a render pass was open (it has to be ended for the barrier).
++    WaitForIdleInRenderPass,
++    /// ... with no draw since the previous one that wrote storage buffers or images, or used
++    /// transform feedback (compute, uploads and copies have barriers of their own).
++    WaitForIdleNoDrawWrites,
+     /// The game's tiled-cache barriers.
+     TiledCacheBarriers,
+     Max,
+@@ -87,6 +95,15 @@ enum class Wait : int {
+     GpuFence,
+     /// Getting or freeing GPU memory (textures, buffers, staging memory).
+     GpuMemory,
++    /// The GPU emulation thread waiting for the texture and buffer cache locks (another thread
++    /// holds them).
++    CacheLock,
++    /// The game's code waiting (any thread) while GPU-written bytes on a page it writes to are
++    /// copied back first (Eden #4490/#4531).
++    KeepGpuWrites,
++    /// Finished GPU-to-guest copies being written out (fence thread) while holding the texture and
++    /// buffer cache locks.
++    FenceFlushes,
+     /// The GPU emulation thread waiting for the game to send GPU commands.
+     GameCommands,
+     Max,
+diff --git a/src/video_core/fence_manager.h b/src/video_core/fence_manager.h
+index 9a4b34f4b..1a3a5435b 100644
+--- a/src/video_core/fence_manager.h
++++ b/src/video_core/fence_manager.h
+@@ -16,6 +16,7 @@
+ #include <queue>
+ 
+ #include "common/doris_cores.h"
++#include "common/doris_perf.h"
+ #include "common/common_types.h"
+ #include "common/settings.h"
+ #include "common/thread.h"
+@@ -242,6 +243,8 @@ private:
+     void PopAsyncFlushes() {
+         {
+             std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
++            // Eden (Doris): the report shows how long the cache locks are held here.
++            const Doris::Perf::ScopedWait doris_wait{Doris::Perf::Wait::FenceFlushes, true};
+             texture_cache.PopAsyncFlushes();
+             buffer_cache.PopAsyncFlushes();
+         }
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index 4db3979ab..5c210c9c2 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -278,6 +278,13 @@ GraphicsPipeline::GraphicsPipeline(
+         num_image_elements += Shader::NumDescriptors(info->texture_descriptors);
+         num_image_elements += Shader::NumDescriptors(info->image_descriptors);
+         num_descriptor_entries += NumDescriptorEntries(*info);
++        doris_writes_memory = doris_writes_memory || info->stores_global_memory ||
++                              std::ranges::any_of(info->storage_buffers_descriptors,
++                                                  [](const auto& desc) { return desc.is_written; }) ||
++                              std::ranges::any_of(info->image_buffer_descriptors,
++                                                  [](const auto& desc) { return desc.is_written; }) ||
++                              std::ranges::any_of(info->image_descriptors,
++                                                  [](const auto& desc) { return desc.is_written; });
+     }
+     fragment_has_color0_output = stage_infos[NUM_STAGES - 1].stores_frag_color[0];
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+index 2a2021cb3..130a94b6a 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+@@ -88,6 +88,11 @@ public:
+         const std::array<const Shader::Info*, NUM_STAGES>& infos);
+ 
+     bool HasDynamicVertexInput() const noexcept { return key.state.dynamic_vertex_input; }
++
++    /// Eden (Doris): true if a shader of this pipeline writes storage buffers or images.
++    bool DorisWritesMemory() const noexcept {
++        return doris_writes_memory;
++    }
+     bool SupportsAlphaToCoverage() const noexcept {
+         return fragment_has_color0_output;
+     }
+@@ -185,6 +190,7 @@ private:
+     size_t num_image_elements{};
+     u32 num_textures{};
+     bool fragment_has_color0_output{};
++    bool doris_writes_memory{};
+ 
+     vk::DescriptorSetLayout descriptor_set_layout;
+     DescriptorAllocator descriptor_allocator;
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index e65aa64d9..ecda08755 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -247,11 +247,20 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+     if (!pipeline) {
+         return;
+     }
+-    std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
++    // Eden (Doris): the report measures how long another thread holds these up.
++    std::unique_lock buffer_lock{buffer_cache.mutex, std::defer_lock};
++    std::unique_lock texture_lock{texture_cache.mutex, std::defer_lock};
++    if (std::try_lock(buffer_lock, texture_lock) != -1) {
++        const Doris::Perf::ScopedWait doris_wait{Doris::Perf::Wait::CacheLock};
++        std::lock(buffer_lock, texture_lock);
++    }
+     // update engine as channel may be different.
+     pipeline->SetEngine(maxwell3d, gpu_memory);
+     if (!pipeline->Configure(is_indexed))
+         return;
++    if (pipeline->DorisWritesMemory() || maxwell3d->regs.transform_feedback_enabled != 0) {
++        doris_draw_writes_since_wfi = true;
++    }
+ 
+     UpdateDynamicStates(pipeline->HasDynamicVertexInput());
+ 
+@@ -904,6 +913,13 @@ void RasterizerVulkan::DorisFullBarrier() {
+ 
+ void RasterizerVulkan::WaitForIdle() {
+     Doris::Perf::Add(Doris::Perf::Count::WaitForIdle);
++    if (scheduler.IsRenderPassActive()) {
++        Doris::Perf::Add(Doris::Perf::Count::WaitForIdleInRenderPass);
++    }
++    if (!doris_draw_writes_since_wfi) {
++        Doris::Perf::Add(Doris::Perf::Count::WaitForIdleNoDrawWrites);
++    }
++    doris_draw_writes_since_wfi = false;
+     if (Settings::values.doris_gpu_barriers.GetValue() != 0) {
+         // Eden (Doris): the event wait below has TOP_OF_PIPE as its destination and no memory
+         // barrier, so Vulkan guarantees neither ordering nor visibility of earlier writes. On
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index ed1aa7933..ac4df0d6a 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -236,6 +236,8 @@ private:
+     u32 draw_counter = 0;
+     /// Eden (Doris): RecordedCommands() right after the last full barrier.
+     u64 doris_last_full_barrier = ~u64{0};
++    /// Eden (Doris, report only): a draw since the last wait-for-idle wrote storage memory.
++    bool doris_draw_writes_since_wfi = true;
+ };
+ 
+ } // namespace Vulkan
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index b3b1bdfec..fd6d6c0c6 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -268,7 +268,7 @@ void TextureCache<P>::DorisRunGarbageCollector() {
+     //   they go, GPU drawings included (Eden kept those until there was pressure, so they piled
+     //   up until it started removing everything older than 25 frames: TotK sat just above Eden's
+     //   threshold and re-uploaded 700 to 3500 textures every 10 seconds).
+-    // - The pressure threshold is 2.2 GiB (Eden 1.6 GiB of the 4 GiB budget); critical stays.
++    // - The pressure threshold is 2.45 GiB (Eden 1.6 GiB of the 4 GiB budget); critical stays.
+     const u64 pressure_threshold = DorisPressureThreshold();
+     constexpr size_t MAX_PENDING_REMOVALS = 64;
+     constexpr size_t MAX_PENDING_BYTES = 128_MiB;
+@@ -317,9 +317,6 @@ void TextureCache<P>::DorisRunGarbageCollector() {
+                     .gpu_tick = runtime.DorisCurrentTick(),
+                     .issue_frame = frame_tick,
+                     .modification_tick = image.modification_tick,
+-                    .global_modification_tick = modification_tick,
+-                    .cpu_addr = image.cpu_addr,
+-                    .cpu_addr_end = image.cpu_addr_end,
+                     .staging_bytes = image.unswizzled_size_bytes,
+                 });
+                 doris_pending_bytes += image.unswizzled_size_bytes;
+@@ -386,20 +383,7 @@ void TextureCache<P>::DorisProcessPendingRemovals() {
+             const bool used_since = image.lru_touch_frame >= removal.issue_frame;
+             const bool drawn_since = image.modification_tick != removal.modification_tick;
+             const bool written_by_cpu = True(image.flags & ImageFlagBits::CpuModified);
+-            // Another texture over the same guest memory drawn into since: its contents are
+-            // newer than this copy, which must not be written over them.
+-            bool neighbour_drawn = false;
+-            if (!used_since && !drawn_since && !written_by_cpu) {
+-                ForEachImageInRegion(
+-                    image.cpu_addr, image.cpu_addr_end - image.cpu_addr,
+-                    [&](ImageId other_id, ImageBase& other) {
+-                        if (other_id != removal.image_id &&
+-                            other.modification_tick > removal.global_modification_tick) {
+-                            neighbour_drawn = true;
+-                        }
+-                    });
+-            }
+-            if (used_since || drawn_since || written_by_cpu || neighbour_drawn) {
++            if (used_since || drawn_since || written_by_cpu) {
+                 // Still in use, or its contents changed: keep it.
+                 Doris::Perf::Add(Doris::Perf::Count::GcCancelled);
+                 runtime.FreeDeferredStagingBuffer(removal.staging);
+@@ -433,29 +417,6 @@ void TextureCache<P>::DorisForgetPendingRemoval(ImageId image_id) {
+     }
+ }
+ 
+-template <class P>
+-void TextureCache<P>::DorisCancelPendingOverlapping(VAddr begin, VAddr end, ImageId except) {
+-    if constexpr (DORIS_ASYNC_REMOVAL) {
+-        for (size_t index = 0; index < doris_pending_removals.size();) {
+-            DorisPendingRemoval& removal = doris_pending_removals[index];
+-            if (removal.image_id == except || removal.cpu_addr_end <= begin ||
+-                end <= removal.cpu_addr) {
+-                ++index;
+-                continue;
+-            }
+-            Doris::Perf::Add(Doris::Perf::Count::GcCancelled);
+-            doris_pending_bytes -= (std::min)(doris_pending_bytes, removal.staging_bytes);
+-            runtime.FreeDeferredStagingBuffer(removal.staging);
+-            doris_pending_removals.erase(doris_pending_removals.begin() +
+-                                         static_cast<std::ptrdiff_t>(index));
+-        }
+-    } else {
+-        static_cast<void>(begin);
+-        static_cast<void>(end);
+-        static_cast<void>(except);
+-    }
+-}
+-
+ template <class P>
+ bool TextureCache<P>::DorisIsPendingRemoval(ImageId image_id) const noexcept {
+     return std::ranges::any_of(doris_pending_removals, [image_id](const auto& removal) {
+@@ -2556,8 +2517,6 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
+     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
+                "Trying to register an already registered image");
+     image.flags |= ImageFlagBits::Registered;
+-    // Eden (Doris): a texture appearing over memory that a pending removal will write to.
+-    DorisCancelPendingOverlapping(image.cpu_addr, image.cpu_addr_end, image_id);
+     u64 tentative_size = (std::max)(image.guest_size_bytes, image.unswizzled_size_bytes);
+     if ((IsPixelFormatASTC(image.info.format) &&
+          True(image.flags & ImageFlagBits::AcceleratedUpload)) ||
+@@ -2726,11 +2685,9 @@ void TextureCache<P>::UntrackImage(ImageBase& image, ImageId image_id) {
+ 
+ template <class P>
+ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
+-    // Eden (Doris): a texture waiting for its copy back can also be deleted another way, and a
+-    // texture going away over the memory of another pending removal calls that one off.
++    // Eden (Doris): a texture waiting for its copy back can also be deleted another way.
+     DorisForgetPendingRemoval(image_id);
+     ImageBase& image = slot_images[image_id];
+-    DorisCancelPendingOverlapping(image.cpu_addr, image.cpu_addr_end, image_id);
+     if (image.HasScaled()) {
+         total_used_memory -= GetScaledImageSizeBytes(image);
+     }
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index 965f95de3..b8371aa3f 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -393,9 +393,6 @@ private:
+     void DorisProcessPendingRemovals();
+     /// Eden (Doris): drops a pending removal (the image is being deleted another way).
+     void DorisForgetPendingRemoval(ImageId image_id);
+-    /// Eden (Doris): calls off pending removals of images that share guest memory with
+-    /// [begin, end) (another image there was created or deleted), except the given image.
+-    void DorisCancelPendingOverlapping(VAddr begin, VAddr end, ImageId except);
+     /// Eden (Doris): true if the image is waiting for its copy back before removal.
+     [[nodiscard]] bool DorisIsPendingRemoval(ImageId image_id) const noexcept;
+     /// Eden (Doris): memory use above which the garbage collector is under pressure.
+@@ -481,9 +478,6 @@ private:
+         u64 gpu_tick;          // the copy is done once the GPU has passed this tick
+         u64 issue_frame;       // frame_tick when the copy was recorded
+         u64 modification_tick; // the image's modification tick at that point
+-        u64 global_modification_tick; // the texture cache's at that point
+-        VAddr cpu_addr;
+-        VAddr cpu_addr_end;
+         size_t staging_bytes;
+     };
+     std::vector<DorisPendingRemoval> doris_pending_removals;
+-- 
+2.43.0
+

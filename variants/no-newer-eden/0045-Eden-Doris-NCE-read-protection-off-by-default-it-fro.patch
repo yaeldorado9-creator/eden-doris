@@ -1,0 +1,47 @@
+From b8b98b9fc2b6114727c7f00a05667d96c4d4ae71 Mon Sep 17 00:00:00 2001
+From: "Eden (Doris) build" <doris@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 11:22:34 -0500
+Subject: [PATCH 45/46] Eden (Doris): NCE read protection off by default (it
+ froze TotK at start in build 26)
+
+Build 28 is build 26 with this one change: with the setting off build 26 ran exactly as tested.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014Ps8wnhVXtSU7d88gGtyHX
+(cherry picked from commit 78818d9eccc091ca3d3c0bdaec2b1c24d6e53ee9)
+---
+ src/android/app/src/main/res/values/strings.xml | 4 ++--
+ src/common/settings.h                           | 2 +-
+ 2 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/src/android/app/src/main/res/values/strings.xml b/src/android/app/src/main/res/values/strings.xml
+index faf70e222..3b07b8ad4 100644
+--- a/src/android/app/src/main/res/values/strings.xml
++++ b/src/android/app/src/main/res/values/strings.xml
+@@ -614,8 +614,8 @@
+     <string name="doris_texture_cleanup_eden">Eden (as before)</string>
+     <string name="doris_nce_gpu_reads">Game reads of GPU drawings (NCE)</string>
+     <string name="doris_nce_gpu_reads_description">With the NCE CPU backend the game\'s code reads memory directly, so when it reads something the GPU drew (TotK: ground data, grass) it got old data: Eden only copies drawings in first with the JIT and reactive flushing. Doris keeps those pages unreadable until the drawing is copied in. Takes effect the next time the game starts.</string>
+-    <string name="doris_nce_gpu_reads_doris">Doris: copy the drawing in first (default)</string>
+-    <string name="doris_nce_gpu_reads_eden">Eden (as before)</string>
++    <string name="doris_nce_gpu_reads_doris">Doris: copy the drawing in first (froze at start in build 26)</string>
++    <string name="doris_nce_gpu_reads_eden">Eden (as before, default)</string>
+     <string name="doris_gpu_barriers">GPU barriers</string>
+     <string name="doris_gpu_barriers_description">How the game\'s \"wait until the GPU is done\" points are carried out. Eden\'s way lets later drawing read results that aren\'t finished yet on Adreno, which can make distant terrain, buildings and shadows drop out for a frame. Doris uses real barriers; by default only where something drawn since the previous wait needs one (most of the game\'s waits follow nothing of the kind), which spares the GPU work. Takes effect the next time the game starts.</string>
+     <string name="doris_barriers_eden">Eden (as before)</string>
+diff --git a/src/common/settings.h b/src/common/settings.h
+index 47177fd2e..ef6251ba3 100644
+--- a/src/common/settings.h
++++ b/src/common/settings.h
+@@ -620,7 +620,7 @@ struct Values {
+     // unreadable while the drawing is only on the GPU; a read stops there, the drawing is copied
+     // in (the first time; afterwards Eden copies it at fences, as with reactive flushing) and the
+     // read goes on. 0 = Eden.
+-    SwitchableSetting<u32> doris_nce_gpu_reads{linkage, 1, "doris_nce_gpu_reads",
++    SwitchableSetting<u32> doris_nce_gpu_reads{linkage, 0, "doris_nce_gpu_reads",
+                                                Category::RendererAdvanced};
+     // With asynchronous shaders on, Eden skips every draw whose shader is still compiling, so new
+     // things are invisible for a moment. Doris first waits up to this many milliseconds per frame
+-- 
+2.43.0
+
