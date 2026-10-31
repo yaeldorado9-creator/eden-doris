@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "name": "Apex Doris @NUM@ (@LABEL@)",
-  "description": "Balemuni's Apex v2 Ultimate (Mesa main b9a2bf3) rebuilt from source for Eden (Doris), with Doris changes for Tears of the Kingdom. Build @NUM@, Mesa tree @SHA@.",
+  "description": "Balemuni's Apex v2 Ultimate (Mesa main b9a2bf3) rebuilt from source for Eden (Doris). For Tears of the Kingdom on Eden: 32-bit render targets and textures tiled instead of linear, SYSMEM/GMEM chosen per render pass by measuring both. Build @NUM@, Mesa tree @SHA@.",
   "author": "Eden (Doris), based on Balemuni (Leon)",
   "packageVersion": "26.3.0-apex-doris-@NUM@-@SHA@",
   "vendor": "Mesa (Apex Doris)",

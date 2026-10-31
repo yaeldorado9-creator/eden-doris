@@ -1,0 +1,125 @@
+From f5dee04d7a9944f3ea8bc6f4e8913af00bf472fe Mon Sep 17 00:00:00 2001
+From: "Eden (Doris) build" <doris@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 12:00:12 -0500
+Subject: [PATCH] turnip (Doris): TotK on Eden: 32-bit color images tiled,
+ render mode measured per pass
+
+For Eden (engine "yuzu Emulator") only:
+- tu_image: Eden gives every 32-bit color image a view format list with all 19 formats of its size
+  class, BGRA8 among them. On A740 (a7xx gen2, no all-formats-compatible UBWC) a list mixing
+  swapped and unswapped formats forced the image LINEAR, so all of TotK's 32-bit render targets
+  and textures were drawn and sampled untiled. Keep them tiled (still without UBWC). Tiled images
+  ignore the swap in CCU and TP alike; R8G8 vs R16 reinterpretation still goes linear.
+- driconf: the profiled autotuner (each render pass with 5+ draws timed in SYSMEM and GMEM).
+- autotune (profiled): GMEM only when at least 15% faster (the CCU switch is paid outside the
+  timed pass); lock a pass's mode after 10 samples per mode and 10 s, for passes from 0.15 ms.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014Ps8wnhVXtSU7d88gGtyHX
+---
+ src/freedreno/vulkan/00-turnip-defaults.conf |  5 ++++
+ src/freedreno/vulkan/tu_autotune.cc          | 24 ++++++++++++++------
+ src/freedreno/vulkan/tu_image.cc             | 14 ++++++++++++
+ 3 files changed, 36 insertions(+), 7 deletions(-)
+
+diff --git a/src/freedreno/vulkan/00-turnip-defaults.conf b/src/freedreno/vulkan/00-turnip-defaults.conf
+index a51e7c486a3..19f06c13895 100644
+--- a/src/freedreno/vulkan/00-turnip-defaults.conf
++++ b/src/freedreno/vulkan/00-turnip-defaults.conf
+@@ -8,6 +8,11 @@
+             <option name="tu_allow_oob_indirect_ubo_loads" value="true" />
+             <option name="tu_dont_care_as_load" value="true" />
+         </engine>
++        <!-- Eden (Doris): Eden reports the engine "yuzu Emulator". Pick SYSMEM or GMEM for each render pass by
++             measuring both on the GPU (the profiled autotuner) instead of estimating bandwidth. -->
++        <engine engine_name_match="yuzu Emulator">
++            <option name="tu_autotune_algorithm" value="profiled" />
++        </engine>
+         <engine engine_name_match="rpcsx|armsx|rpcs3">
+             <option name="tu_restrict_subgroup_size_64" value="false" />
+             <option name="tu_autotune_algorithm" value="prefer_gmem" />
+diff --git a/src/freedreno/vulkan/tu_autotune.cc b/src/freedreno/vulkan/tu_autotune.cc
+index 8274e010737..0dfc0e37c69 100644
+--- a/src/freedreno/vulkan/tu_autotune.cc
++++ b/src/freedreno/vulkan/tu_autotune.cc
+@@ -1141,13 +1141,19 @@ struct tu_autotune::rp_history {
+ 
+                uint64_t avg_sysmem = sysmem_ema.get();
+                uint64_t avg_gmem = gmem_ema.get();
++               /* Eden (Doris): GMEM has to be 15% faster to win. Switching the CCU between SYSMEM
++                * and GMEM (flush, invalidate, wait for idle) happens outside the timed pass, before
++                * the next SYSMEM pass, so a GMEM pass in a run of SYSMEM ones costs more than its
++                * own time shows; in TotK on Eden the GMEM wins were 5-17%.
++                */
++               const bool gmem_wins = avg_gmem * 115 < avg_sysmem * 100;
+ 
+-               if (avg_gmem < avg_sysmem) {
++               if (gmem_wins) {
+                   if (sysmem_prob > FAST_MIN_PROBABILITY && sysmem_prob <= FAST_MAX_PROBABILITY)
+                      sysmem_prob = MAX2(sysmem_prob - FAST_STEP_DELTA, FAST_MIN_PROBABILITY);
+                   else if (sysmem_prob > SLOW_MIN_PROBABILITY)
+                      sysmem_prob = MAX2(sysmem_prob - SLOW_STEP_DELTA, SLOW_MIN_PROBABILITY);
+-               } else if (avg_sysmem < avg_gmem) {
++               } else {
+                   if (sysmem_prob >= FAST_MIN_PROBABILITY && sysmem_prob < FAST_MAX_PROBABILITY)
+                      sysmem_prob = MIN2(sysmem_prob + FAST_STEP_DELTA, FAST_MAX_PROBABILITY);
+                   else if (sysmem_prob < SLOW_MAX_PROBABILITY)
+@@ -1159,13 +1165,17 @@ struct tu_autotune::rp_history {
+                 * avoids performance hazards from switching to an extremely suboptimal mode even if done very rarely.
+                 * Note: Due to the potentially huge negative impact of a bad lock, this is a very conservative check.
+                 */
+-               constexpr uint32_t MIN_LOCK_DURATION_COUNT = 15;
+-               constexpr uint64_t MIN_LOCK_THRESHOLD = GPU_TICKS_PER_US * 1'000; /* 1ms */
++               /* Eden (Doris): lock sooner and for shorter passes too. In TotK on Eden many passes take
++                * 0.2-1 ms and were never locked, so they kept trying the slower mode 1% of the time
++                * (a GMEM try of a 0.6 ms SYSMEM pass took 1.2-1.7 ms).
++                */
++               constexpr uint32_t MIN_LOCK_DURATION_COUNT = 10;
++               constexpr uint64_t MIN_LOCK_THRESHOLD = GPU_TICKS_PER_US * 150; /* 0.15ms */
+                constexpr uint32_t LOCK_PERCENT_DIFF = 30;
+-               constexpr uint64_t LOCK_TIME_WINDOW_NS = 30'000'000'000; /* 30s */
++               constexpr uint64_t LOCK_TIME_WINDOW_NS = 10'000'000'000; /* 10s */
+ 
+                uint64_t now = os_time_get_nano();
+-               bool current_sysmem_winning = avg_sysmem < avg_gmem;
++               bool current_sysmem_winning = !gmem_wins;
+ 
+                if (winning_since_ts == 0 || current_sysmem_winning != is_sysmem_winning) {
+                   winning_since_ts = now;
+@@ -1181,7 +1191,7 @@ struct tu_autotune::rp_history {
+ 
+                if (has_resolved && enough_samples && max_avg >= MIN_LOCK_THRESHOLD &&
+                    percent_diff >= LOCK_PERCENT_DIFF && (now - winning_since_ts) >= LOCK_TIME_WINDOW_NS) {
+-                  if (avg_gmem < avg_sysmem)
++                  if (gmem_wins)
+                      sysmem_prob = 0;
+                   else
+                      sysmem_prob = 100;
+diff --git a/src/freedreno/vulkan/tu_image.cc b/src/freedreno/vulkan/tu_image.cc
+index 6c68838e338..15b52f6f5b0 100644
+--- a/src/freedreno/vulkan/tu_image.cc
++++ b/src/freedreno/vulkan/tu_image.cc
+@@ -651,6 +651,20 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
+             bool r8g8_r16 = format_list_reinterprets_r8g8_r16(vk_format_to_pipe_format(image->vk.format), fmt_list);
+             bool fmt_list_has_swaps = format_list_has_swaps(fmt_list);
+ 
++            /* Eden (Doris): Eden gives every 32-bit color image a view format list with all 19
++             * formats of its size class, BGRA8 among them, so on A740 (no all-formats-compatible
++             * UBWC) every 32-bit render target and texture became LINEAR: all of TotK's
++             * RGBA8/RGB10A2/RG16F/R11G11B10F/R32 targets were drawn and sampled untiled. Keep them
++             * tiled (still without UBWC). A tiled image ignores the swap in both the CCU and the
++             * TP, so a view with a swapped format reads the same channels as the image's own
++             * format instead of R and B exchanged; Eden only makes such a view when the guest
++             * reinterprets RGBA as BGRA in place. R8G8 vs R16 still needs linear (different tiled
++             * layouts), so that stays.
++             */
++            const char *engine = device->instance->vk.app_info.engine_name;
++            if (fmt_list_has_swaps && !r8g8_r16 && engine && !strcmp(engine, "yuzu Emulator"))
++               fmt_list_has_swaps = false;
++
+             if (r8g8_r16 || fmt_list_has_swaps) {
+                ubwc_enabled = false;
+                force_linear_tile = true;
+-- 
+2.43.0
+
