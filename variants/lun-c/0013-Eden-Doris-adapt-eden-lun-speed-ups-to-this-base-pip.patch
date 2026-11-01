@@ -1,0 +1,43 @@
+From c758c97b02eff720f2b15386667f008b7901d32b Mon Sep 17 00:00:00 2001
+From: Eden-Doris <doris@localhost>
+Date: Sun, 1 Nov 2026 01:19:14 -0500
+Subject: [PATCH 13/15] Eden (Doris): adapt eden-lun speed-ups to this base
+ (pipeline_helper_h part)
+
+---
+ src/video_core/renderer_vulkan/pipeline_helper.h | 5 ++---
+ 1 file changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/src/video_core/renderer_vulkan/pipeline_helper.h b/src/video_core/renderer_vulkan/pipeline_helper.h
+index 71f5b1fee0..a6d61a0d3d 100644
+--- a/src/video_core/renderer_vulkan/pipeline_helper.h
++++ b/src/video_core/renderer_vulkan/pipeline_helper.h
+@@ -364,7 +364,6 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
+     const u32 num_image_buffers = Shader::NumDescriptors(info.image_buffer_descriptors);
+     views += num_texture_buffers;
+     views += num_image_buffers;
+-    const bool is_rescaling_active = texture_cache.IsRescaling();
+     for (const auto& desc : info.texture_descriptors) {
+         bool is_rescaled{};
+         for (u32 index = 0; index < desc.count; ++index) {
+@@ -379,7 +378,7 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
+             Sampler& sampler{texture_cache.GetSampler(sampler_id)};
+             guest_descriptor_queue.AddSampledImage(vk_image_view,
+                                                    sampler.HandleFor(image_view, desc.is_depth));
+-            const bool element_rescaled{is_rescaling_active && texture_cache.IsRescaling(image_view)};
++            const bool element_rescaled{texture_cache.IsRescaling(image_view)};
+             is_rescaled |= element_rescaled;
+         }
+         rescaling.PushTexture(is_rescaled);
+@@ -393,7 +392,7 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
+             }
+             const VkImageView vk_image_view{image_view.StorageView(desc.type, desc.format)};
+             guest_descriptor_queue.AddImage(vk_image_view);
+-            const bool element_rescaled{is_rescaling_active && texture_cache.IsRescaling(image_view)};
++            const bool element_rescaled{texture_cache.IsRescaling(image_view)};
+             is_rescaled |= element_rescaled;
+         }
+         rescaling.PushImage(is_rescaled);
+-- 
+2.43.0
+

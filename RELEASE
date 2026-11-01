@@ -8,8 +8,12 @@
 # continuity fix 0032, and variants/speed: versionCode, Vulkan worker woken only when asleep, frame
 # generation resuming 100 ms after a hitch, one GPU wait per texture-cleanup pass.
 #
-# Release 33 splits release 32 in two to find what brought the dark ground squares back:
-#   -lun    the eden-lun speed-ups (0006, 0008-0027) and the continuity fix 0032
-#   -later  only the three later speed-ups (variants/speed)
--lun     patches:1-1 patches:6-6 patches:8-27 patches:32-32 variants/build6
--later   patches:1-1 variants/speed
+# Release 34 splits the eden-lun group of release 33 (-lun) in three, each on its own on stock Eden:
+#   -lun-a  memory translation caches and descriptor/macro fast paths (0006 0010 0020 0022 0023 0024)
+#           and the continuity fix 0032
+#   -lun-b  command processing: method sink bypass, dirty-flag skips, register-write batching
+#           (0011 0021 0026 + the DMA part of 0027)
+#   -lun-c  Vulkan and cache fast paths (0008 0009 0012-0019 0025 + the other parts of 0027)
+-lun-a   patches:1-1 variants/lun-a
+-lun-b   patches:1-1 variants/lun-b
+-lun-c   patches:1-1 variants/lun-c

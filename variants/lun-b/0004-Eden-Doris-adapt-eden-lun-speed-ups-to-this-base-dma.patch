@@ -1,0 +1,27 @@
+From 11971fabc4aa7ad1291e70e4645aab2c6e8abb61 Mon Sep 17 00:00:00 2001
+From: Eden-Doris <doris@localhost>
+Date: Sun, 1 Nov 2026 01:19:12 -0500
+Subject: [PATCH 4/5] Eden (Doris): adapt eden-lun speed-ups to this base
+ (dma_pusher_cpp part)
+
+---
+ src/video_core/dma_pusher.cpp | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index bc168c6293..bbb6bad361 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -120,7 +120,8 @@ void DmaPusher::ProcessCommands(std::span<const CommandHeader> commands) {
+         } else if (dma_state.method_count) {
+             auto const& run_header = commands[index];
+             // Coalesce a run of non-executable register writes into one virtual call.
+-            if (dma_state.method >= non_puller_methods) {
++            // Eden (Doris): not for IncreaseOnce, where only the first word advances the method.
++            if (!dma_increment_once && dma_state.method >= non_puller_methods) {
+                 auto subchannel = subchannels[dma_state.subchannel];
+                 const u32 method = dma_state.method;
+                 const u32 available =
+-- 
+2.43.0
+

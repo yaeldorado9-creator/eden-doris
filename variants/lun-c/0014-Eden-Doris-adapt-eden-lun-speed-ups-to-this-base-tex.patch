@@ -1,0 +1,36 @@
+From ade7b541a653743ee204eff88c7462165d734215 Mon Sep 17 00:00:00 2001
+From: Eden-Doris <doris@localhost>
+Date: Sun, 1 Nov 2026 01:19:14 -0500
+Subject: [PATCH 14/15] Eden (Doris): adapt eden-lun speed-ups to this base
+ (texture_cache_h part)
+
+---
+ src/video_core/texture_cache/texture_cache.h | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 2101706bc1..c4bef9fc2e 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -1976,11 +1976,18 @@ void TextureCache<P>::ForEachImageInRegion(DAddr cpu_addr, size_t size, Func&& f
+         if (it == page_table.end()) {
+             return;
+         }
++        // Eden (Doris): like the full path, visit each image once even if several of its map
++        // views fall in this page.
++        boost::container::small_vector<ImageId, 16> visited;
+         for (const ImageMapId map_id : it->second) {
+             ImageMapView& map = slot_map_views[map_id];
+             if (!map.Overlaps(cpu_addr, size)) {
+                 continue;
+             }
++            if (std::ranges::find(visited, map.image_id) != visited.end()) {
++                continue;
++            }
++            visited.push_back(map.image_id);
+             Image& image = slot_images[map.image_id];
+             if constexpr (BOOL_BREAK) {
+                 if (func(map.image_id, image)) {
+-- 
+2.43.0
+

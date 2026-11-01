@@ -1,0 +1,28 @@
+From bb2f9fde89655756720ec00a777ec0f4594c6252 Mon Sep 17 00:00:00 2001
+From: Eden-Doris <doris@localhost>
+Date: Sun, 1 Nov 2026 01:19:14 -0500
+Subject: [PATCH 12/15] Eden (Doris): adapt eden-lun speed-ups to this base
+ (buffer_cache_h part)
+
+---
+ src/video_core/buffer_cache/buffer_cache.h | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index a833dfac66..e9b151cb65 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -1749,6 +1749,10 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
+     u64 total_size_bytes = 0;
+     u64 largest_copy = 0;
+     const DAddr buffer_start = buffer.cpu_addr_cached;
++    // eden-lun 924f5904f: nothing to upload when the CPU wrote nothing in this range.
++    if (!memory_tracker.IsRegionCpuModified(device_addr, size)) {
++        return true;
++    }
+     memory_tracker.ForEachUploadRange(device_addr, size, [&](u64 device_addr_out, u64 range_size) {
+         upload_copies.push_back(BufferCopy{
+             .src_offset = total_size_bytes,
+-- 
+2.43.0
+
