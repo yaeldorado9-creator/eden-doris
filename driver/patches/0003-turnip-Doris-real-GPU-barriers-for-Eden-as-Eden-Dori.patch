@@ -1,0 +1,137 @@
+From f49a078cc3b4e61c4a88efff5aa04e34941b15b1 Mon Sep 17 00:00:00 2001
+From: "Eden (Doris) build" <doris@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 00:10:53 -0500
+Subject: [PATCH 3/4] turnip (Doris): real GPU barriers for Eden (as Eden
+ (Doris) build 6 does)
+
+Eden turns the game's "wait until the GPU is done" points into an event wait with no memory barrier,
+and puts no barrier after compute work. On Adreno that lets later draws (and the binning pass of a
+GMEM render pass, which reads geometry first) read culling results, indirect arguments and vertex data
+that aren't finished yet, so distant terrain, buildings and rocks drop out for a frame. For the
+engine "yuzu Emulator" (Eden), every dispatch is followed by a barrier and every event wait is a
+full memory barrier, the same barriers Eden (Doris) build 6 records itself.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014Ps8wnhVXtSU7d88gGtyHX
+---
+ src/freedreno/vulkan/tu_cmd_buffer.cc | 28 +++++++++++++++++++++++++++
+ src/freedreno/vulkan/tu_cmd_buffer.h  |  5 +++++
+ src/freedreno/vulkan/tu_device.cc     |  4 ++++
+ src/freedreno/vulkan/tu_device.h      |  6 ++++++
+ src/freedreno/vulkan/tu_event.cc      |  7 +++++++
+ 5 files changed, 50 insertions(+)
+
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index 489f3e090db..4f152032af5 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -9838,6 +9838,13 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
+    }
+ 
+    cmd->state.total_dispatches++;
++
++   /* Eden (Doris): Eden has no barrier after a dispatch, so draws right after it (and the binning pass
++    * of a GMEM render pass, which reads geometry before anything is drawn) could read culling results,
++    * indirect arguments and vertex data that the compute shader hasn't finished writing.
++    */
++   if (cmd->device->doris_eden_barriers)
++      tu_doris_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT);
+ }
+ 
+ template <chip CHIP>
+@@ -10025,6 +10032,27 @@ tu_CmdEndRendering2EXT(VkCommandBuffer commandBuffer,
+    }
+ }
+ 
++/* Eden (Doris): make every earlier write from src_stage visible to every later command. */
++void
++tu_doris_barrier(struct tu_cmd_buffer *cmd,
++                 VkPipelineStageFlags2 src_stage,
++                 VkAccessFlags2 src_access)
++{
++   const VkMemoryBarrier2 barrier = {
++      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
++      .srcStageMask = src_stage,
++      .srcAccessMask = src_access,
++      .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
++      .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
++   };
++   const VkDependencyInfo dep = {
++      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
++      .memoryBarrierCount = 1,
++      .pMemoryBarriers = &barrier,
++   };
++   tu_barrier(cmd, 1, &dep, false);
++}
++
+ void
+ tu_barrier(struct tu_cmd_buffer *cmd,
+            uint32_t dep_count,
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.h b/src/freedreno/vulkan/tu_cmd_buffer.h
+index abf6cb659ec..b7cf94ca427 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.h
++++ b/src/freedreno/vulkan/tu_cmd_buffer.h
+@@ -914,6 +914,11 @@ struct tu_vis_stream_patchpoint_cs {
+    struct tu_suballoc_bo fence_bo;
+ };
+ 
++void
++tu_doris_barrier(struct tu_cmd_buffer *cmd,
++                 VkPipelineStageFlags2 src_stage,
++                 VkAccessFlags2 src_access);
++
+ void
+ tu_barrier(struct tu_cmd_buffer *cmd,
+            uint32_t dep_count,
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index b554a5b024c..a1e91b83398 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -2893,6 +2893,10 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
+ 
+    device->instance = physical_device->instance;
+    device->physical_device = physical_device;
++   {
++      const char *engine = device->instance->vk.app_info.engine_name;
++      device->doris_eden_barriers = engine && !strcmp(engine, "yuzu Emulator");
++   }
+    device->device_idx = device->physical_device->device_count++;
+ 
+    result = tu_drm_device_init(device);
+diff --git a/src/freedreno/vulkan/tu_device.h b/src/freedreno/vulkan/tu_device.h
+index 3d03eadb8d8..b60896af0f4 100644
+--- a/src/freedreno/vulkan/tu_device.h
++++ b/src/freedreno/vulkan/tu_device.h
+@@ -453,6 +453,12 @@ struct tu_device
+ 
+    struct tu_autotune *autotune;
+ 
++   /* Eden (Doris): the application is Eden (engine "yuzu Emulator"). Its "wait for the GPU" points are
++    * event waits without memory barriers and it puts no barrier after compute work, so the driver adds
++    * real barriers there (what Eden (Doris) build 6 does on the emulator side).
++    */
++   bool doris_eden_barriers;
++
+    struct breadcrumbs_context *breadcrumbs_ctx;
+ 
+    struct tu_cs *dbg_cmdbuf_stomp_cs;
+diff --git a/src/freedreno/vulkan/tu_event.cc b/src/freedreno/vulkan/tu_event.cc
+index 5e9b9c30b31..d8d56ba1f70 100644
+--- a/src/freedreno/vulkan/tu_event.cc
++++ b/src/freedreno/vulkan/tu_event.cc
+@@ -185,5 +185,12 @@ tu_CmdWaitEvents2(VkCommandBuffer commandBuffer,
+           VK_DEPENDENCY_ASYMMETRIC_EVENT_BIT_KHR)
+          tu_barrier(cmd, 1, &pDependencyInfos[i], false);
+    }
++
++   /* Eden (Doris): Eden turns the game's "wait until the GPU is done" points into an event wait with no
++    * memory barrier, which waits for earlier work but doesn't make its writes visible. Make it a real
++    * full barrier, as Eden (Doris) build 6 does.
++    */
++   if (cmd->device->doris_eden_barriers && !cmd->state.pass)
++      tu_doris_barrier(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT);
+ }
+ TU_GENX(tu_CmdWaitEvents2);
+-- 
+2.43.0
+
