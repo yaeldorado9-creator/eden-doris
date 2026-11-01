@@ -1,0 +1,2157 @@
+From 2bba0b69e4cf8542301f661272346ee799397c97 Mon Sep 17 00:00:00 2001
+From: Eden-Doris <doris@localhost>
+Date: Sun, 1 Nov 2026 17:47:57 -0500
+Subject: [PATCH] Eden (Doris): performance report, CPU profiler and hitch
+ sampler (always on, nothing else changes)
+
+The report, profiler and hitch sampler of Doris builds 10-29, carried over on their own so the log
+shows what happens when the game drops frames, with the emulator otherwise unchanged:
+- every 10 seconds in the log ("Doris perf"): frame times, CPU time per emulator thread and the
+  core it ran on, CPU cluster and GPU clocks, GPU load, battery temperature; per frame draws,
+  dispatches, render passes, submits, new pipelines, worker wake-ups, texture uploads (and uploads
+  over GPU-drawn contents), texture cleanup removals (copied back / lost), upload volume, new staging
+  buffers, GPU memory allocated and the texture cache's memory against its thresholds; and how long
+  the GPU emulation thread waited for presentation frames, shaders, GPU fences, GPU memory, the cache
+  locks and the game's commands; and the longest hitches with what happened in each;
+- doris_profile.txt: where the GPU thread and the Vulkan worker spend their CPU time;
+- doris_hitches.txt: the GPU thread's call stacks during frames over 50 ms.
+Always on in this build (no settings: values saved by older Doris builds can't turn it off). The cache
+lock in PrepareDraw is taken the same way (std::lock), only timed when it has to wait.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014Ps8wnhVXtSU7d88gGtyHX
+---
+ src/common/CMakeLists.txt                     |   4 +
+ src/common/doris_perf.cpp                     | 779 ++++++++++++++++++
+ src/common/doris_perf.h                       | 179 ++++
+ src/common/doris_profiler.cpp                 | 591 +++++++++++++
+ src/common/doris_profiler.h                   |  27 +
+ src/core/cpu_manager.cpp                      |   2 +
+ src/core/memory.cpp                           |   5 +
+ src/video_core/fence_manager.h                |   3 +
+ src/video_core/gpu.cpp                        |   2 +
+ src/video_core/gpu_thread.cpp                 |  11 +-
+ .../renderer_vulkan/vk_compute_pipeline.cpp   |   2 +
+ .../renderer_vulkan/vk_graphics_pipeline.cpp  |   2 +
+ .../renderer_vulkan/vk_pipeline_cache.cpp     |   3 +
+ .../renderer_vulkan/vk_present_manager.cpp    |   2 +
+ .../renderer_vulkan/vk_rasterizer.cpp         |  16 +-
+ .../renderer_vulkan/vk_scheduler.cpp          |  11 +
+ .../vk_staging_buffer_pool.cpp                |  11 +-
+ src/video_core/texture_cache/texture_cache.h  |  21 +-
+ .../vulkan_common/vulkan_memory_allocator.cpp |  16 +-
+ 19 files changed, 1681 insertions(+), 6 deletions(-)
+ create mode 100644 src/common/doris_perf.cpp
+ create mode 100644 src/common/doris_perf.h
+ create mode 100644 src/common/doris_profiler.cpp
+ create mode 100644 src/common/doris_profiler.h
+
+diff --git a/src/common/CMakeLists.txt b/src/common/CMakeLists.txt
+index 10e8cd0cc7..3851015969 100644
+--- a/src/common/CMakeLists.txt
++++ b/src/common/CMakeLists.txt
+@@ -99,6 +99,10 @@ add_library(
+     scm_rev.h
+     scope_exit.h
+     scratch_buffer.h
++    doris_perf.cpp
++    doris_perf.h
++    doris_profiler.cpp
++    doris_profiler.h
+     settings.cpp
+     settings.h
+     settings_common.cpp
+diff --git a/src/common/doris_perf.cpp b/src/common/doris_perf.cpp
+new file mode 100644
+index 0000000000..e9ba6a3b2c
+--- /dev/null
++++ b/src/common/doris_perf.cpp
+@@ -0,0 +1,779 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden (Doris)
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#include "common/doris_perf.h"
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <ctime>
++#include <fstream>
++#include <map>
++#include <mutex>
++#include <optional>
++#include <sstream>
++#include <string>
++#include <thread>
++#include <utility>
++#include <vector>
++
++#if defined(__linux__) || defined(__ANDROID__)
++#include <dirent.h>
++#include <sys/syscall.h>
++#include <unistd.h>
++#define DORIS_PERF_PROCFS 1
++#endif
++
++#include <fmt/format.h>
++
++#include "common/doris_profiler.h"
++#include "common/logging.h"
++#include "common/settings.h"
++#include "common/thread.h"
++
++namespace Doris::Perf {
++namespace {
++
++// Eden (Doris): this build always writes the report (no setting).
++constexpr bool kReportOn = true;
++
++using Clock = std::chrono::steady_clock;
++
++constexpr auto REPORT_INTERVAL = std::chrono::seconds{10};
++constexpr size_t MAX_FRAMES = 4096;
++
++std::mutex frame_mutex;
++std::vector<Clock::time_point> frames;
++std::once_flag start_flag;
++
++std::array<std::atomic<std::uint64_t>, static_cast<size_t>(Count::Max)> counters{};
++std::array<std::atomic<std::uint64_t>, static_cast<size_t>(Wait::Max)> wait_ns{};
++// Texture events named in the report (see NoteTexture).
++std::mutex note_mutex;
++std::array<std::map<std::string, std::uint32_t>, static_cast<size_t>(Note::Max)> notes;
++std::array<std::atomic<std::uint64_t>, static_cast<size_t>(GpuPart::Max)> gpu_ns{};
++std::array<std::atomic<std::uint64_t>, static_cast<size_t>(Gauge::Max)> gauge_now{};
++std::array<std::atomic<std::uint64_t>, static_cast<size_t>(Gauge::Max)> gauge_max{};
++
++thread_local bool is_gpu_thread = false;
++
++struct RegisteredThread {
++    char label[16]{};
++    std::atomic<int> tid{0};
++};
++constexpr size_t MAX_REGISTERED = 4;
++std::array<RegisteredThread, MAX_REGISTERED> registered{};
++std::atomic<size_t> registered_count{0};
++
++template <size_t N>
++std::array<std::uint64_t, N> TakeAll(std::array<std::atomic<std::uint64_t>, N>& values) {
++    std::array<std::uint64_t, N> result{};
++    for (size_t i = 0; i < N; ++i) {
++        result[i] = values[i].exchange(0, std::memory_order_relaxed);
++    }
++    return result;
++}
++
++// Counters and waits only ever grow; readers keep their own previous reading (the report every
++// 10 seconds, the hitch check every frame) and take the difference.
++template <size_t N>
++std::array<std::uint64_t, N> ReadAll(const std::array<std::atomic<std::uint64_t>, N>& values) {
++    std::array<std::uint64_t, N> result{};
++    for (size_t i = 0; i < N; ++i) {
++        result[i] = values[i].load(std::memory_order_relaxed);
++    }
++    return result;
++}
++
++template <size_t N>
++std::array<std::uint64_t, N> Since(const std::array<std::uint64_t, N>& now,
++                                   std::array<std::uint64_t, N>& previous) {
++    std::array<std::uint64_t, N> result{};
++    for (size_t i = 0; i < N; ++i) {
++        result[i] = now[i] - previous[i];
++    }
++    previous = now;
++    return result;
++}
++
++/// A frame that took much longer than it should, and what happened during it.
++struct Hitch {
++    Clock::time_point end;
++    double frame_ms{};
++    /// CPU time the GPU emulation thread used during the frame. Close to frame_ms: that thread
++    /// was the bottleneck. Far below it (and few waits): it sat idle waiting for the game.
++    double gpu_thread_cpu_ms{};
++    /// CPU time the game's own threads (emulated CPU cores) used during the frame, all together.
++    double game_cpu_ms{};
++    std::array<std::uint64_t, static_cast<size_t>(Count::Max)> counts{};
++    std::array<std::uint64_t, static_cast<size_t>(Wait::Max)> waits_ns{};
++};
++constexpr double HITCH_MS = 50.0;
++constexpr size_t MAX_HITCHES = 64;
++constexpr size_t HITCHES_SHOWN = 6;
++/// Guarded by frame_mutex. The longest hitches of the current report window.
++std::vector<Hitch> hitches;
++size_t hitch_count = 0;
++
++/// State of the frame in progress; only the GPU emulation thread touches it (OnGameFrame).
++struct FrameState {
++    bool valid{false};
++    Clock::time_point start;
++    std::uint64_t gpu_thread_cpu_ns{};
++    std::uint64_t game_cpu_ns{};
++    std::array<std::uint64_t, static_cast<size_t>(Count::Max)> counts{};
++    std::array<std::uint64_t, static_cast<size_t>(Wait::Max)> waits_ns{};
++};
++FrameState frame_state;
++
++/// Threads running the game's code (emulated CPU cores).
++constexpr size_t MAX_GAME_THREADS = 8;
++std::array<std::atomic<int>, MAX_GAME_THREADS> game_thread_ids{};
++std::atomic<size_t> game_thread_count{0};
++
++std::uint64_t ThreadCpuNs() {
++#if defined(__linux__) || defined(__ANDROID__)
++    timespec now{};
++    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now) == 0) {
++        return static_cast<std::uint64_t>(now.tv_sec) * 1'000'000'000ULL +
++               static_cast<std::uint64_t>(now.tv_nsec);
++    }
++#endif
++    return 0;
++}
++
++/// CPU time used so far by all the game's threads together (ns).
++std::uint64_t GameThreadsCpuNs() {
++    std::uint64_t total = 0;
++#if defined(__linux__) || defined(__ANDROID__)
++    const size_t count = std::min(game_thread_count.load(std::memory_order_relaxed),
++                                  MAX_GAME_THREADS);
++    for (size_t i = 0; i < count; ++i) {
++        const int tid = game_thread_ids[i].load(std::memory_order_acquire);
++        if (tid <= 0) {
++            continue;
++        }
++        // The kernel's per-thread CPU clock of another thread in this process
++        // (MAKE_THREAD_CPUCLOCK(tid, CPUCLOCK_SCHED)).
++        const clockid_t clock = static_cast<clockid_t>((~static_cast<unsigned>(tid) << 3) | 6U);
++        timespec now{};
++        if (clock_gettime(clock, &now) == 0) {
++            total += static_cast<std::uint64_t>(now.tv_sec) * 1'000'000'000ULL +
++                     static_cast<std::uint64_t>(now.tv_nsec);
++        }
++    }
++#endif
++    return total;
++}
++
++std::string ReadFirstLine(const std::string& path) {
++    std::ifstream file(path);
++    std::string line;
++    if (file) {
++        std::getline(file, line);
++    }
++    return line;
++}
++
++#ifdef DORIS_PERF_PROCFS
++struct ThreadTimes {
++    std::string name;
++    unsigned long long ticks{};
++    int cpu{-1};
++};
++
++/// CPU time of every thread of this process, from /proc/self/task/<tid>/stat.
++std::map<int, ThreadTimes> ReadThreads() {
++    std::map<int, ThreadTimes> result;
++    DIR* dir = opendir("/proc/self/task");
++    if (dir == nullptr) {
++        return result;
++    }
++    while (const dirent* entry = readdir(dir)) {
++        if (entry->d_name[0] < '0' || entry->d_name[0] > '9') {
++            continue;
++        }
++        const int tid = std::atoi(entry->d_name);
++        const std::string stat = ReadFirstLine(fmt::format("/proc/self/task/{}/stat", tid));
++        const size_t open = stat.find('(');
++        const size_t close = stat.rfind(')');
++        if (open == std::string::npos || close == std::string::npos || close < open) {
++            continue;
++        }
++        ThreadTimes times;
++        times.name = stat.substr(open + 1, close - open - 1);
++        // Fields after the name, starting with field 3 (state): utime is field 14, stime 15,
++        // processor 39.
++        std::istringstream rest(stat.substr(close + 2));
++        std::vector<std::string> fields;
++        for (std::string field; rest >> field;) {
++            fields.push_back(std::move(field));
++        }
++        if (fields.size() > 36) {
++            times.ticks = std::stoull(fields[11]) + std::stoull(fields[12]);
++            times.cpu = std::atoi(fields[36].c_str());
++        }
++        result.emplace(tid, std::move(times));
++    }
++    closedir(dir);
++    return result;
++}
++
++/// "cpu0-2 1.2/1.8 GHz, ..." for every cpufreq policy (cluster).
++std::string ReadClusters() {
++    std::string out;
++    for (int policy = 0; policy < 16; ++policy) {
++        const std::string base = fmt::format("/sys/devices/system/cpu/cpufreq/policy{}/", policy);
++        const std::string cur = ReadFirstLine(base + "scaling_cur_freq");
++        if (cur.empty()) {
++            continue;
++        }
++        const std::string max = ReadFirstLine(base + "scaling_max_freq");
++        const std::string cpus = ReadFirstLine(base + "related_cpus");
++        const double cur_ghz = std::atof(cur.c_str()) / 1e6;
++        const double max_ghz = std::atof(max.c_str()) / 1e6;
++        out += fmt::format("{}[cpu {}] {:.2f}/{:.2f} GHz", out.empty() ? "" : ", ", cpus, cur_ghz,
++                           max_ghz);
++    }
++    return out.empty() ? "n/a" : out;
++}
++
++/// Adreno load and clock, if the kernel lets apps read them.
++std::string ReadGpu() {
++    std::string out;
++    const std::string busy = ReadFirstLine("/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage");
++    if (!busy.empty()) {
++        out += fmt::format("busy {}", busy);
++    } else {
++        unsigned long long busy_time{}, total_time{};
++        const std::string raw = ReadFirstLine("/sys/class/kgsl/kgsl-3d0/gpubusy");
++        if (std::sscanf(raw.c_str(), "%llu %llu", &busy_time, &total_time) == 2 && total_time) {
++            out += fmt::format("busy {}%", busy_time * 100 / total_time);
++        }
++    }
++    std::string clock = ReadFirstLine("/sys/class/kgsl/kgsl-3d0/gpuclk");
++    if (clock.empty()) {
++        clock = ReadFirstLine("/sys/class/kgsl/kgsl-3d0/devfreq/cur_freq");
++    }
++    if (!clock.empty()) {
++        out += fmt::format("{}{} MHz", out.empty() ? "" : ", ",
++                           static_cast<long long>(std::atof(clock.c_str()) / 1e6));
++    }
++    return out.empty() ? "n/a" : out;
++}
++
++std::string ReadBatteryTemperature() {
++    const std::string raw = ReadFirstLine("/sys/class/power_supply/battery/temp");
++    if (raw.empty()) {
++        return "n/a";
++    }
++    return fmt::format("{:.1f} C", std::atof(raw.c_str()) / 10.0);
++}
++
++/// Kind of every CPU: 0 little, 1 middle, 2 prime (by each cluster's highest clock).
++std::vector<int> ReadCoreKinds() {
++    struct Cluster {
++        std::vector<int> cpus;
++        long long max_khz{};
++    };
++    std::vector<Cluster> clusters;
++    for (int policy = 0; policy < 16; ++policy) {
++        const std::string base = fmt::format("/sys/devices/system/cpu/cpufreq/policy{}/", policy);
++        const std::string max = ReadFirstLine(base + "cpuinfo_max_freq");
++        if (max.empty()) {
++            continue;
++        }
++        Cluster cluster;
++        cluster.max_khz = std::atoll(max.c_str());
++        std::istringstream list(ReadFirstLine(base + "related_cpus"));
++        for (std::string item; list >> item;) {
++            const size_t dash = item.find('-');
++            if (dash == std::string::npos) {
++                cluster.cpus.push_back(std::atoi(item.c_str()));
++            } else {
++                for (int cpu = std::atoi(item.substr(0, dash).c_str());
++                     cpu <= std::atoi(item.substr(dash + 1).c_str()); ++cpu) {
++                    cluster.cpus.push_back(cpu);
++                }
++            }
++        }
++        clusters.push_back(std::move(cluster));
++    }
++    std::vector<int> kinds(64, 1);
++    if (clusters.size() < 2) {
++        return kinds;
++    }
++    long long lowest = clusters.front().max_khz;
++    long long highest = clusters.front().max_khz;
++    for (const auto& cluster : clusters) {
++        lowest = std::min(lowest, cluster.max_khz);
++        highest = std::max(highest, cluster.max_khz);
++    }
++    for (const auto& cluster : clusters) {
++        const int kind = cluster.max_khz == highest ? 2 : (cluster.max_khz == lowest ? 0 : 1);
++        for (const int cpu : cluster.cpus) {
++            if (cpu >= 0 && cpu < static_cast<int>(kinds.size())) {
++                kinds[cpu] = kind;
++            }
++        }
++    }
++    return kinds;
++}
++
++/// The CPU a thread of this process last ran on, or -1.
++int ReadThreadCpu(int tid) {
++    const std::string stat = ReadFirstLine(fmt::format("/proc/self/task/{}/stat", tid));
++    const size_t close = stat.rfind(')');
++    if (close == std::string::npos || close + 2 >= stat.size()) {
++        return -1;
++    }
++    std::istringstream rest(stat.substr(close + 2));
++    std::string field;
++    for (int index = 0; index <= 36 && (rest >> field); ++index) {
++        if (index == 36) {
++            return std::atoi(field.c_str());
++        }
++    }
++    return -1;
++}
++#endif
++
++void ReportLoop() {
++    Common::SetCurrentThreadName("DorisPerf");
++    Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
++    // Eden (Doris): measuring must never take a big core from the emulator.
++    Common::SetCurrentThreadToEfficiencyCores();
++#ifdef DORIS_PERF_PROCFS
++    const double ticks_per_second = static_cast<double>(sysconf(_SC_CLK_TCK));
++    auto previous_threads = ReadThreads();
++    const std::vector<int> core_kinds = ReadCoreKinds();
++#endif
++    // Work done while the game was loading is not part of any frame.
++    auto counters_seen = ReadAll(counters);
++    auto waits_seen = ReadAll(wait_ns);
++    TakeAll(gpu_ns);
++    auto previous_time = Clock::now();
++    while (true) {
++        // Sample which kind of core the registered threads are on, ten times a second.
++        std::array<std::array<int, 3>, MAX_REGISTERED> placement{};
++        constexpr auto SAMPLE_INTERVAL = std::chrono::milliseconds{100};
++        for (auto waited = Clock::duration{}; waited < REPORT_INTERVAL;
++             waited += SAMPLE_INTERVAL) {
++            std::this_thread::sleep_for(SAMPLE_INTERVAL);
++#ifdef DORIS_PERF_PROCFS
++            const size_t count = std::min(registered_count.load(), MAX_REGISTERED);
++            for (size_t i = 0; i < count; ++i) {
++                const int tid = registered[i].tid.load(std::memory_order_relaxed);
++                const int cpu = tid != 0 ? ReadThreadCpu(tid) : -1;
++                if (cpu >= 0 && cpu < static_cast<int>(core_kinds.size())) {
++                    ++placement[i][core_kinds[cpu]];
++                }
++            }
++#endif
++        }
++        const auto counted = Since(ReadAll(counters), counters_seen);
++        const auto waited = Since(ReadAll(wait_ns), waits_seen);
++        const auto gpu = TakeAll(gpu_ns);
++        const auto gauges_max = TakeAll(gauge_max);
++        std::vector<Clock::time_point> stamps;
++        std::vector<Hitch> window_hitches;
++        size_t window_hitch_count = 0;
++        {
++            std::scoped_lock lock{frame_mutex};
++            stamps.swap(frames);
++            window_hitches.swap(hitches);
++            window_hitch_count = std::exchange(hitch_count, 0);
++        }
++        const auto now = Clock::now();
++        const double seconds = std::chrono::duration<double>(now - previous_time).count();
++        previous_time = now;
++#ifdef DORIS_PERF_PROCFS
++        auto threads = ReadThreads();
++#endif
++        if (stamps.size() < 2 || !kReportOn) {
++#ifdef DORIS_PERF_PROCFS
++            previous_threads = std::move(threads);
++#endif
++            continue;
++        }
++
++        std::vector<double> frame_ms;
++        frame_ms.reserve(stamps.size() - 1);
++        for (size_t i = 1; i < stamps.size(); ++i) {
++            frame_ms.push_back(
++                std::chrono::duration<double, std::milli>(stamps[i] - stamps[i - 1]).count());
++        }
++        const double span_s =
++            std::chrono::duration<double>(stamps.back() - stamps.front()).count();
++        const double fps = span_s > 0 ? static_cast<double>(frame_ms.size()) / span_s : 0.0;
++        const auto slow = std::ranges::count_if(frame_ms, [](double ms) { return ms > 40.0; });
++        std::ranges::sort(frame_ms);
++        const auto pct = [&](double p) {
++            return frame_ms[std::min(frame_ms.size() - 1,
++                                     static_cast<size_t>(p * static_cast<double>(frame_ms.size())))];
++        };
++        // The device's clock time, to match the report with videos of the screen.
++        char clock_text[16] = "?";
++        {
++            const std::time_t now_time = std::time(nullptr);
++            std::tm local{};
++            if (localtime_r(&now_time, &local) != nullptr) {
++                std::strftime(clock_text, sizeof(clock_text), "%H:%M:%S", &local);
++            }
++        }
++        LOG_INFO(Frontend,
++                 "Doris perf: {:.1f} fps | frame ms p50 {:.1f} p95 {:.1f} p99 {:.1f} max {:.1f} | "
++                 "frames over 40 ms: {} | clock {}",
++                 fps, pct(0.50), pct(0.95), pct(0.99), frame_ms.back(), slow, clock_text);
++
++#ifdef DORIS_PERF_PROCFS
++        // CPU time per thread name over the interval, as % of one core; last core it ran on.
++        struct Usage {
++            double percent{};
++            int threads{};
++            int cpu{-1};
++        };
++        std::map<std::string, Usage> usage;
++        double total = 0.0;
++        for (const auto& [tid, times] : threads) {
++            const auto previous = previous_threads.find(tid);
++            const unsigned long long before =
++                previous != previous_threads.end() ? previous->second.ticks : 0ULL;
++            const double percent = static_cast<double>(times.ticks - std::min(times.ticks, before)) /
++                                   ticks_per_second / seconds * 100.0;
++            auto& entry = usage[times.name];
++            entry.percent += percent;
++            entry.threads++;
++            entry.cpu = times.cpu;
++            total += percent;
++        }
++        previous_threads = std::move(threads);
++        std::vector<std::pair<std::string, Usage>> sorted(usage.begin(), usage.end());
++        std::ranges::sort(sorted, [](const auto& a, const auto& b) {
++            return a.second.percent > b.second.percent;
++        });
++        std::string list;
++        for (size_t i = 0; i < sorted.size() && i < 14; ++i) {
++            const auto& [name, use] = sorted[i];
++            if (use.percent < 1.0) {
++                break;
++            }
++            list += fmt::format("{}{}{} {:.0f}% (cpu{})", list.empty() ? "" : ", ", name,
++                                use.threads > 1 ? fmt::format(" x{}", use.threads) : "",
++                                use.percent, use.cpu);
++        }
++        LOG_INFO(Frontend, "Doris perf: CPU total {:.0f}% of one core | {}", total, list);
++        LOG_INFO(Frontend, "Doris perf: clusters {} | GPU {} | battery {}", ReadClusters(),
++                 ReadGpu(), ReadBatteryTemperature());
++#endif
++        const double frame_count = static_cast<double>(stamps.size());
++        const auto per_frame = [&](std::uint64_t value) {
++            return static_cast<double>(value) / frame_count;
++        };
++        const auto ms_per_frame = [&](std::uint64_t ns) {
++            return static_cast<double>(ns) / 1e6 / frame_count;
++        };
++        LOG_INFO(Frontend,
++                 "Doris perf: per frame {:.0f} draws, {:.0f} dispatches, {:.0f} render passes, "
++                 "{:.1f} submits | new pipelines {} | held up per frame: GPU thread by presentation "
++                 "{:.1f} ms and GPU fences {:.1f} ms, Vulkan worker by shader builds {:.1f} ms",
++                 per_frame(counted[static_cast<size_t>(Count::Draws)]),
++                 per_frame(counted[static_cast<size_t>(Count::Dispatches)]),
++                 per_frame(counted[static_cast<size_t>(Count::RenderPasses)]),
++                 per_frame(counted[static_cast<size_t>(Count::Submits)]),
++                 counted[static_cast<size_t>(Count::NewPipelines)],
++                 ms_per_frame(waited[static_cast<size_t>(Wait::PresentFrame)]),
++                 ms_per_frame(waited[static_cast<size_t>(Wait::GpuFence)]),
++                 ms_per_frame(waited[static_cast<size_t>(Wait::Shaders)]));
++        std::string cores;
++        const size_t registered_threads = std::min(registered_count.load(), MAX_REGISTERED);
++        for (size_t i = 0; i < registered_threads; ++i) {
++            const auto& [little, middle, prime] = placement[i];
++            const int samples = std::max(1, little + middle + prime);
++            cores += fmt::format("{}{} prime {}% / middle {}% / little {}%",
++                                 cores.empty() ? "" : ", ", registered[i].label,
++                                 prime * 100 / samples, middle * 100 / samples,
++                                 little * 100 / samples);
++        }
++        LOG_INFO(Frontend,
++                 "Doris perf: per frame {:.2f} MiB uploaded, {:.2f} new staging buffers ({:.2f} "
++                 "MiB), {:.2f} MiB new GPU memory, GPU thread {:.2f} ms getting/freeing GPU "
++                 "memory, {:.1f} ms waiting for the game's commands and {:.2f} ms for the cache "
++                 "locks (held {:.2f} ms by fence handling) | game wrote to pages with GPU-written "
++                 "bytes {} times (copied back first; the game waited {:.1f} ms in all) | NCE "
++                 "pages kept unreadable for GPU drawings {}, the game's reads there {} and "
++                 "writes {} (the drawing copied in first; the game waited {:.1f} ms in all)",
++                 static_cast<double>(counted[static_cast<size_t>(Count::UploadBytes)]) /
++                     (1024.0 * 1024.0) / frame_count,
++                 per_frame(counted[static_cast<size_t>(Count::StagingCreated)]),
++                 static_cast<double>(counted[static_cast<size_t>(Count::StagingCreatedBytes)]) /
++                     (1024.0 * 1024.0) / frame_count,
++                 static_cast<double>(
++                     counted[static_cast<size_t>(Count::GpuMemoryAllocatedBytes)]) /
++                     (1024.0 * 1024.0) / frame_count,
++                 ms_per_frame(waited[static_cast<size_t>(Wait::GpuMemory)]),
++                 ms_per_frame(waited[static_cast<size_t>(Wait::GameCommands)]),
++                 ms_per_frame(waited[static_cast<size_t>(Wait::CacheLock)]),
++                 ms_per_frame(waited[static_cast<size_t>(Wait::FenceFlushes)]),
++                 counted[static_cast<size_t>(Count::GpuWritesKept)],
++                 static_cast<double>(waited[static_cast<size_t>(Wait::KeepGpuWrites)]) / 1e6,
++                 counted[static_cast<size_t>(Count::NceReadProtectedPages)],
++                 counted[static_cast<size_t>(Count::NceGpuPageReads)],
++                 counted[static_cast<size_t>(Count::NceGpuPageWrites)],
++                 static_cast<double>(waited[static_cast<size_t>(Wait::NceGpuReads)]) / 1e6);
++        LOG_INFO(Frontend,
++                 "Doris perf: GPU work per frame {:.1f} ms (frame generation {:.1f} ms, output "
++                 "scaling {:.1f} ms) | cores: {}",
++                 ms_per_frame(gpu[static_cast<size_t>(GpuPart::Total)]),
++                 ms_per_frame(gpu[static_cast<size_t>(GpuPart::FrameGen)]),
++                 ms_per_frame(gpu[static_cast<size_t>(GpuPart::Output)]),
++                 cores.empty() ? "n/a" : cores);
++        const auto count_of = [&](Count counter) {
++            return counted[static_cast<size_t>(counter)];
++        };
++        const auto gauge_of = [&](Gauge gauge) {
++            return gauge_now[static_cast<size_t>(gauge)].load(std::memory_order_relaxed);
++        };
++        LOG_INFO(Frontend,
++                 "Doris perf: per frame {:.0f} worker wake-ups, {:.1f} render passes cut by a "
++                 "submit, {:.1f} protection changes, {:.1f} wait-for-idles ({:.1f} redundant "
++                 "barriers skipped, {:.1f} in an open render pass, {:.1f} with no storage writes by "
++                 "draws since the previous one), {:.1f} tiled-cache barriers | textures: {} "
++                 "uploads ({} over GPU-drawn contents), game writes next to GPU-drawn ones {} "
++                 "(contents kept {}, changed {}), garbage collector removed {} ({} copies back "
++                 "started, {} "
++                 "removals called off, {} with GPU-drawn contents lost) | GPU memory {} MiB (max "
++                 "{}), collection from {} MiB, aggressive from {} MiB",
++                 per_frame(count_of(Count::WorkerWakeups)),
++                 per_frame(count_of(Count::RenderPassSplits)),
++                 per_frame(count_of(Count::ProtectCalls)),
++                 per_frame(count_of(Count::WaitForIdle)),
++                 per_frame(count_of(Count::BarriersSkipped)),
++                 per_frame(count_of(Count::WaitForIdleInRenderPass)),
++                 per_frame(count_of(Count::WaitForIdleNoDrawWrites)),
++                 per_frame(count_of(Count::TiledCacheBarriers)), count_of(Count::TextureUploads),
++                 count_of(Count::TextureUploadsOverGpuData),
++                 count_of(Count::TextureNeighbourWrites), count_of(Count::TextureNeighbourKept),
++                 count_of(Count::TextureNeighbourChanged), count_of(Count::GcRemoved),
++                 count_of(Count::GcDownloaded), count_of(Count::GcCancelled),
++                 count_of(Count::GcDroppedGpuData),
++                 gauge_of(Gauge::TextureCacheMemory),
++                 gauges_max[static_cast<size_t>(Gauge::TextureCacheMemory)],
++                 gauge_of(Gauge::TextureCacheExpected), gauge_of(Gauge::TextureCacheCritical));
++
++        // Which textures lost GPU-drawn contents, and how.
++        {
++            std::array<std::map<std::string, std::uint32_t>, static_cast<size_t>(Note::Max)> taken;
++            {
++                std::scoped_lock lock{note_mutex};
++                taken.swap(notes);
++            }
++            static constexpr std::array<const char*, static_cast<size_t>(Note::Max)> NOTE_NAMES{
++                "uploaded again over GPU-drawn contents",
++                "own bytes changed by the game's code",
++                "removed with GPU-drawn contents lost",
++            };
++            for (size_t kind = 0; kind < taken.size(); ++kind) {
++                if (taken[kind].empty()) {
++                    continue;
++                }
++                std::vector<std::pair<std::string, std::uint32_t>> sorted(taken[kind].begin(),
++                                                                          taken[kind].end());
++                std::ranges::sort(sorted, [](const auto& a, const auto& b) {
++                    return a.second > b.second;
++                });
++                std::string list;
++                for (size_t i = 0; i < sorted.size() && i < 8; ++i) {
++                    list += fmt::format("{}{} x{}", list.empty() ? "" : ", ", sorted[i].first,
++                                        sorted[i].second);
++                }
++                LOG_INFO(Frontend, "Doris textures {}: {}", NOTE_NAMES[kind], list);
++            }
++        }
++
++        // The longest hitches, in the order they happened.
++        std::ranges::sort(window_hitches,
++                          [](const Hitch& a, const Hitch& b) { return a.frame_ms > b.frame_ms; });
++        if (window_hitches.size() > HITCHES_SHOWN) {
++            window_hitches.resize(HITCHES_SHOWN);
++        }
++        std::ranges::sort(window_hitches,
++                          [](const Hitch& a, const Hitch& b) { return a.end < b.end; });
++        for (const Hitch& hitch : window_hitches) {
++            const auto c = [&](Count counter) { return hitch.counts[static_cast<size_t>(counter)]; };
++            const auto w = [&](Wait kind) {
++                return static_cast<double>(hitch.waits_ns[static_cast<size_t>(kind)]) / 1e6;
++            };
++            const auto mib = [&](Count counter) {
++                return static_cast<double>(c(counter)) / (1024.0 * 1024.0);
++            };
++            LOG_INFO(Frontend,
++                     "Doris hitch: {:.0f} ms frame ({:.1f} s before this line; {} over {:.0f} ms "
++                     "in this window) | GPU thread busy {:.0f} ms, waited for the game's "
++                     "commands {:.0f} ms, for the GPU {:.1f} ms, for presentation {:.1f} ms, "
++                     "getting/freeing GPU memory {:.1f} ms, for the cache locks {:.1f} ms (fence "
++                     "handling held them {:.1f} ms); game threads busy {:.0f} ms, waited {:.1f} ms "
++                     "for {} copies of GPU-written bytes; "
++                     "Vulkan worker waited for shaders {:.1f} ms | {} new pipelines, {} texture "
++                     "uploads, "
++                     "{:.1f} MiB uploaded, {} new staging buffers ({:.0f} MiB), {:.0f} MiB new "
++                     "GPU memory, {} textures removed ({} copies back started), {} draws, {} "
++                     "dispatches, {} render passes, {} submits, {} wait-for-idles, {} protection "
++                     "changes, {} worker wake-ups",
++                     hitch.frame_ms, std::chrono::duration<double>(now - hitch.end).count(),
++                     window_hitch_count, HITCH_MS, hitch.gpu_thread_cpu_ms, w(Wait::GameCommands),
++                     w(Wait::GpuFence), w(Wait::PresentFrame), w(Wait::GpuMemory),
++                     w(Wait::CacheLock), w(Wait::FenceFlushes), hitch.game_cpu_ms,
++                     w(Wait::KeepGpuWrites),
++                     c(Count::GpuWritesKept), w(Wait::Shaders), c(Count::NewPipelines),
++                     c(Count::TextureUploads), mib(Count::UploadBytes), c(Count::StagingCreated),
++                     mib(Count::StagingCreatedBytes), mib(Count::GpuMemoryAllocatedBytes),
++                     c(Count::GcRemoved), c(Count::GcDownloaded), c(Count::Draws),
++                     c(Count::Dispatches), c(Count::RenderPasses), c(Count::Submits),
++                     c(Count::WaitForIdle), c(Count::ProtectCalls), c(Count::WorkerWakeups));
++        }
++    }
++}
++
++} // Anonymous namespace
++
++bool Enabled() {
++    return kReportOn;
++}
++
++void Add(Count counter, std::uint64_t amount) {
++    if (!Enabled()) {
++        return;
++    }
++    counters[static_cast<size_t>(counter)].fetch_add(amount, std::memory_order_relaxed);
++}
++
++ScopedWait::ScopedWait(Wait kind_, bool any_thread)
++    : kind{kind_}, active{(any_thread || is_gpu_thread) && Enabled()} {
++    if (active) {
++        start = Clock::now();
++    }
++}
++
++ScopedWait::~ScopedWait() {
++    if (!active) {
++        return;
++    }
++    const auto ns =
++        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count();
++    wait_ns[static_cast<size_t>(kind)].fetch_add(static_cast<std::uint64_t>(ns),
++                                                std::memory_order_relaxed);
++}
++
++void NoteTexture(Note kind, std::string description) {
++    if (!Enabled()) {
++        return;
++    }
++    std::scoped_lock lock{note_mutex};
++    auto& map = notes[static_cast<size_t>(kind)];
++    if (map.size() < 256 || map.contains(description)) {
++        ++map[std::move(description)];
++    }
++}
++
++void SetGauge(Gauge gauge, std::uint64_t value) {
++    const auto index = static_cast<size_t>(gauge);
++    gauge_now[index].store(value, std::memory_order_relaxed);
++    std::uint64_t seen = gauge_max[index].load(std::memory_order_relaxed);
++    while (value > seen &&
++           !gauge_max[index].compare_exchange_weak(seen, value, std::memory_order_relaxed)) {
++    }
++}
++
++void AddGpuTime(GpuPart part, std::uint64_t nanoseconds) {
++    gpu_ns[static_cast<size_t>(part)].fetch_add(nanoseconds, std::memory_order_relaxed);
++}
++
++void RegisterGameThread() {
++#ifdef DORIS_PERF_PROCFS
++    const size_t index = game_thread_count.fetch_add(1);
++    if (index >= MAX_GAME_THREADS) {
++        return;
++    }
++    game_thread_ids[index].store(static_cast<int>(syscall(SYS_gettid)), std::memory_order_release);
++#endif
++}
++
++void RegisterThread(const char* label) {
++    if (std::strcmp(label, "GPU") == 0) {
++        is_gpu_thread = true;
++    }
++#ifdef DORIS_PERF_PROCFS
++    const size_t index = registered_count.fetch_add(1);
++    if (index >= MAX_REGISTERED) {
++        return;
++    }
++    std::snprintf(registered[index].label, sizeof(registered[index].label), "%s", label);
++    registered[index].tid.store(static_cast<int>(syscall(SYS_gettid)));
++#endif
++}
++
++void OnGameFrame() {
++    if (!kReportOn) {
++        frame_state.valid = false;
++        return;
++    }
++    std::call_once(start_flag, [] { std::thread(ReportLoop).detach(); });
++    // On the GPU emulation thread (this function runs there); does nothing once started for it.
++    Doris::Profiler::StartHitchSampler();
++    const auto now = Clock::now();
++    const auto counts_now = ReadAll(counters);
++    const auto waits_now = ReadAll(wait_ns);
++    const std::uint64_t cpu_now = ThreadCpuNs();
++    const std::uint64_t game_cpu_now = GameThreadsCpuNs();
++    std::optional<Hitch> hitch;
++    double frame_ms = 0.0;
++    if (frame_state.valid) {
++        frame_ms = std::chrono::duration<double, std::milli>(now - frame_state.start).count();
++        if (frame_ms >= HITCH_MS) {
++            hitch.emplace();
++            hitch->end = now;
++            hitch->frame_ms = frame_ms;
++            hitch->gpu_thread_cpu_ms =
++                static_cast<double>(cpu_now - std::min(cpu_now, frame_state.gpu_thread_cpu_ns)) /
++                1e6;
++            hitch->game_cpu_ms =
++                static_cast<double>(game_cpu_now -
++                                    std::min(game_cpu_now, frame_state.game_cpu_ns)) /
++                1e6;
++            hitch->counts = Since(counts_now, frame_state.counts);
++            hitch->waits_ns = Since(waits_now, frame_state.waits_ns);
++        }
++    }
++    Doris::Profiler::HitchFrameBoundary(frame_ms);
++    frame_state.valid = true;
++    frame_state.start = now;
++    frame_state.gpu_thread_cpu_ns = cpu_now;
++    frame_state.game_cpu_ns = game_cpu_now;
++    frame_state.counts = counts_now;
++    frame_state.waits_ns = waits_now;
++
++    std::scoped_lock lock{frame_mutex};
++    if (frames.size() < MAX_FRAMES) {
++        frames.push_back(now);
++    }
++    if (hitch) {
++        ++hitch_count;
++        if (hitches.size() < MAX_HITCHES) {
++            hitches.push_back(*hitch);
++        } else {
++            // Keep the longest ones.
++            auto shortest = std::ranges::min_element(
++                hitches, [](const Hitch& a, const Hitch& b) { return a.frame_ms < b.frame_ms; });
++            if (shortest->frame_ms < hitch->frame_ms) {
++                *shortest = *hitch;
++            }
++        }
++    }
++}
++
++} // namespace Doris::Perf
+diff --git a/src/common/doris_perf.h b/src/common/doris_perf.h
+new file mode 100644
+index 0000000000..8405554293
+--- /dev/null
++++ b/src/common/doris_perf.h
+@@ -0,0 +1,179 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden (Doris)
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <chrono>
++#include <string>
++#include <cstdint>
++
++namespace Doris::Perf {
++
++/// Called once for every frame the game renders. When the "Performance report" setting is on,
++/// the first call starts a low-priority thread that writes a summary to the log every 10 seconds:
++/// frame times, CPU time per emulator thread (and the core it last ran on), CPU cluster and GPU
++/// clocks, GPU load and battery temperature, plus the counters and timers below, and the longest
++/// hitches (frames over 50 ms) with what happened in each. Called on the GPU emulation thread.
++void OnGameFrame();
++
++/// True while the "Performance report" setting is on.
++bool Enabled();
++
++/// Work counted per game frame.
++enum class Count : int {
++    Draws,
++    Dispatches,
++    RenderPasses,
++    Submits,
++    NewPipelines,
++    /// The Vulkan worker had to be woken up for new work.
++    WorkerWakeups,
++    /// A submission had to end an open render pass (costly on tiled GPUs).
++    RenderPassSplits,
++    /// Textures uploaded from guest memory (new, or written by the game's CPU code).
++    TextureUploads,
++    /// ... of which the GPU had drawn into the texture before (the upload replaces that).
++    TextureUploadsOverGpuData,
++    /// Textures the texture cache's garbage collector removed.
++    GcRemoved,
++    /// ... that it first copied back to guest memory (each one waits for the GPU to finish).
++    GcDownloaded,
++    /// ... that the GPU had drawn into but could not be copied back (their contents are lost).
++    GcDroppedGpuData,
++    /// The game's code wrote to a page shared with a GPU-drawn texture (NCE write fault).
++    TextureNeighbourWrites,
++    /// ... and at the texture's next use its own bytes were unchanged (GPU contents kept).
++    TextureNeighbourKept,
++    /// ... or changed (uploaded again from guest memory, as Eden always did).
++    TextureNeighbourChanged,
++    /// Doris cleanup: removals called off because the texture was used or changed meanwhile.
++    GcCancelled,
++    /// Full barriers skipped because nothing was recorded since the previous one.
++    BarriersSkipped,
++    /// Bytes handed to the GPU through upload staging memory (textures, buffers).
++    UploadBytes,
++    /// Staging buffers newly created (each one is fresh memory the kernel has to provide).
++    StagingCreated,
++    StagingCreatedBytes,
++    /// GPU memory allocated for textures and buffers.
++    GpuMemoryAllocatedBytes,
++    /// The game's code wrote to a page holding GPU-written bytes, which were copied back first.
++    GpuWritesKept,
++    /// Memory protection changes for CPU write tracking.
++    ProtectCalls,
++    /// The game's "wait for idle" GPU commands.
++    WaitForIdle,
++    /// ... that came while a render pass was open (it has to be ended for the barrier).
++    WaitForIdleInRenderPass,
++    /// ... with no draw since the previous one that wrote storage buffers or images, or used
++    /// transform feedback (compute, uploads and copies have barriers of their own).
++    WaitForIdleNoDrawWrites,
++    /// The game's tiled-cache barriers.
++    TiledCacheBarriers,
++    /// NCE: pages made unreadable because a GPU drawing covers them (doris_nce_gpu_reads).
++    NceReadProtectedPages,
++    /// ... reads by the game's code that stopped there (the drawing was copied in first).
++    NceGpuPageReads,
++    /// ... and writes (copied in, then the usual invalidation).
++    NceGpuPageWrites,
++    Max,
++};
++
++/// Values that are sampled rather than counted.
++enum class Gauge : int {
++    /// GPU memory in use, as the texture cache sees it (MiB).
++    TextureCacheMemory,
++    /// The texture cache starts removing old textures above this (MiB).
++    TextureCacheExpected,
++    /// ... and removes them aggressively above this (MiB).
++    TextureCacheCritical,
++    Max,
++};
++
++/// Sets a gauge (the report shows the latest and the highest value of each window).
++void SetGauge(Gauge gauge, std::uint64_t value);
++
++/// Adds to a counter. Cheap (one relaxed atomic add); does nothing while the report is off.
++void Add(Count counter, std::uint64_t amount = 1);
++
++/// Places where the GPU emulation thread can be held up.
++enum class Wait : int {
++    /// Waiting for a free presentation frame (the display or frame generation is behind).
++    PresentFrame,
++    /// Vulkan worker waiting for a shader/pipeline the frame needs to finish building (the GPU
++    /// gets no new work meanwhile).
++    Shaders,
++    /// Waiting for the GPU to reach a point (fences, synchronization with the game).
++    GpuFence,
++    /// Getting or freeing GPU memory (textures, buffers, staging memory).
++    GpuMemory,
++    /// The GPU emulation thread waiting for the texture and buffer cache locks (another thread
++    /// holds them).
++    CacheLock,
++    /// The game's code waiting (any thread) while GPU-written bytes on a page it writes to are
++    /// copied back first (Eden #4490/#4531).
++    KeepGpuWrites,
++    /// Finished GPU-to-guest copies being written out (fence thread) while holding the texture and
++    /// buffer cache locks.
++    FenceFlushes,
++    /// The game's code waiting (any thread) while a GPU drawing it reads is copied into guest
++    /// memory (NCE, doris_nce_gpu_reads).
++    NceGpuReads,
++    /// The GPU emulation thread waiting for the game to send GPU commands.
++    GameCommands,
++    Max,
++};
++
++/// Kinds of texture events the report names textures for (size and format, most frequent first).
++enum class Note : int {
++    /// Uploaded again from guest memory over contents the GPU had drawn.
++    UploadOverGpuData,
++    /// The game's code changed bytes of a GPU-drawn texture (on a page it wrote to).
++    NeighbourChanged,
++    /// Removed by the garbage collector with GPU-drawn contents that could not be copied back.
++    GcLostGpuData,
++    Max,
++};
++
++/// Notes a texture event (does nothing while the report is off).
++void NoteTexture(Note kind, std::string description);
++
++/// Measures wall time spent in a scope: on the GPU emulation thread only, or on any thread when
++/// any_thread is true.
++class ScopedWait {
++public:
++    explicit ScopedWait(Wait kind, bool any_thread = false);
++    ~ScopedWait();
++
++    ScopedWait(const ScopedWait&) = delete;
++    ScopedWait& operator=(const ScopedWait&) = delete;
++
++private:
++    Wait kind;
++    bool active;
++    std::chrono::steady_clock::time_point start;
++};
++
++/// Parts of the GPU's own work, measured with GPU timestamps.
++enum class GpuPart : int {
++    /// Every command buffer (all GPU work).
++    Total,
++    /// Scaling the game's image to the screen (FSR etc.).
++    Output,
++    /// Frame generation (Lossless Scaling).
++    FrameGen,
++    Max,
++};
++
++/// Adds measured GPU time.
++void AddGpuTime(GpuPart part, std::uint64_t nanoseconds);
++
++/// Remembers the calling thread (GPU emulation thread or Vulkan worker) so the report can say
++/// which kind of core it mostly ran on.
++void RegisterThread(const char* label);
++
++/// Remembers a thread that runs the game's code (emulated CPU core), so a hitch can say how
++/// busy the game's own threads were during it.
++void RegisterGameThread();
++
++} // namespace Doris::Perf
+diff --git a/src/common/doris_profiler.cpp b/src/common/doris_profiler.cpp
+new file mode 100644
+index 0000000000..49a8dac180
+--- /dev/null
++++ b/src/common/doris_profiler.cpp
+@@ -0,0 +1,591 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden (Doris)
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#include "common/doris_profiler.h"
++
++#if (defined(__linux__) || defined(__ANDROID__)) && defined(__aarch64__)
++#define DORIS_PROFILER_ENABLED 1
++#endif
++
++#ifdef DORIS_PROFILER_ENABLED
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <cstring>
++#include <ctime>
++#include <deque>
++#include <fstream>
++#include <map>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <unordered_map>
++#include <vector>
++
++#include <dlfcn.h>
++#include <pthread.h>
++#include <signal.h>
++#include <sys/syscall.h>
++#include <time.h>
++#include <ucontext.h>
++#include <unistd.h>
++
++#include <fmt/format.h>
++
++#include "common/fs/path_util.h"
++#include "common/logging.h"
++#include "common/settings.h"
++#include "common/thread.h"
++
++namespace Doris::Profiler {
++namespace {
++
++constexpr int MAX_THREADS = 4;
++constexpr uint32_t CAPACITY = 1u << 14;             // samples per buffer
++constexpr long PERIOD_NS = 1'000'000;                // 1 ms of the thread's CPU time
++constexpr auto DRAIN_INTERVAL = std::chrono::seconds{10};
++constexpr int DRAINS_PER_WRITE = 2;                  // write the file every 20 seconds
++constexpr int MAX_DEPTH = 14;                        // pc, lr and up to 12 frame-pointer frames
++constexpr size_t MAX_STACK_ROWS = 8000;
++
++struct Sample {
++    uintptr_t pc;
++    uintptr_t lr;
++    uint32_t depth;                                  // valid entries in frames
++    std::array<uintptr_t, MAX_DEPTH - 2> frames;     // return addresses from the frame chain
++};
++
++struct Slot {
++    char label[32]{};
++    uintptr_t stack_low{};                           // the thread's stack, for safe unwinding
++    uintptr_t stack_high{};
++    std::atomic<uint32_t> active{0};                 // buffer the signal handler writes to
++    std::array<std::atomic<uint32_t>, 2> count{};
++    std::array<std::array<Sample, CAPACITY>, 2> samples{};
++};
++
++std::array<Slot, MAX_THREADS> slots;
++std::atomic<int> slot_count{0};
++std::once_flag start_flag;
++
++void HitchHandler(const ucontext_t* context);
++
++void Handler(int, siginfo_t* info, void* raw_context) {
++    if (info->si_code == SI_TKILL) {
++        // Sent by the hitch sampler's watchdog (pthread_kill), not by a profiler timer.
++        HitchHandler(static_cast<const ucontext_t*>(raw_context));
++        return;
++    }
++    if (info->si_code != SI_TIMER) {
++        return;
++    }
++    const int index = info->si_value.sival_int;
++    if (index < 0 || index >= MAX_THREADS) {
++        return;
++    }
++    const auto* context = static_cast<const ucontext_t*>(raw_context);
++    Slot& slot = slots[index];
++    const uint32_t buffer = slot.active.load(std::memory_order_relaxed) & 1;
++    const uint32_t position = slot.count[buffer].fetch_add(1, std::memory_order_relaxed);
++    if (position >= CAPACITY) {
++        return;
++    }
++    Sample& sample = slot.samples[buffer][position];
++    sample.pc = static_cast<uintptr_t>(context->uc_mcontext.pc);
++    sample.lr = static_cast<uintptr_t>(context->uc_mcontext.regs[30]);
++    // Walk the frame-pointer chain (x29), only through 16-byte aligned records that lie inside
++    // this thread's stack and move strictly upwards, so a bad frame pointer can't fault.
++    uint32_t depth = 0;
++    uintptr_t fp = static_cast<uintptr_t>(context->uc_mcontext.regs[29]);
++    while (depth < sample.frames.size()) {
++        if ((fp & 15) != 0 || fp < slot.stack_low || fp + 16 > slot.stack_high) {
++            break;
++        }
++        const auto* record = reinterpret_cast<const uintptr_t*>(fp);
++        const uintptr_t next = record[0];
++        const uintptr_t ret = record[1];
++        if (ret == 0) {
++            break;
++        }
++        sample.frames[depth++] = ret;
++        if (next <= fp) {
++            break;
++        }
++        fp = next;
++    }
++    sample.depth = depth;
++}
++
++struct Location {
++    std::string module;
++    uintptr_t offset;
++    std::string symbol; // nearest exported symbol, for libraries without our debug info
++};
++
++Location Resolve(uintptr_t address, std::unordered_map<uintptr_t, Location>& cache) {
++    if (const auto it = cache.find(address); it != cache.end()) {
++        return it->second;
++    }
++    Location location{"?", address, {}};
++    Dl_info info{};
++    if (address != 0 && dladdr(reinterpret_cast<void*>(address), &info) != 0 &&
++        info.dli_fname != nullptr) {
++        const std::string path = info.dli_fname;
++        location.module = path.substr(path.find_last_of('/') + 1);
++        location.offset = address - reinterpret_cast<uintptr_t>(info.dli_fbase);
++        if (info.dli_sname != nullptr && location.module.rfind("libyuzu", 0) != 0) {
++            location.symbol = fmt::format("{}+{:#x}", info.dli_sname,
++                                          address - reinterpret_cast<uintptr_t>(info.dli_saddr));
++        }
++    }
++    cache.emplace(address, location);
++    return location;
++}
++
++std::string Describe(uintptr_t address, std::unordered_map<uintptr_t, Location>& cache) {
++    const Location location = Resolve(address, cache);
++    if (!location.symbol.empty()) {
++        return fmt::format("{}:{}", location.module, location.symbol);
++    }
++    return fmt::format("{}+{:#x}", location.module, location.offset);
++}
++
++/// Hash for a call stack (a vector of addresses).
++struct StackHash {
++    size_t operator()(const std::vector<uintptr_t>& stack) const noexcept {
++        size_t hash = 1469598103934665603ULL;
++        for (const uintptr_t address : stack) {
++            hash = (hash ^ address) * 1099511628211ULL;
++        }
++        return hash;
++    }
++};
++
++void WriterLoop() {
++    Common::SetCurrentThreadName("DorisProfiler");
++    Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
++    // Eden (Doris): measuring must never take a big core from the emulator.
++    Common::SetCurrentThreadToEfficiencyCores();
++    const auto start = std::chrono::steady_clock::now();
++    // Totals since the profiler started, per thread: address -> count, and stack -> count.
++    std::array<std::unordered_map<uintptr_t, uint64_t>, MAX_THREADS> pc_totals, lr_totals;
++    std::array<std::unordered_map<std::vector<uintptr_t>, uint64_t, StackHash>, MAX_THREADS>
++        stack_totals;
++    std::array<uint64_t, MAX_THREADS> sample_totals{};
++    std::unordered_map<uintptr_t, Location> cache;
++    const std::string path =
++        Common::FS::GetEdenPathString(Common::FS::EdenPath::LogDir) + "/doris_profile.txt";
++
++    std::vector<uintptr_t> stack;
++    for (int drains = 1;; ++drains) {
++        std::this_thread::sleep_for(DRAIN_INTERVAL);
++        const int threads = std::min(slot_count.load(), MAX_THREADS);
++        for (int index = 0; index < threads; ++index) {
++            Slot& slot = slots[index];
++            const uint32_t old = slot.active.fetch_xor(1) & 1;
++            std::this_thread::sleep_for(std::chrono::milliseconds{2});
++            const uint32_t taken = std::min(slot.count[old].load(), CAPACITY);
++            for (uint32_t i = 0; i < taken; ++i) {
++                const Sample& sample = slot.samples[old][i];
++                ++pc_totals[index][sample.pc];
++                ++lr_totals[index][sample.lr];
++                // Stack, innermost first: pc, lr (unless the frame chain already starts with
++                // it), then the frame chain.
++                stack.clear();
++                stack.push_back(sample.pc);
++                const uint32_t depth = std::min<uint32_t>(sample.depth, MAX_DEPTH - 2);
++                if (depth == 0 || sample.frames[0] != sample.lr) {
++                    stack.push_back(sample.lr);
++                }
++                for (uint32_t frame = 0; frame < depth; ++frame) {
++                    stack.push_back(sample.frames[frame]);
++                }
++                ++stack_totals[index][stack];
++            }
++            sample_totals[index] += taken;
++            slot.count[old].store(0);
++        }
++        if (drains % DRAINS_PER_WRITE != 0) {
++            continue;
++        }
++
++        std::ofstream file(path, std::ios::trunc);
++        if (!file) {
++            LOG_WARNING(Frontend, "Doris profiler: could not write {}", path);
++            continue;
++        }
++        const auto seconds =
++            std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() -
++                                                             start)
++                .count();
++        file << fmt::format("# Doris profile v2: {} s, one sample per ms of CPU time\n", seconds);
++        for (int index = 0; index < threads; ++index) {
++            const auto write_table = [&](const char* kind,
++                                         const std::unordered_map<uintptr_t, uint64_t>& totals) {
++                // Fold addresses into module + offset, then sort by count.
++                std::map<std::pair<std::string, uintptr_t>, uint64_t> folded;
++                std::map<std::pair<std::string, uintptr_t>, std::string> symbols;
++                for (const auto& [address, count] : totals) {
++                    const Location location = Resolve(address, cache);
++                    folded[{location.module, location.offset}] += count;
++                    if (!location.symbol.empty()) {
++                        symbols[{location.module, location.offset}] = location.symbol;
++                    }
++                }
++                std::vector<std::pair<uint64_t, std::pair<std::string, uintptr_t>>> rows;
++                rows.reserve(folded.size());
++                for (const auto& [key, count] : folded) {
++                    rows.emplace_back(count, key);
++                }
++                std::ranges::sort(rows, [](const auto& a, const auto& b) { return a.first > b.first; });
++                file << fmt::format("[{} {}] samples {}\n", slots[index].label, kind,
++                                    sample_totals[index]);
++                for (size_t i = 0; i < rows.size() && i < 4000; ++i) {
++                    const auto symbol = symbols.find(rows[i].second);
++                    file << fmt::format("{} {:#x} {}{}{}\n", rows[i].second.first,
++                                        rows[i].second.second, rows[i].first,
++                                        symbol != symbols.end() ? " " : "",
++                                        symbol != symbols.end() ? symbol->second : "");
++                }
++            };
++            write_table("pc", pc_totals[index]);
++            write_table("lr", lr_totals[index]);
++
++            // Call stacks, innermost first, most frequent first.
++            std::vector<std::pair<uint64_t, const std::vector<uintptr_t>*>> stacks;
++            stacks.reserve(stack_totals[index].size());
++            for (const auto& [frames, count] : stack_totals[index]) {
++                stacks.emplace_back(count, &frames);
++            }
++            std::ranges::sort(stacks, [](const auto& a, const auto& b) { return a.first > b.first; });
++            file << fmt::format("[{} stacks] samples {} unique {}\n", slots[index].label,
++                                sample_totals[index], stacks.size());
++            for (size_t i = 0; i < stacks.size() && i < MAX_STACK_ROWS; ++i) {
++                std::string line = std::to_string(stacks[i].first);
++                for (const uintptr_t address : *stacks[i].second) {
++                    line += ' ';
++                    line += Describe(address, cache);
++                }
++                file << line << '\n';
++            }
++        }
++        LOG_INFO(Frontend, "Doris profiler: wrote {} ({} s)", path, seconds);
++    }
++}
++
++
++std::once_flag handler_flag;
++
++void InstallHandler() {
++    std::call_once(handler_flag, [] {
++        struct sigaction action {};
++        action.sa_sigaction = Handler;
++        action.sa_flags = SA_SIGINFO | SA_RESTART;
++        sigemptyset(&action.sa_mask);
++        sigaction(SIGPROF, &action, nullptr);
++    });
++}
++
++// ---- Hitch sampler -------------------------------------------------------------------------
++
++constexpr auto HITCH_ARM_AFTER = std::chrono::milliseconds{40};
++constexpr auto HITCH_SAMPLE_EVERY = std::chrono::milliseconds{2};
++constexpr double HITCH_MIN_MS = 50.0;
++constexpr uint32_t HITCH_CAPACITY = 4096;   // samples in the ring (8 s of sampling)
++constexpr size_t HITCHES_KEPT = 60;
++constexpr auto HITCH_WRITE_INTERVAL = std::chrono::seconds{10};
++
++struct HitchSampler {
++    /// The sampled thread (the current GPU emulation thread) while active.
++    std::atomic<int> tid{0};
++    uintptr_t stack_low{};
++    uintptr_t stack_high{};
++    std::atomic<bool> active{false};
++    /// Start of the frame in progress (steady clock, ns) and its number.
++    std::atomic<int64_t> frame_start_ns{0};
++    std::atomic<uint32_t> frame_id{0};
++    /// Ring of samples; written only by the signal handler on the sampled thread.
++    std::array<Sample, HITCH_CAPACITY> samples{};
++    std::atomic<uint32_t> write_pos{0};
++    uint32_t frame_first_pos{0}; // sampled thread only
++};
++HitchSampler hitch;
++
++struct FinishedHitch {
++    double frame_ms;
++    std::chrono::steady_clock::time_point when;
++    std::vector<Sample> samples;
++};
++std::mutex finished_mutex;
++std::deque<FinishedHitch> finished_hitches;
++bool finished_dirty = false;
++
++int64_t NowNs() {
++    return std::chrono::duration_cast<std::chrono::nanoseconds>(
++               std::chrono::steady_clock::now().time_since_epoch())
++        .count();
++}
++
++int CurrentTid() {
++    // bionic keeps the thread id in thread-local storage (no system call, signal safe).
++    return static_cast<int>(gettid());
++}
++
++void HitchHandler(const ucontext_t* context) {
++    // Only ever sample the thread the sampler was started on (its stack bounds are known).
++    if (!hitch.active.load(std::memory_order_acquire) ||
++        CurrentTid() != hitch.tid.load(std::memory_order_relaxed)) {
++        return;
++    }
++    const uint32_t position = hitch.write_pos.load(std::memory_order_relaxed);
++    Sample& sample = hitch.samples[position % HITCH_CAPACITY];
++    sample.pc = static_cast<uintptr_t>(context->uc_mcontext.pc);
++    sample.lr = static_cast<uintptr_t>(context->uc_mcontext.regs[30]);
++    uint32_t depth = 0;
++    uintptr_t fp = static_cast<uintptr_t>(context->uc_mcontext.regs[29]);
++    while (depth < sample.frames.size()) {
++        if ((fp & 15) != 0 || fp < hitch.stack_low || fp + 16 > hitch.stack_high) {
++            break;
++        }
++        const auto* record = reinterpret_cast<const uintptr_t*>(fp);
++        const uintptr_t next = record[0];
++        const uintptr_t ret = record[1];
++        if (ret == 0) {
++            break;
++        }
++        sample.frames[depth++] = ret;
++        if (next <= fp) {
++            break;
++        }
++        fp = next;
++    }
++    sample.depth = depth;
++    hitch.write_pos.store(position + 1, std::memory_order_release);
++}
++
++/// Wakes up when the current frame turns 40 ms old, then samples the thread every 2 ms until
++/// the frame ends. Between hitches it wakes about once per frame and does nothing else.
++void HitchWatchdogLoop() {
++    Common::SetCurrentThreadName("DorisHitches");
++    Common::SetCurrentThreadToEfficiencyCores();
++    std::unordered_map<uintptr_t, Location> cache;
++    const std::string path =
++        Common::FS::GetEdenPathString(Common::FS::EdenPath::LogDir) + "/doris_hitches.txt";
++    auto last_write = std::chrono::steady_clock::now();
++    std::deque<FinishedHitch> kept;
++    size_t total_hitches = 0;
++    const auto start = std::chrono::steady_clock::now();
++    std::vector<uintptr_t> stack;
++    while (true) {
++        if (!hitch.active.load(std::memory_order_acquire)) {
++            std::this_thread::sleep_for(std::chrono::milliseconds{100});
++            continue;
++        }
++        const uint32_t id = hitch.frame_id.load(std::memory_order_acquire);
++        const int64_t frame_start = hitch.frame_start_ns.load(std::memory_order_acquire);
++        const auto armed_at = std::chrono::steady_clock::time_point{
++            std::chrono::nanoseconds{frame_start}} + HITCH_ARM_AFTER;
++        if (std::chrono::steady_clock::now() < armed_at) {
++            std::this_thread::sleep_until(armed_at);
++        }
++        // Sample while the same frame is still running (for at most 2 seconds: longer means
++        // emulation is paused or loading, not a hitch).
++        constexpr int64_t SAMPLE_AT_MOST_NS = 2'000'000'000;
++        while (hitch.frame_id.load(std::memory_order_acquire) == id &&
++               hitch.active.load(std::memory_order_acquire)) {
++            if (NowNs() - frame_start > SAMPLE_AT_MOST_NS) {
++                std::this_thread::sleep_for(std::chrono::milliseconds{50});
++                continue;
++            }
++            // tgkill, not pthread_kill: if the thread has just exited this fails harmlessly.
++            syscall(SYS_tgkill, static_cast<int>(getpid()), hitch.tid.load(), SIGPROF);
++            std::this_thread::sleep_for(HITCH_SAMPLE_EVERY);
++        }
++        // Collect finished hitches and write them out now and then.
++        {
++            std::scoped_lock lock{finished_mutex};
++            while (!finished_hitches.empty()) {
++                kept.push_back(std::move(finished_hitches.front()));
++                finished_hitches.pop_front();
++                ++total_hitches;
++                if (kept.size() > HITCHES_KEPT) {
++                    kept.pop_front();
++                }
++            }
++            if (!finished_dirty ||
++                std::chrono::steady_clock::now() - last_write < HITCH_WRITE_INTERVAL) {
++                continue;
++            }
++            finished_dirty = false;
++        }
++        last_write = std::chrono::steady_clock::now();
++        std::ofstream file(path, std::ios::trunc);
++        if (!file) {
++            continue;
++        }
++        file << fmt::format("# Doris hitch stacks v1: GPU emulation thread, one sample every {} "
++                            "ms once a frame has lasted {} ms; {} hitches so far, the latest {} "
++                            "below (seconds since the game started)\n",
++                            HITCH_SAMPLE_EVERY.count(), HITCH_ARM_AFTER.count(), total_hitches,
++                            kept.size());
++        for (const FinishedHitch& finished : kept) {
++            std::unordered_map<std::vector<uintptr_t>, uint64_t, StackHash> stacks;
++            for (const Sample& sample : finished.samples) {
++                stack.clear();
++                stack.push_back(sample.pc);
++                const uint32_t depth = std::min<uint32_t>(sample.depth, MAX_DEPTH - 2);
++                if (depth == 0 || sample.frames[0] != sample.lr) {
++                    stack.push_back(sample.lr);
++                }
++                for (uint32_t frame = 0; frame < depth; ++frame) {
++                    stack.push_back(sample.frames[frame]);
++                }
++                ++stacks[stack];
++            }
++            std::vector<std::pair<uint64_t, const std::vector<uintptr_t>*>> sorted;
++            for (const auto& [frames, count] : stacks) {
++                sorted.emplace_back(count, &frames);
++            }
++            std::ranges::sort(sorted, [](const auto& a, const auto& b) { return a.first > b.first; });
++            file << fmt::format(
++                "[hitch {:.0f} ms at {:.1f} s] samples {}\n", finished.frame_ms,
++                std::chrono::duration<double>(finished.when - start).count(),
++                finished.samples.size());
++            for (size_t i = 0; i < sorted.size() && i < 40; ++i) {
++                std::string line = std::to_string(sorted[i].first);
++                for (const uintptr_t address : *sorted[i].second) {
++                    line += ' ';
++                    line += Describe(address, cache);
++                }
++                file << line << '\n';
++            }
++        }
++    }
++}
++
++std::once_flag hitch_watchdog_flag;
++
++} // Anonymous namespace
++
++void StartHitchSampler() {
++    const int me = CurrentTid();
++    if (hitch.active.load() && hitch.tid.load() == me) {
++        return;
++    }
++    hitch.active.store(false);
++    pthread_attr_t attributes;
++    if (pthread_getattr_np(pthread_self(), &attributes) == 0) {
++        void* stack_address = nullptr;
++        size_t stack_size = 0;
++        if (pthread_attr_getstack(&attributes, &stack_address, &stack_size) == 0) {
++            hitch.stack_low = reinterpret_cast<uintptr_t>(stack_address);
++            hitch.stack_high = hitch.stack_low + stack_size;
++        }
++        pthread_attr_destroy(&attributes);
++    }
++    InstallHandler();
++    hitch.frame_first_pos = hitch.write_pos.load();
++    hitch.frame_start_ns.store(NowNs(), std::memory_order_release);
++    hitch.frame_id.fetch_add(1);
++    hitch.tid.store(me);
++    hitch.active.store(true, std::memory_order_release);
++    std::call_once(hitch_watchdog_flag, [] { std::thread(HitchWatchdogLoop).detach(); });
++    LOG_INFO(Frontend, "Doris: hitch sampler on (doris_hitches.txt)");
++}
++
++void StopHitchSampler() {
++    if (hitch.tid.load() == CurrentTid()) {
++        hitch.active.store(false, std::memory_order_release);
++    }
++}
++
++void HitchFrameBoundary(double frame_ms) {
++    if (!hitch.active.load(std::memory_order_relaxed) ||
++        hitch.tid.load(std::memory_order_relaxed) != CurrentTid()) {
++        return;
++    }
++    // A new frame starts: the watchdog stops sampling the old one.
++    hitch.frame_start_ns.store(NowNs(), std::memory_order_release);
++    hitch.frame_id.fetch_add(1, std::memory_order_acq_rel);
++    const uint32_t end = hitch.write_pos.load(std::memory_order_acquire);
++    const uint32_t first = hitch.frame_first_pos;
++    hitch.frame_first_pos = end;
++    if (frame_ms < HITCH_MIN_MS || end == first || end - first > HITCH_CAPACITY) {
++        return;
++    }
++    FinishedHitch finished{frame_ms, std::chrono::steady_clock::now(), {}};
++    finished.samples.reserve(end - first);
++    for (uint32_t position = first; position != end; ++position) {
++        finished.samples.push_back(hitch.samples[position % HITCH_CAPACITY]);
++    }
++    std::scoped_lock lock{finished_mutex};
++    finished_hitches.push_back(std::move(finished));
++    if (finished_hitches.size() > HITCHES_KEPT) {
++        finished_hitches.pop_front();
++    }
++    finished_dirty = true;
++}
++
++void RegisterCurrentThread(const char* label) {
++    if (false) { // Eden (Doris): this build always runs the CPU profiler (no setting).
++        return;
++    }
++    InstallHandler();
++    std::call_once(start_flag, [] { std::thread(WriterLoop).detach(); });
++    const int index = slot_count.fetch_add(1);
++    if (index >= MAX_THREADS) {
++        return;
++    }
++    std::snprintf(slots[index].label, sizeof(slots[index].label), "%s", label);
++    pthread_attr_t attributes;
++    if (pthread_getattr_np(pthread_self(), &attributes) == 0) {
++        void* stack_address = nullptr;
++        size_t stack_size = 0;
++        if (pthread_attr_getstack(&attributes, &stack_address, &stack_size) == 0) {
++            slots[index].stack_low = reinterpret_cast<uintptr_t>(stack_address);
++            slots[index].stack_high = slots[index].stack_low + stack_size;
++        }
++        pthread_attr_destroy(&attributes);
++    }
++
++    clockid_t clock{};
++    if (pthread_getcpuclockid(pthread_self(), &clock) != 0) {
++        LOG_WARNING(Frontend, "Doris profiler: no CPU clock for {}", label);
++        return;
++    }
++    sigevent event{};
++    event.sigev_notify = SIGEV_THREAD_ID;
++    event.sigev_signo = SIGPROF;
++    event.sigev_value.sival_int = index;
++#ifdef sigev_notify_thread_id
++    event.sigev_notify_thread_id = static_cast<pid_t>(syscall(SYS_gettid));
++#else
++    event._sigev_un._tid = static_cast<pid_t>(syscall(SYS_gettid));
++#endif
++    timer_t timer{};
++    if (timer_create(clock, &event, &timer) != 0) {
++        LOG_WARNING(Frontend, "Doris profiler: could not create the timer for {}", label);
++        return;
++    }
++    itimerspec spec{};
++    spec.it_interval.tv_nsec = PERIOD_NS;
++    spec.it_value.tv_nsec = PERIOD_NS;
++    timer_settime(timer, 0, &spec, nullptr);
++    LOG_INFO(Frontend, "Doris profiler: sampling thread {}", label);
++}
++
++} // namespace Doris::Profiler
++
++#else
++
++namespace Doris::Profiler {
++void RegisterCurrentThread(const char*) {}
++void StartHitchSampler() {}
++void StopHitchSampler() {}
++void HitchFrameBoundary(double) {}
++} // namespace Doris::Profiler
++
++#endif
+diff --git a/src/common/doris_profiler.h b/src/common/doris_profiler.h
+new file mode 100644
+index 0000000000..fe7f017810
+--- /dev/null
++++ b/src/common/doris_profiler.h
+@@ -0,0 +1,27 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden (Doris)
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++namespace Doris::Profiler {
++
++/// Starts sampling the calling thread, if the "CPU profiler" setting is on: about once per
++/// millisecond of CPU time the thread uses (never while it sleeps), its program counter, return
++/// address and call stack (frame-pointer chain, checked against the thread's stack bounds) are
++/// recorded. Every 20 seconds the totals so far are written to doris_profile.txt in the log
++/// folder, as module + offset (plus the nearest exported symbol for system libraries), for
++/// symbolizing against the build's unstripped library.
++/// Only for host threads (GPU, Vulkan worker); never for threads that run guest code.
++void RegisterCurrentThread(const char* label);
++
++/// Hitch sampler, for the GPU emulation thread (called on it): whenever one of its frames has
++/// lasted 40 ms, its call stack is sampled every 2 ms until the frame ends. The stacks of every
++/// frame that ends up longer than 50 ms are written to doris_hitches.txt in the log folder (the
++/// latest 60 hitches), to be symbolized like doris_profile.txt. Costs nothing between hitches.
++void StartHitchSampler();
++/// Called on the same thread before it exits.
++void StopHitchSampler();
++/// Called on the same thread at every frame boundary, with the length of the frame that ended.
++void HitchFrameBoundary(double frame_ms);
++
++} // namespace Doris::Profiler
+diff --git a/src/core/cpu_manager.cpp b/src/core/cpu_manager.cpp
+index 23d5ac3dfd..346201827f 100644
+--- a/src/core/cpu_manager.cpp
++++ b/src/core/cpu_manager.cpp
+@@ -17,6 +17,7 @@
+ #include "core/hle/kernel/kernel.h"
+ #include "core/hle/kernel/physical_core.h"
+ #include "video_core/gpu.h"
++#include "common/doris_perf.h"
+ 
+ namespace Core {
+ 
+@@ -175,6 +176,7 @@ void CpuManager::RunThread(std::stop_token token, std::size_t core) {
+     Common::SetCurrentThreadName(name.c_str());
+     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
+     Common::SetCurrentThreadToPerformanceCores();
++    Doris::Perf::RegisterGameThread();
+     auto& data = core_data[core];
+     data.host_context = Common::Fiber::ThreadToFiber();
+ 
+diff --git a/src/core/memory.cpp b/src/core/memory.cpp
+index a5e6b8592c..94a55053fc 100644
+--- a/src/core/memory.cpp
++++ b/src/core/memory.cpp
+@@ -33,6 +33,7 @@
+ #include "video_core/host1x/gpu_device_memory_manager.h"
+ #include "video_core/host1x/host1x.h"
+ #include "video_core/rasterizer_download_area.h"
++#include "common/doris_perf.h"
+ 
+ namespace Core::Memory {
+ 
+@@ -107,6 +108,7 @@ struct Memory::Impl {
+             case Common::PageType::RasterizerCachedMemory:
+                 if (protect_bytes > 0) {
+                     host_buffer->Protect(protect_begin, protect_bytes, perms);
++                    Doris::Perf::Add(Doris::Perf::Count::ProtectCalls);
+                     protect_bytes = 0;
+                 }
+                 break;
+@@ -119,6 +121,7 @@ struct Memory::Impl {
+ 
+         if (protect_bytes > 0) {
+             host_buffer->Protect(protect_begin, protect_bytes, perms);
++            Doris::Perf::Add(Doris::Perf::Count::ProtectCalls);
+         }
+     }
+ 
+@@ -398,6 +401,7 @@ struct Memory::Impl {
+             const auto perm{debug ? Common::MemoryPermission{}
+                                   : Common::MemoryPermission::ReadWrite};
+             host_buffer->Protect(vaddr, size, perm);
++            Doris::Perf::Add(Doris::Perf::Count::ProtectCalls);
+         }
+ 
+         // Iterate over a contiguous CPU address space, marking/unmarking the region.
+@@ -458,6 +462,7 @@ struct Memory::Impl {
+                 perm |= Common::MemoryPermission::Write;
+             }
+             host_buffer->Protect(vaddr, size, perm);
++            Doris::Perf::Add(Doris::Perf::Count::ProtectCalls);
+         }
+ 
+         // Iterate over a contiguous CPU address space, which corresponds to the specified GPU
+diff --git a/src/video_core/fence_manager.h b/src/video_core/fence_manager.h
+index 885c714025..63a414a927 100644
+--- a/src/video_core/fence_manager.h
++++ b/src/video_core/fence_manager.h
+@@ -23,6 +23,7 @@
+ #include "video_core/host1x/host1x.h"
+ #include "video_core/host1x/syncpoint_manager.h"
+ #include "video_core/rasterizer_interface.h"
++#include "common/doris_perf.h"
+ 
+ namespace VideoCommon {
+ 
+@@ -240,6 +241,8 @@ private:
+     void PopAsyncFlushes() {
+         {
+             std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
++            // Eden (Doris): the report shows how long the cache locks are held here.
++            const Doris::Perf::ScopedWait doris_wait{Doris::Perf::Wait::FenceFlushes, true};
+             texture_cache.PopAsyncFlushes();
+             buffer_cache.PopAsyncFlushes();
+         }
+diff --git a/src/video_core/gpu.cpp b/src/video_core/gpu.cpp
+index dbc7d43553..754cbee63c 100644
+--- a/src/video_core/gpu.cpp
++++ b/src/video_core/gpu.cpp
+@@ -37,6 +37,7 @@
+ #include "video_core/memory_manager.h"
+ #include "video_core/renderer_base.h"
+ #include "video_core/shader_notify.h"
++#include "common/doris_perf.h"
+ 
+ namespace Tegra {
+ 
+@@ -171,6 +172,7 @@ struct GPU::Impl {
+ 
+     void RendererFrameEndNotify() {
+         system.GetPerfStats().EndGameFrame();
++        Doris::Perf::OnGameFrame();
+     }
+ 
+     /// Performs any additional setup necessary in order to begin GPU emulation.
+diff --git a/src/video_core/gpu_thread.cpp b/src/video_core/gpu_thread.cpp
+index 2acf9ac458..406c01278c 100644
+--- a/src/video_core/gpu_thread.cpp
++++ b/src/video_core/gpu_thread.cpp
+@@ -16,6 +16,8 @@
+ #include "video_core/gpu_thread.h"
+ #include "video_core/host1x/host1x.h"
+ #include "video_core/renderer_base.h"
++#include "common/doris_perf.h"
++#include "common/doris_profiler.h"
+ 
+ namespace VideoCommon::GPUThread {
+ 
+@@ -31,12 +33,18 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
+         Common::SetCurrentThreadName("GPU");
+         Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
+         Common::SetCurrentThreadToPerformanceCores();
++        Doris::Profiler::RegisterCurrentThread("GPU");
++        Doris::Perf::RegisterThread("GPU");
+         system.RegisterHostThread();
+ 
+         auto current_context = context.Acquire();
+         CommandDataContainer next;
+         while (!stop_token.stop_requested()) {
+-            state.queue.PopWait(next, stop_token);
++            {
++                // Eden (Doris): time spent waiting for the game's next GPU commands.
++                const Doris::Perf::ScopedWait doris_wait{Doris::Perf::Wait::GameCommands};
++                state.queue.PopWait(next, stop_token);
++            }
+             if (stop_token.stop_requested()) {
+                 break;
+             }
+@@ -59,6 +67,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
+                 state.cv.notify_all();
+             }
+         }
++        Doris::Profiler::StopHitchSampler();
+     });
+ }
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+index 29356cfcec..fa8692b563 100644
+--- a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+@@ -24,6 +24,7 @@
+ #include "video_core/gpu_logging/gpu_logging.h"
+ #include "common/logging.h"
+ #include "common/settings.h"
++#include "common/doris_perf.h"
+ 
+ namespace Vulkan {
+ 
+@@ -261,6 +262,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
+     if (!is_built.load(std::memory_order::relaxed)) {
+         // Wait for the pipeline to be built
+         scheduler.Record([this](vk::CommandBuffer) {
++            const Doris::Perf::ScopedWait doris_wait{Doris::Perf::Wait::Shaders, true};
+             std::unique_lock lock{build_mutex};
+             build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
+         });
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index 8b5b0bc9c5..57f53f6852 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -29,6 +29,7 @@
+ #include "video_core/vulkan_common/vulkan_device.h"
+ #include "video_core/gpu_logging/gpu_logging.h"
+ #include "common/settings.h"
++#include "common/doris_perf.h"
+ 
+ #if defined(_MSC_VER) && defined(NDEBUG)
+ #define LAMBDA_FORCEINLINE [[msvc::forceinline]]
+@@ -599,6 +600,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+     if (!is_built.load(std::memory_order::relaxed)) {
+         // Wait for the pipeline to be built
+         scheduler.Record([this](vk::CommandBuffer) {
++            const Doris::Perf::ScopedWait doris_wait{Doris::Perf::Wait::Shaders, true};
+             std::unique_lock lock{build_mutex};
+             build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
+         });
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 6e6120d1b1..e9600cff4c 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -15,6 +15,7 @@
+ #include <bit>
+ #include <numeric>
+ #include "common/cityhash.h"
++#include "common/doris_perf.h"
+ #include "common/fs/fs.h"
+ #include "common/fs/path_util.h"
+ #include "common/thread_worker.h"
+@@ -872,6 +873,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+ }
+ 
+ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
++    Doris::Perf::Add(Doris::Perf::Count::NewPipelines);
+     GraphicsEnvironments environments;
+     GetGraphicsEnvironments(environments, graphics_key.unique_hashes);
+ 
+@@ -896,6 +898,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
+ 
+ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
+     const ComputePipelineCacheKey& key, const ShaderInfo* shader) {
++    Doris::Perf::Add(Doris::Perf::Count::NewPipelines);
+     const GPUVAddr program_base{kepler_compute->regs.code_loc.Address()};
+     const auto& qmd{kepler_compute->launch_description};
+     ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start};
+diff --git a/src/video_core/renderer_vulkan/vk_present_manager.cpp b/src/video_core/renderer_vulkan/vk_present_manager.cpp
+index 523e6d02cb..de9e5c7992 100644
+--- a/src/video_core/renderer_vulkan/vk_present_manager.cpp
++++ b/src/video_core/renderer_vulkan/vk_present_manager.cpp
+@@ -16,6 +16,7 @@
+ #include "video_core/vulkan_common/vulkan_device.h"
+ #include "video_core/vulkan_common/vulkan_surface.h"
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
++#include "common/doris_perf.h"
+ 
+ namespace Vulkan {
+ 
+@@ -171,6 +172,7 @@ PresentManager::PresentManager(const vk::Instance& instance_,
+ PresentManager::~PresentManager() = default;
+ 
+ Frame* PresentManager::GetRenderFrame() {
++    const Doris::Perf::ScopedWait doris_wait{Doris::Perf::Wait::PresentFrame};
+ 
+     // Wait for free presentation frames
+     std::unique_lock lock{free_mutex};
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 3b0fea2fec..ee3d6717af 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -42,6 +42,7 @@
+ #include "video_core/texture_cache/texture_cache_base.h"
+ #include "video_core/vulkan_common/vulkan_device.h"
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
++#include "common/doris_perf.h"
+ 
+ namespace Vulkan {
+ 
+@@ -241,11 +242,18 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+     FlushWork();
+     gpu_memory->FlushCaching();
+ 
++    Doris::Perf::Add(Doris::Perf::Count::Draws);
+     GraphicsPipeline* const pipeline{pipeline_cache.CurrentGraphicsPipeline()};
+     if (!pipeline) {
+         return;
+     }
+-    std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
++    // Eden (Doris): same locking as before; the report shows how long the GPU thread waits here.
++    std::unique_lock buffer_lock{buffer_cache.mutex, std::defer_lock};
++    std::unique_lock texture_lock{texture_cache.mutex, std::defer_lock};
++    if (std::try_lock(buffer_lock, texture_lock) != -1) {
++        const Doris::Perf::ScopedWait doris_wait{Doris::Perf::Wait::CacheLock};
++        std::lock(buffer_lock, texture_lock);
++    }
+     // update engine as channel may be different.
+     pipeline->SetEngine(maxwell3d, gpu_memory);
+     if (!pipeline->Configure(is_indexed))
+@@ -583,6 +591,7 @@ void RasterizerVulkan::Clear(u32 layer_count) {
+ }
+ 
+ void RasterizerVulkan::DispatchCompute() {
++    Doris::Perf::Add(Doris::Perf::Count::Dispatches);
+     FlushWork();
+     gpu_memory->FlushCaching();
+ 
+@@ -850,6 +859,10 @@ void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,
+ }
+ 
+ void RasterizerVulkan::WaitForIdle() {
++    Doris::Perf::Add(Doris::Perf::Count::WaitForIdle);
++    if (scheduler.IsRenderPassActive()) {
++        Doris::Perf::Add(Doris::Perf::Count::WaitForIdleInRenderPass);
++    }
+     // Everything but wait pixel operations. This intentionally includes FRAGMENT_SHADER_BIT because
+     // fragment shaders can still write storage buffers.
+     VkPipelineStageFlags flags =
+@@ -878,6 +891,7 @@ void RasterizerVulkan::FragmentBarrier() {
+ }
+ 
+ void RasterizerVulkan::TiledCacheBarrier() {
++    Doris::Perf::Add(Doris::Perf::Count::TiledCacheBarriers);
+     // TODO: Implementing tiled barriers requires rewriting a good chunk of the Vulkan backend
+ }
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index 3364feabee..1afd88ce03 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -24,6 +24,8 @@
+ #include "video_core/renderer_vulkan/vk_texture_cache.h"
+ #include "video_core/vulkan_common/vulkan_device.h"
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
++#include "common/doris_perf.h"
++#include "common/doris_profiler.h"
+ 
+ namespace Vulkan {
+ 
+@@ -95,6 +97,7 @@ void Scheduler::DispatchWork() {
+             wake_worker = worker_waiting;
+         }
+         if (wake_worker) {
++            Doris::Perf::Add(Doris::Perf::Count::WorkerWakeups);
+             event_cv.notify_all();
+         }
+         AcquireNewChunk();
+@@ -105,6 +108,7 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
+                                     const VkClearValue* clear_values, u32 clear_value_count) {
+     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
+     const VkExtent2D render_area = framebuffer->RenderArea();
++    Doris::Perf::Add(Doris::Perf::Count::RenderPasses);
+     state.renderpass = renderpass;
+     state.framebuffer = framebuffer_handle;
+     state.render_area = render_area;
+@@ -279,6 +283,8 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
+     Common::SetCurrentThreadName("VulkanWorker");
+     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
+     Common::SetCurrentThreadToPerformanceCores();
++    Doris::Profiler::RegisterCurrentThread("VulkanWorker");
++    Doris::Perf::RegisterThread("VulkanWorker");
+ 
+     const auto TryPopQueue{[this](auto& work) -> bool {
+         if (work_queue.empty()) {
+@@ -361,6 +367,7 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
+     InvalidateState();
+ 
+     const u64 signal_value = master_semaphore->NextTick();
++    Doris::Perf::Add(Doris::Perf::Count::Submits);
+     RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value,
+                             this](vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) {
+         static constexpr VkMemoryBarrier WRITE_BARRIER{
+@@ -414,6 +421,10 @@ void Scheduler::InvalidateState() {
+ 
+ void Scheduler::EndPendingOperations() {
+     query_cache->CounterReset(VideoCommon::QueryType::ZPassPixelCount64);
++    if (state.renderpass) {
++        // A submission that cuts an open render pass in two (costly on tiled GPUs).
++        Doris::Perf::Add(Doris::Perf::Count::RenderPassSplits);
++    }
+     EndRenderPass();
+ }
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+index 7b6571d33d..2ffd677418 100644
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+@@ -19,6 +19,7 @@
+ #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
+ #include "video_core/vulkan_common/vulkan_device.h"
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
++#include "common/doris_perf.h"
+ 
+ namespace Vulkan {
+ namespace {
+@@ -101,6 +102,9 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
+ StagingBufferPool::~StagingBufferPool() = default;
+ 
+ StagingBufferRef StagingBufferPool::Request(size_t size, MemoryUsage usage, bool deferred) {
++    if (usage == MemoryUsage::Upload) {
++        Doris::Perf::Add(Doris::Perf::Count::UploadBytes, size);
++    }
+     if (!deferred && usage == MemoryUsage::Upload && size <= region_size) {
+         return GetStreamBuffer(size);
+     }
+@@ -222,6 +226,8 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
+     if (device.IsBufferDeviceAddressSupported()) {
+         buffer_ci.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+     }
++    Doris::Perf::Add(Doris::Perf::Count::StagingCreated);
++    Doris::Perf::Add(Doris::Perf::Count::StagingCreatedBytes, buffer_ci.size);
+     vk::Buffer buffer = memory_allocator.CreateBuffer(buffer_ci, usage);
+     if (device.HasDebuggingToolAttached()) {
+         ++buffer_index;
+@@ -276,7 +282,10 @@ void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
+     const size_t end_offset = (std::min)(begin_offset + deletions_per_tick, old_size);
+     const auto begin = entries.begin() + begin_offset;
+     const auto end = entries.begin() + end_offset;
+-    entries.erase(std::remove_if(begin, end, is_deletable), end);
++    {
++        const Doris::Perf::ScopedWait doris_wait{Doris::Perf::Wait::GpuMemory};
++        entries.erase(std::remove_if(begin, end, is_deletable), end);
++    }
+ 
+     const size_t new_size = entries.size();
+     staging.delete_index += deletions_per_tick;
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index b22c8f4cf2..7ceec2de5a 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -16,6 +16,7 @@
+ #include <boost/container/small_vector.hpp>
+ 
+ #include "common/alignment.h"
++#include "common/doris_perf.h"
+ #include "common/settings.h"
+ #include "common/slot_vector.h"
+ #include "video_core/control/channel_state.h"
+@@ -168,7 +169,12 @@ void TextureCache<P>::RunGarbageCollector() {
+         if ((!aggressive_mode && True(image.flags & ImageFlagBits::CostlyLoad)) || (!high_priority_mode && must_download)) {
+             return false;
+         }
++        Doris::Perf::Add(Doris::Perf::Count::GcRemoved);
++        if (!must_download && True(image.flags & ImageFlagBits::GpuModified)) {
++            Doris::Perf::Add(Doris::Perf::Count::GcDroppedGpuData);
++        }
+         if (must_download) {
++            Doris::Perf::Add(Doris::Perf::Count::GcDownloaded);
+             auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
+             const auto copies = FixSmallVectorADL(FullDownloadCopies(image.info));
+             image.DownloadMemory(map, copies);
+@@ -241,10 +247,19 @@ void TextureCache<P>::TickFrame() {
+     if (runtime.CanReportMemoryUsage()) {
+         total_used_memory = runtime.GetDeviceMemoryUsage();
+     }
++    if (Doris::Perf::Enabled()) {
++        Doris::Perf::SetGauge(Doris::Perf::Gauge::TextureCacheMemory, total_used_memory >> 20);
++        Doris::Perf::SetGauge(Doris::Perf::Gauge::TextureCacheExpected, expected_memory >> 20);
++        Doris::Perf::SetGauge(Doris::Perf::Gauge::TextureCacheCritical, critical_memory >> 20);
++    }
+     if (total_used_memory > minimum_memory) {
+         RunGarbageCollector();
+     }
+-    sentenced_images.Tick();
++    {
++        // Eden (Doris): destroying textures frees their GPU memory.
++        const Doris::Perf::ScopedWait doris_wait{Doris::Perf::Wait::GpuMemory};
++        sentenced_images.Tick();
++    }
+     sentenced_framebuffers.Tick();
+     sentenced_image_view.Tick();
+     TickAsyncDecode();
+@@ -1187,6 +1202,10 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
+     }
+ 
+     image.flags &= ~ImageFlagBits::CpuModified;
++    Doris::Perf::Add(Doris::Perf::Count::TextureUploads);
++    if (True(image.flags & ImageFlagBits::GpuModified)) {
++        Doris::Perf::Add(Doris::Perf::Count::TextureUploadsOverGpuData);
++    }
+ 
+     TrackImage(image, image_id);
+ 
+diff --git a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
+index e57864ede8..2e76bb4ab3 100644
+--- a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
++++ b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
+@@ -24,6 +24,7 @@
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+ #include "video_core/gpu_logging/gpu_logging.h"
+ #include "common/settings.h"
++#include "common/doris_perf.h"
+ 
+ namespace Vulkan {
+     namespace {
+@@ -240,7 +241,12 @@ namespace Vulkan {
+         VkImage handle{};
+         VmaAllocation allocation{};
+         VmaAllocationInfo alloc_info{};
+-        vk::Check(vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info));
++        {
++            // Eden (Doris): time the GPU emulation thread spends getting GPU memory.
++            const Doris::Perf::ScopedWait doris_wait{Doris::Perf::Wait::GpuMemory};
++            vk::Check(vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info));
++        }
++        Doris::Perf::Add(Doris::Perf::Count::GpuMemoryAllocatedBytes, alloc_info.size);
+ 
+         // Log GPU memory allocation for images
+         if (GPU::Logging::IsActive() &&
+@@ -277,7 +283,13 @@ namespace Vulkan {
+         VmaAllocation allocation{};
+         VkMemoryPropertyFlags property_flags{};
+ 
+-        vk::Check(vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info));
++        {
++            // Eden (Doris): time the GPU emulation thread spends getting GPU memory.
++            const Doris::Perf::ScopedWait doris_wait{Doris::Perf::Wait::GpuMemory};
++            vk::Check(
++                vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info));
++        }
++        Doris::Perf::Add(Doris::Perf::Count::GpuMemoryAllocatedBytes, alloc_info.size);
+         vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
+ 
+         // Log GPU memory allocation for buffers
+-- 
+2.43.0
+

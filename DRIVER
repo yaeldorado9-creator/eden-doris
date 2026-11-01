@@ -1,2 +1,3 @@
 # The driver every Eden (Doris) release is meant for: "<release tag> <zip>". The build attaches it to the release.
-apex-doris-11 Apex-Doris-11.zip
+# Apex Doris 14 draws like 11 and writes apex_doris.txt (frames, CPU and GPU clocks, GPU load, temperatures).
+apex-doris-14 Apex-Doris-14.zip
