@@ -1,0 +1,42 @@
+From 98499ef525ab824c91fc8d92c4fe2d292e431e4a Mon Sep 17 00:00:00 2001
+From: "Eden (Doris) build" <doris@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 00:23:45 -0500
+Subject: [PATCH] turnip (Doris): no LRZ for Eden
+
+In a stock Eden, Apex Doris 9 (render mode measured per pass, mostly SYSMEM) has no distant flicker in
+Tears of the Kingdom but square blocks of the ground turn black and flicker; every pass in GMEM (Apex's
+TOTK rule) hides them but is slow and makes distant objects flicker. LRZ culls in blocks and is the
+suspect, and Apex's own TOTK rule also touched an LRZ option. For the engine "yuzu Emulator", turn LRZ
+off as TU_DEBUG=nolrz does; per-pixel depth testing is unaffected.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014Ps8wnhVXtSU7d88gGtyHX
+---
+ src/freedreno/vulkan/tu_device.cc | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index b554a5b024c..c6cfd21c137 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -3220,6 +3220,17 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
+       (!border_color_without_format ||
+        !physical_device->instance->drirc.misc.enable_d24s8_border_color_workaround);
+    device->use_lrz = !TU_DEBUG_START(NOLRZ);
++   {
++      /* Eden (Doris): no LRZ (the coarse block depth cull) for Eden, the same as TU_DEBUG=nolrz. In Tears
++       * of the Kingdom, with most render passes drawn straight to memory (SYSMEM), square blocks of the
++       * ground turn black and flicker; drawing everything in tile memory hides them but is slow and makes
++       * distant objects flicker. LRZ culls in blocks and is the suspect. Per-pixel depth testing is
++       * unaffected.
++       */
++      const char *engine = physical_device->instance->vk.app_info.engine_name;
++      if (engine && !strcmp(engine, "yuzu Emulator"))
++         device->use_lrz = false;
++   }
+ 
+    tu_gpu_tracepoint_config_variable();
+ 
+-- 
+2.43.0
+

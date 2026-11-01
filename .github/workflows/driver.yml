@@ -2,9 +2,8 @@ name: Build Apex Doris driver
 
 # Builds the Doris Turnip driver (Balemuni's Apex v2 Ultimate rebuilt from source, plus Doris
 # changes for Tears of the Kingdom on Eden) from Mesa at driver/MESA_COMMIT with driver/patches,
-# and publishes three zips for Eden's driver manager as a release (apex-doris-<number>):
-#   Apex-Doris-<n>.zip          patches 0001-0004: tiled 32-bit images, GPU barriers for Eden, every pass in GMEM
-#   Apex-Doris-<n>-fast.zip     patches 0001-0003: tiled 32-bit images, GPU barriers for Eden, measured render modes
+# and publishes two zips for Eden's driver manager as a release (apex-doris-<number>):
+#   Apex-Doris-<n>.zip          all patches: tiled 32-bit images, measured render modes, no LRZ for Eden
 #   Apex-Doris-<n>-asis.zip     patch 0001 only (Apex v2 Ultimate as it is)
 on:
   push:
@@ -72,30 +71,24 @@ jobs:
           cd mesa && git am -q ../driver/patches/0001-*.patch && git tag apex && cd ..
           driver/build.sh mesa ndk/android-ndk-${NDK_VERSION} out "$NUM" "Apex-Doris-${NUM}-asis.zip" "Apex v2 Ultimate as is"
 
-      - name: Build "TotK fast" (patches 0001-0003)
-        run: |
-          cd mesa && git am -q ../driver/patches/0002-*.patch ../driver/patches/0003-*.patch && cd ..
-          driver/build.sh mesa ndk/android-ndk-${NDK_VERSION} out "$NUM" "Apex-Doris-${NUM}-fast.zip" \
-            "TotK fast: GPU barriers for Eden, render mode measured per pass"
-
       - name: Build "TotK" (all patches)
         run: |
           cd mesa && for p in ../driver/patches/*.patch; do
-            case "$(basename "$p")" in 000[1-3]-*) continue;; esac
+            case "$(basename "$p")" in 0001-*) continue;; esac
             git am -q "$p"
           done && cd ..
           driver/build.sh mesa ndk/android-ndk-${NDK_VERSION} out "$NUM" "Apex-Doris-${NUM}.zip" \
-            "TotK: GPU barriers for Eden, every render pass in tile memory"
+            "TotK: render mode measured per pass, no LRZ for Eden"
           ccache -s | head -5
 
       - name: Check and checksum
         run: |
           cd out
-          for z in Apex-Doris-${NUM}.zip Apex-Doris-${NUM}-fast.zip Apex-Doris-${NUM}-asis.zip; do
+          for z in Apex-Doris-${NUM}.zip Apex-Doris-${NUM}-asis.zip; do
             unzip -l "$z"
             unzip -p "$z" vulkan.freedreno.so | strings | grep -m1 "Apex v2 Ultimate, Doris"
           done
-          sha256sum Apex-Doris-${NUM}.zip Apex-Doris-${NUM}-fast.zip Apex-Doris-${NUM}-asis.zip > SHA256SUMS.txt
+          sha256sum Apex-Doris-${NUM}.zip Apex-Doris-${NUM}-asis.zip > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Publish
@@ -104,5 +97,5 @@ jobs:
         run: |
           gh release create "apex-doris-${NUM}" --target "${GITHUB_SHA}" \
             --title "Apex Doris ${NUM} (driver)" \
-            --notes "Turnip driver for Eden (Doris): Balemuni's Apex v2 Ultimate rebuilt from source (Mesa $(cut -c1-10 driver/MESA_COMMIT)), plus Doris changes for Eden. Apex-Doris-${NUM}.zip: 32-bit images tiled, real GPU barriers for Eden (as Eden (Doris) build 6), every render pass in tile memory (GMEM, Apex's TotK rule). Apex-Doris-${NUM}-fast.zip: the same with the render mode measured per pass instead. Apex-Doris-${NUM}-asis.zip: Apex v2 Ultimate as it is. Install in Eden: GPU driver manager, install, pick the zip." \
-            out/Apex-Doris-${NUM}.zip out/Apex-Doris-${NUM}-fast.zip out/Apex-Doris-${NUM}-asis.zip out/SHA256SUMS.txt
+            --notes "Turnip driver for Eden (Doris): Balemuni's Apex v2 Ultimate rebuilt from source (Mesa $(cut -c1-10 driver/MESA_COMMIT)), plus Doris changes for Eden. Apex-Doris-${NUM}.zip: 32-bit images tiled, render mode measured per pass, no LRZ for Eden. Apex-Doris-${NUM}-asis.zip: Apex v2 Ultimate as it is. Install in Eden: GPU driver manager, install, pick the zip." \
+            out/Apex-Doris-${NUM}.zip out/Apex-Doris-${NUM}-asis.zip out/SHA256SUMS.txt
