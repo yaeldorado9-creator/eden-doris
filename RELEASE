@@ -7,4 +7,9 @@
 # 0006 and 0008-0026 without 0007 (made water vanish), their adaptation 0027, the device-memory
 # continuity fix 0032, and variants/speed: versionCode, Vulkan worker woken only when asleep, frame
 # generation resuming 100 ms after a hitch, one GPU wait per texture-cleanup pass.
--   patches:1-1 patches:6-6 patches:8-27 patches:32-32 variants/speed
+#
+# Release 33 splits release 32 in two to find what brought the dark ground squares back:
+#   -lun    the eden-lun speed-ups (0006, 0008-0027) and the continuity fix 0032
+#   -later  only the three later speed-ups (variants/speed)
+-lun     patches:1-1 patches:6-6 patches:8-27 patches:32-32 variants/build6
+-later   patches:1-1 variants/speed
