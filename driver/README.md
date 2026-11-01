@@ -14,8 +14,9 @@ Balemuni's **Apex v2 Ultimate** Turnip driver rebuilt from source, as the base f
 
 `patches/0001` is that rebuild (the "as is" zip). `patches/0002`-`0007` are the Doris driver for TotK on Eden (the main
 zip): driver 8's patches (with its GPU report, `apex_doris.txt` in Eden's log folder), then no LRZ (0006) and a report
-header saying whether Eden was detected (0007). Driver 11 is the same without the report (driver 9's single patch
-0002 + no LRZ); driver 13 is this series. Everything applies to Eden only (engine name `yuzu Emulator`):
+header saying whether Eden was detected (0007), and frames (fps, slowest 1%, long gaps) and CPU cluster clocks
+in the report (0008). Driver 11 is the same without the report (driver 9's single patch 0002 + no LRZ); driver 13
+is 0001-0007, driver 14 all of them. All three draw the same. Everything applies to Eden only (engine name `yuzu Emulator`):
 
 - **32-bit color images stay tiled.** Eden gives every 32-bit color image a view format list with all 19 formats
   of its size class, BGRA8 among them; on A740 (a7xx gen2) Turnip makes any image whose list mixes swapped and

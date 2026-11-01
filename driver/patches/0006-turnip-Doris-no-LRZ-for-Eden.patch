@@ -1,7 +1,7 @@
 From 7b463c6f0d393914c548024c87aaca42f8223c5e Mon Sep 17 00:00:00 2001
 From: "Eden (Doris) build" <doris@users.noreply.github.com>
 Date: Sun, 1 Nov 2026 00:23:45 -0500
-Subject: [PATCH 6/7] turnip (Doris): no LRZ for Eden
+Subject: [PATCH 6/8] turnip (Doris): no LRZ for Eden
 
 In a stock Eden, Apex Doris 9 (render mode measured per pass, mostly SYSMEM) has no distant flicker in
 Tears of the Kingdom but square blocks of the ground turn black and flicker; every pass in GMEM (Apex's

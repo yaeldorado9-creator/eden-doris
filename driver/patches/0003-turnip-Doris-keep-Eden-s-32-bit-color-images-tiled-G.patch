@@ -1,7 +1,7 @@
 From 119f2fa2d38b566932290266426b5ee7ad9c2ffa Mon Sep 17 00:00:00 2001
 From: "Eden (Doris) build" <doris@users.noreply.github.com>
 Date: Fri, 30 Oct 2026 15:04:17 -0500
-Subject: [PATCH 3/7] turnip (Doris): keep Eden's 32-bit color images tiled;
+Subject: [PATCH 3/8] turnip (Doris): keep Eden's 32-bit color images tiled;
  GPU clock/load/temperature report; lock render modes sooner
 
 - tu_image: Eden gives every 32-bit color image a view format list with all 19 formats of its

@@ -1,0 +1,216 @@
+From e0e666a87933f83ef2c32907c4cd1a913de198c6 Mon Sep 17 00:00:00 2001
+From: "Eden (Doris) build" <doris@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 17:35:42 -0500
+Subject: [PATCH 8/8] turnip (Doris): report frames (fps, slowest 1%, long
+ gaps) and CPU cluster clocks every 10 seconds
+
+The report already had the GPU clock and load and the temperatures. To see what happens when the game
+drops frames after a while (heat throttling, GPU or CPU limits), it now also writes, every 10 seconds:
+- frames: presents per second (vkQueueSignalReleaseImageANDROID, so generated frames count), average
+  and slowest 1% frame time, the longest gap, and how many gaps were over 33, 50 and 100 ms;
+- cpu: each cluster's average and highest clock and the lowest maximum it was allowed (thermal and
+  power limits lower it).
+Nothing that is drawn changes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014Ps8wnhVXtSU7d88gGtyHX
+---
+ src/freedreno/vulkan/tu_doris.cc | 125 +++++++++++++++++++++++++++++++
+ src/vulkan/runtime/vk_android.c  |   6 ++
+ 2 files changed, 131 insertions(+)
+
+diff --git a/src/freedreno/vulkan/tu_doris.cc b/src/freedreno/vulkan/tu_doris.cc
+index 13f603414dc..8350d57979f 100644
+--- a/src/freedreno/vulkan/tu_doris.cc
++++ b/src/freedreno/vulkan/tu_doris.cc
+@@ -28,6 +28,11 @@
+ 
+ #include "git_sha1.h"
+ 
++extern "C" {
++/* Eden (Doris): set to a function called on every present (vk_android.c). */
++extern void (*vk_doris_present_hook)(void);
++}
++
+ namespace {
+ 
+ /** The report file **/
+@@ -90,6 +95,33 @@ struct thermal_zone {
+ 
+ constexpr uint64_t WINDOW_NS = 10'000'000'000ull;
+ 
++/* CPU clusters (cpufreq policies): current clock and the highest clock currently allowed (the
++ * thermal and power limits lower it), sampled every second.
++ */
++struct cpu_policy {
++   int id;
++   std::string cur_path, max_path;
++   double cur_sum = 0;
++   unsigned cur_max = 0, cap_min = ~0u, samples = 0;
++};
++
++/* Frames: the time between presents (vkQueueSignalReleaseImageANDROID). */
++struct frame_state {
++   std::mutex mutex;
++   uint64_t last_ns = 0;
++   std::vector<float> intervals_ms;
++} frames;
++
++void
++doris_present(void)
++{
++   uint64_t now = os_time_get_nano();
++   std::scoped_lock lock(frames.mutex);
++   if (frames.last_ns)
++      frames.intervals_ms.push_back((now - frames.last_ns) / 1e6f);
++   frames.last_ns = now;
++}
++
+ struct system_state {
+    std::mutex mutex;
+    uint64_t last_sample_ns = 0, window_start_ns = 0;
+@@ -97,8 +129,97 @@ struct system_state {
+    unsigned clock_min = ~0u, clock_max = 0, samples = 0, busy_samples = 0;
+    bool zones_scanned = false;
+    std::vector<thermal_zone> zones;
++   bool policies_scanned = false;
++   std::vector<cpu_policy> policies;
+ } sys;
+ 
++void
++scan_policies()
++{
++   sys.policies_scanned = true;
++   for (int id = 0; id < 16; id++) {
++      char base[96];
++      snprintf(base, sizeof(base), "/sys/devices/system/cpu/cpufreq/policy%d/", id);
++      std::string cur = std::string(base) + "scaling_cur_freq";
++      if (read_first_line(cur.c_str()).empty())
++         continue;
++      cpu_policy p;
++      p.id = id;
++      p.cur_path = cur;
++      p.max_path = std::string(base) + "scaling_max_freq";
++      sys.policies.push_back(p);
++   }
++}
++
++void
++sample_cpu()
++{
++   if (!sys.policies_scanned)
++      scan_policies();
++   for (auto &p : sys.policies) {
++      std::string cur = read_first_line(p.cur_path.c_str());
++      if (cur.empty())
++         continue;
++      unsigned mhz = (unsigned) (atof(cur.c_str()) / 1000.0);
++      p.cur_sum += mhz;
++      p.cur_max = MAX2(p.cur_max, mhz);
++      p.samples++;
++      std::string cap = read_first_line(p.max_path.c_str());
++      if (!cap.empty())
++         p.cap_min = MIN2(p.cap_min, (unsigned) (atof(cap.c_str()) / 1000.0));
++   }
++}
++
++/* One line per window: CPU clusters' average and highest clock, and the lowest allowed maximum. */
++void
++write_cpu_line(double window_s)
++{
++   std::string line;
++   for (auto &p : sys.policies) {
++      if (!p.samples)
++         continue;
++      char buf[96];
++      snprintf(buf, sizeof(buf), "%scpu%d+ avg %.0f MHz (top %u, allowed %s%u)", line.empty() ? "" : ", ", p.id,
++               p.cur_sum / p.samples, p.cur_max, p.cap_min == ~0u ? "?" : "", p.cap_min == ~0u ? 0 : p.cap_min);
++      line += buf;
++      p.cur_sum = 0;
++      p.cur_max = 0;
++      p.cap_min = ~0u;
++      p.samples = 0;
++   }
++   if (!line.empty())
++      tu_doris_printf("cpu (%.0f s): %s\n", window_s, line.c_str());
++}
++
++/* One line per window: presents per second, the slowest 1% and the longest gaps. */
++void
++write_frames_line(double window_s)
++{
++   std::vector<float> v;
++   {
++      std::scoped_lock lock(frames.mutex);
++      v.swap(frames.intervals_ms);
++   }
++   if (v.empty()) {
++      tu_doris_printf("frames (%.0f s): none presented\n", window_s);
++      return;
++   }
++   std::sort(v.begin(), v.end());
++   double sum = 0;
++   unsigned over33 = 0, over50 = 0, over100 = 0;
++   for (float ms : v) {
++      sum += ms;
++      over33 += ms > 33.4f;
++      over50 += ms > 50.0f;
++      over100 += ms > 100.0f;
++   }
++   float p99 = v[MIN2(v.size() - 1, (size_t) (v.size() * 0.99))];
++   tu_doris_printf("frames (%.0f s): %.1f fps, avg %.1f ms, 1%% slowest %.0f ms, longest %.0f ms | gaps over "
++                   "33 ms %u, over 50 ms %u, over 100 ms %u\n",
++                   window_s, v.size() / MAX2(window_s, 0.001), sum / v.size(), p99, v.back(), over33, over50,
++                   over100);
++}
++
+ double
+ to_celsius(const std::string &text)
+ {
+@@ -513,6 +634,7 @@ tu_doris_device_init(struct tu_device *device)
+    if (!tu_doris_enabled())
+       return;
+    tu_doris_printf("\n#### Apex Doris GPU report (Mesa " PACKAGE_VERSION MESA_GIT_SHA1 "), device opened\n");
++   vk_doris_present_hook = doris_present;
+    {
+       const char *engine = device->instance->vk.app_info.engine_name;
+       const char *app = device->instance->vk.app_info.app_name;
+@@ -598,8 +720,11 @@ tu_doris_tick(void)
+    if (now - sys.last_sample_ns >= 1'000'000'000ull) {
+       sys.last_sample_ns = now;
+       sample_gpu();
++      sample_cpu();
+    }
+    if (now - sys.window_start_ns >= WINDOW_NS) {
++      write_frames_line((now - sys.window_start_ns) / 1e9);
++      write_cpu_line((now - sys.window_start_ns) / 1e9);
+       write_system_line((now - sys.window_start_ns) / 1e9);
+       sys.clock_sum = sys.busy_sum = 0;
+       sys.clock_min = ~0u;
+diff --git a/src/vulkan/runtime/vk_android.c b/src/vulkan/runtime/vk_android.c
+index 4a79a44404c..da95bfc95fb 100644
+--- a/src/vulkan/runtime/vk_android.c
++++ b/src/vulkan/runtime/vk_android.c
+@@ -551,6 +551,9 @@ vk_anb_semaphore_init_once(struct vk_queue *queue, struct vk_device *device)
+                                                  &queue->anb_semaphore);
+ }
+ 
++/* Eden (Doris): called on every present (the driver's report counts frames). */
++void (*vk_doris_present_hook)(void) = NULL;
++
+ VKAPI_ATTR VkResult VKAPI_CALL
+ vk_common_QueueSignalReleaseImageANDROID(VkQueue _queue,
+                                          uint32_t waitSemaphoreCount,
+@@ -562,6 +565,9 @@ vk_common_QueueSignalReleaseImageANDROID(VkQueue _queue,
+    struct vk_device *device = queue->base.device;
+    VkResult result;
+ 
++   if (vk_doris_present_hook)
++      vk_doris_present_hook();
++
+    if (waitSemaphoreCount == 0) {
+       *pNativeFenceFd = -1;
+       return VK_SUCCESS;
+-- 
+2.43.0
+

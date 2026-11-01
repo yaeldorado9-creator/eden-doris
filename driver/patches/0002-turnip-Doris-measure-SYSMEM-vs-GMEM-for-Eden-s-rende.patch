@@ -1,7 +1,7 @@
 From a8b9bc97f4c3084a83ca5c52f1abdd3a56fa5058 Mon Sep 17 00:00:00 2001
 From: "Eden (Doris) build" <doris@users.noreply.github.com>
 Date: Fri, 30 Oct 2026 12:01:34 -0500
-Subject: [PATCH 2/7] turnip (Doris): measure SYSMEM vs GMEM for Eden's render
+Subject: [PATCH 2/8] turnip (Doris): measure SYSMEM vs GMEM for Eden's render
  passes; report where the GPU time goes
 
 - driconf: for the engine "yuzu Emulator" (Eden), tu_autotune_algorithm=profiled: each render pass

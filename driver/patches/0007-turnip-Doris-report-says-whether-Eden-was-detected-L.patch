@@ -1,7 +1,7 @@
 From cfe657ae8107b21be1581b72e70970ab455503e7 Mon Sep 17 00:00:00 2001
 From: "Eden (Doris) build" <doris@users.noreply.github.com>
 Date: Sun, 1 Nov 2026 00:27:19 -0500
-Subject: [PATCH 7/7] turnip (Doris): report says whether Eden was detected,
+Subject: [PATCH 7/8] turnip (Doris): report says whether Eden was detected,
  LRZ and the autotune algorithm
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

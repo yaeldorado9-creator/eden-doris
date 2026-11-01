@@ -1,7 +1,7 @@
 From 42a41c89e901c817b93ea2cbacdb5b423bc3616c Mon Sep 17 00:00:00 2001
 From: "Eden (Doris) build" <doris@users.noreply.github.com>
 Date: Sat, 31 Oct 2026 11:57:08 -0500
-Subject: [PATCH 5/7] turnip (Doris): GMEM must be 15% faster to win; timing
+Subject: [PATCH 5/8] turnip (Doris): GMEM must be 15% faster to win; timing
  without per-pass trace copies; count reinterpreting views
 
 - autotune (profiled): pick GMEM for a pass only when it is at least 15% faster. The CCU switch

@@ -1,7 +1,7 @@
 From a3a173700dac29c4984b0b6307505660dc733462 Mon Sep 17 00:00:00 2001
 From: "Eden (Doris) build" <doris@users.noreply.github.com>
 Date: Sat, 31 Oct 2026 11:08:16 -0500
-Subject: [PATCH 4/7] turnip (Doris): time every GPU operation for 1 s of every
+Subject: [PATCH 4/8] turnip (Doris): time every GPU operation for 1 s of every
  30 (fixed: turnip's tracepoints are markers)
 
 Apex Doris 4's operation timing wrote nothing: it only looked at events marked as begin/end
