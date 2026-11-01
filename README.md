@@ -9,8 +9,10 @@ handhelds (AYN Thor Pro): distant terrain, structures and shadows that flicker o
 > **From build 31, Doris is the Eden build Yael plays (PR #4324) plus only speed-ups**, for the **Apex Doris 11**
 > driver, which on its own removes TotK's graphical problems in that build (32-bit images tiled, render mode
 > measured per pass, no LRZ; see `driver/`). The APK has the own app ID (0001), the eden-lun speed-ups 0006 and
-> 0008-0026 (not 0007, which made water vanish) with their adaptation 0027, and the device-memory continuity fix
-> 0032; none of Doris's graphics changes or settings (0002-0005, 0028-0053). See `RELEASE`.
+> 0008-0026 (not 0007, which made water vanish) with their adaptation 0027, the device-memory continuity fix
+> 0032, and three later speed-ups taken out on their own (`variants/speed`: the Vulkan worker is woken only when
+> asleep, frame generation resumes 100 ms after a hitch, texture cleanup waits for the GPU once per pass); none of
+> Doris's graphics changes or settings (0002-0005, the texture-cleanup rules, the shader loop limit). See `RELEASE`.
 
 ## Installs beside every other Eden
 

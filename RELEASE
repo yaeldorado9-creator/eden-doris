@@ -4,6 +4,7 @@
 #
 # Release 31+: Eden PR #4324 (the build Yael plays) + only the speed-ups, no Doris graphics changes: the
 # Apex Doris 11 driver fixes the graphics in that build on its own. Own app ID (0001), eden-lun speed-ups
-# 0006 and 0008-0026 without 0007 (made water vanish), their adaptation 0027, and the device-memory
-# continuity fix 0032.
+# 0006 and 0008-0026 without 0007 (made water vanish), their adaptation 0027, the device-memory
+# continuity fix 0032, and variants/speed: versionCode, Vulkan worker woken only when asleep, frame
+# generation resuming 100 ms after a hitch, one GPU wait per texture-cleanup pass.
 -   patches:1-1 patches:6-6 patches:8-27 patches:32-32 variants/speed
