@@ -12,17 +12,19 @@ Balemuni's **Apex v2 Ultimate** Turnip driver rebuilt from source, as the base f
 - ir3 global code motion on by default (`GCM=1`), 512 KiB pipeline and kgsl profiling suballocators, 4 GiB disk
   shader cache.
 
-`patches/0001` is that rebuild (the "as is" zip). `patches/0002`-`0003` are the Doris driver for TotK on Eden (the main
-zip); everything in them applies to Eden only (engine name `yuzu Emulator`):
+`patches/0001` is that rebuild (the "as is" zip). `patches/0002`-`0007` are the Doris driver for TotK on Eden (the main
+zip): driver 8's patches (with its GPU report, `apex_doris.txt` in Eden's log folder), then no LRZ (0006) and a report
+header saying whether Eden was detected (0007). Driver 11 is the same without the report (driver 9's single patch
+0002 + no LRZ); driver 13 is this series. Everything applies to Eden only (engine name `yuzu Emulator`):
 
 - **32-bit color images stay tiled.** Eden gives every 32-bit color image a view format list with all 19 formats
   of its size class, BGRA8 among them; on A740 (a7xx gen2) Turnip makes any image whose list mixes swapped and
   unswapped formats LINEAR, so all of TotK's 32-bit render targets and textures were drawn and sampled untiled.
-  They are now tiled (still without UBWC). R8G8 vs R16 reinterpretation still goes linear. (0002)
+  They are now tiled (still without UBWC). R8G8 vs R16 reinterpretation still goes linear.
 - **Render mode measured per pass:** each render pass with 5+ draws is timed on the GPU in SYSMEM and GMEM and
   the faster one is used; GMEM only when at least 15% faster (the CCU switch is paid outside the timed pass), and
-  the choice is locked after 10 samples per mode and 10 s, for passes from 0.15 ms. (0002)
-- **No LRZ** (the coarse block depth cull), as `TU_DEBUG=nolrz`. (0003)
+  the choice is locked after 10 samples per mode and 10 s, for passes from 0.15 ms.
+- **No LRZ** (the coarse block depth cull), as `TU_DEBUG=nolrz`.
 
 Driver 10 tried the other way round, and its patches are in the history: real GPU barriers for Eden plus every
 render pass in GMEM (Apex's TOTK rule; of its two options only `prefer_gmem` changes anything in Eden, because

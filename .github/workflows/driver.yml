@@ -3,7 +3,7 @@ name: Build Apex Doris driver
 # Builds the Doris Turnip driver (Balemuni's Apex v2 Ultimate rebuilt from source, plus Doris
 # changes for Tears of the Kingdom on Eden) from Mesa at driver/MESA_COMMIT with driver/patches,
 # and publishes two zips for Eden's driver manager as a release (apex-doris-<number>):
-#   Apex-Doris-<n>.zip          all patches: tiled 32-bit images, measured render modes, no LRZ for Eden
+#   Apex-Doris-<n>.zip          all patches: tiled 32-bit images, measured render modes, no LRZ for Eden, report
 #   Apex-Doris-<n>-asis.zip     patch 0001 only (Apex v2 Ultimate as it is)
 on:
   push:
@@ -78,7 +78,7 @@ jobs:
             git am -q "$p"
           done && cd ..
           driver/build.sh mesa ndk/android-ndk-${NDK_VERSION} out "$NUM" "Apex-Doris-${NUM}.zip" \
-            "TotK: render mode measured per pass, no LRZ for Eden"
+            "TotK: render mode measured per pass, no LRZ for Eden, with report"
           ccache -s | head -5
 
       - name: Check and checksum
@@ -97,5 +97,5 @@ jobs:
         run: |
           gh release create "apex-doris-${NUM}" --target "${GITHUB_SHA}" \
             --title "Apex Doris ${NUM} (driver)" \
-            --notes "Turnip driver for Eden (Doris): Balemuni's Apex v2 Ultimate rebuilt from source (Mesa $(cut -c1-10 driver/MESA_COMMIT)), plus Doris changes for Eden. Apex-Doris-${NUM}.zip: 32-bit images tiled, render mode measured per pass, no LRZ for Eden. Apex-Doris-${NUM}-asis.zip: Apex v2 Ultimate as it is. Install in Eden: GPU driver manager, install, pick the zip." \
+            --notes "Turnip driver for Eden (Doris): Balemuni's Apex v2 Ultimate rebuilt from source (Mesa $(cut -c1-10 driver/MESA_COMMIT)), plus Doris changes for Eden. Apex-Doris-${NUM}.zip: 32-bit images tiled, render mode measured per pass, no LRZ for Eden; writes apex_doris.txt (GPU report) to Eden's log folder. Apex-Doris-${NUM}-asis.zip: Apex v2 Ultimate as it is. Install in Eden: GPU driver manager, install, pick the zip." \
             out/Apex-Doris-${NUM}.zip out/Apex-Doris-${NUM}-asis.zip out/SHA256SUMS.txt
