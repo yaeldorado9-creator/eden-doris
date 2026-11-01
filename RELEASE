@@ -2,6 +2,8 @@
 # A patch set is a folder (all its .patch files, in order) or "patches:<first>-<last>" (patches/ by number).
 # Every APK starts again from the Eden source in UPSTREAM; all share one versionCode.
 #
-# Release 30+: back to build 6 (flicker fixes 0001-0005 + eden-lun speed-ups 0006-0028).
--            patches:1-28 variants/build6
--water-fix   patches:1-28 variants/build6-water-fix
+# Release 31+: Eden PR #4324 (the build Yael plays) + only the speed-ups, no Doris graphics changes: the
+# Apex Doris 11 driver fixes the graphics in that build on its own. Own app ID (0001), eden-lun speed-ups
+# 0006 and 0008-0026 without 0007 (made water vanish), their adaptation 0027, and the device-memory
+# continuity fix 0032.
+-   patches:1-1 patches:6-6 patches:8-27 patches:32-32 variants/speed
