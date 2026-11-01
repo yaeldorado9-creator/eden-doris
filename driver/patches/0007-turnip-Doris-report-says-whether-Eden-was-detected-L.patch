@@ -1,0 +1,36 @@
+From cfe657ae8107b21be1581b72e70970ab455503e7 Mon Sep 17 00:00:00 2001
+From: "Eden (Doris) build" <doris@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 00:27:19 -0500
+Subject: [PATCH 7/7] turnip (Doris): report says whether Eden was detected,
+ LRZ and the autotune algorithm
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014Ps8wnhVXtSU7d88gGtyHX
+---
+ src/freedreno/vulkan/tu_doris.cc | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/src/freedreno/vulkan/tu_doris.cc b/src/freedreno/vulkan/tu_doris.cc
+index 8002a576104..13f603414dc 100644
+--- a/src/freedreno/vulkan/tu_doris.cc
++++ b/src/freedreno/vulkan/tu_doris.cc
+@@ -513,6 +513,16 @@ tu_doris_device_init(struct tu_device *device)
+    if (!tu_doris_enabled())
+       return;
+    tu_doris_printf("\n#### Apex Doris GPU report (Mesa " PACKAGE_VERSION MESA_GIT_SHA1 "), device opened\n");
++   {
++      const char *engine = device->instance->vk.app_info.engine_name;
++      const char *app = device->instance->vk.app_info.app_name;
++      bool eden = tu_doris_is_eden_engine(engine);
++      tu_doris_printf("app \"%s\", engine \"%s\": %s; LRZ %s, autotune %s\n", app ? app : "", engine ? engine : "",
++                      eden ? "Eden detected (32-bit images tiled, render mode measured per pass)"
++                           : "not Eden, Doris changes off",
++                      device->use_lrz ? "on" : "off",
++                      device->instance->drirc.perf.autotune_algo ? device->instance->drirc.perf.autotune_algo : "default");
++   }
+    device->trace_context.doris_event = doris_event;
+    device->trace_context.doris_end_of_batch = doris_end_of_batch;
+    /* Tracepoints recorded inside a render pass are copied into the command buffer's trace with a
+-- 
+2.43.0
+
