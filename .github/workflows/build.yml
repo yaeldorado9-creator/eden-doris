@@ -6,7 +6,7 @@ name: Build Eden (Doris)
 on:
   push:
     branches: [main]
-    paths: [UPSTREAM, RELEASE, 'patches/**', 'upstream/**', 'variants/**', '.github/workflows/build.yml']
+    paths: [UPSTREAM, RELEASE, DRIVER, 'patches/**', 'upstream/**', 'variants/**', '.github/workflows/build.yml']
   workflow_dispatch:
 
 permissions:
@@ -143,6 +143,11 @@ jobs:
             echo
             cat notes-variants.md
           } > notes.md
+          # The driver this release is meant for (DRIVER), attached next to the APKs.
+          read -r DRV_TAG DRV_ZIP < <(grep -v '^[[:space:]]*#' DRIVER | grep -v '^[[:space:]]*$' | head -n 1)
+          if [ -n "$DRV_ZIP" ] && gh release download "$DRV_TAG" -p "$DRV_ZIP" -D out; then
+            echo "Driver: $DRV_ZIP (release $DRV_TAG). Install it in Eden: GPU driver manager, install, pick the zip." >> notes.md
+          fi
           shopt -s nullglob
           gh release create "$DORIS_TAG" out/*.apk out/SHA256SUMS.txt out/*.zip \
             --title "Eden (Doris) ${{ github.run_number }}" --notes-file notes.md --target "${{ github.sha }}"

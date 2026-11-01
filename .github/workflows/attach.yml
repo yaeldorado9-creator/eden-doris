@@ -1,0 +1,27 @@
+name: Attach a file from one release to another
+
+# Copies a release asset (e.g. the recommended driver zip) into another release, for when a release
+# should carry a file built by a different workflow. Run by hand (workflow_dispatch).
+on:
+  workflow_dispatch:
+    inputs:
+      from_tag: { description: "Release that has the file (e.g. apex-doris-11)", required: true }
+      asset: { description: "File name (e.g. Apex-Doris-11.zip)", required: true }
+      to_tag: { description: "Release to add it to (e.g. doris-32)", required: true }
+
+permissions:
+  contents: write
+
+jobs:
+  attach:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Copy the file
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FROM: ${{ inputs.from_tag }}
+          ASSET: ${{ inputs.asset }}
+          TO: ${{ inputs.to_tag }}
+        run: |
+          gh release download "$FROM" -R "$GITHUB_REPOSITORY" -p "$ASSET"
+          gh release upload "$TO" "$ASSET" -R "$GITHUB_REPOSITORY" --clobber
