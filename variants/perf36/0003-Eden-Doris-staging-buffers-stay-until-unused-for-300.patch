@@ -1,0 +1,86 @@
+From 0e5902711cee68617a3e8eb049ae31f3ec9fe31d Mon Sep 17 00:00:00 2001
+From: Eden-Doris <doris@localhost>
+Date: Mon, 2 Nov 2026 00:42:44 -0500
+Subject: [PATCH 3/4] Eden (Doris): staging buffers stay until unused for 300
+ frames
+
+Eden deleted every staging buffer the GPU was done with whenever its size level came round (every
+64 frames, about 2 s), so the next big upload created it again: most hitches in the release 35 log
+had a new 64 MiB staging buffer, about 45 ms to get from the system. They now stay until unused for
+300 frames (about 10 s). Same uploads, same contents.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014Ps8wnhVXtSU7d88gGtyHX
+---
+ .../renderer_vulkan/vk_staging_buffer_pool.cpp         | 10 +++++++++-
+ .../renderer_vulkan/vk_staging_buffer_pool.h           |  4 ++++
+ 2 files changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+index 2ffd677418..9285ebe171 100644
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+@@ -124,6 +124,7 @@ void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
+ }
+ 
+ void StagingBufferPool::TickFrame() {
++    ++frame_count;
+     current_delete_level = (current_delete_level + 1) % NUM_LEVELS;
+ 
+     ReleaseCache(MemoryUsage::DeviceLocal);
+@@ -201,6 +202,7 @@ std::optional<StagingBufferRef> StagingBufferPool::TryGetReservedBuffer(size_t s
+     }
+     cache_level.iterate_index = std::distance(entries.begin(), it) + 1;
+     it->tick = deferred ? (std::numeric_limits<u64>::max)() : scheduler.CurrentTick();
++    it->last_used_frame = frame_count;
+     ASSERT(!it->deferred);
+     it->deferred = deferred;
+     return it->Ref();
+@@ -246,6 +248,7 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
+         .log2_level = log2_size,
+         .index = unique_ids++,
+         .tick = deferred ? (std::numeric_limits<u64>::max)() : scheduler.CurrentTick(),
++        .last_used_frame = frame_count,
+         .deferred = deferred,
+     });
+     return entry.Ref();
+@@ -275,8 +278,13 @@ void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
+     auto& entries = staging.entries;
+     const size_t old_size = entries.size();
+ 
++    // Eden (Doris): Eden deleted every staging buffer the GPU was done with as soon as its size level
++    // came round (every 64 frames, about 2 s), so the next big upload had to create it again: in a
++    // TotK log most hitches had a new 64 MiB staging buffer, about 45 ms to get from the system.
++    // Buffers now stay until they have gone unused for 300 frames (about 10 s at 30 fps).
++    static constexpr u64 KEEP_UNUSED_FRAMES = 300;
+     const auto is_deletable = [this](const StagingBuffer& entry) {
+-        return scheduler.IsFree(entry.tick);
++        return scheduler.IsFree(entry.tick) && frame_count - entry.last_used_frame >= KEEP_UNUSED_FRAMES;
+     };
+     const size_t begin_offset = staging.delete_index;
+     const size_t end_offset = (std::min)(begin_offset + deletions_per_tick, old_size);
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
+index 6d967abb41..29b09e8ef9 100644
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
+@@ -60,6 +60,8 @@ private:
+         u32 log2_level;
+         u64 index;
+         u64 tick = 0;
++        /// Eden (Doris): frame of the last request that got this buffer.
++        u64 last_used_frame = 0;
+         bool deferred{};
+ 
+         StagingBufferRef Ref() const noexcept {
+@@ -124,6 +126,8 @@ private:
+     StagingBuffersCache download_cache;
+ 
+     size_t current_delete_level = 0;
++    /// Eden (Doris): frames since the pool was created (staging buffers stay for a while unused).
++    u64 frame_count = 0;
+     u64 buffer_index = 0;
+     u64 unique_ids{};
+ };
+-- 
+2.43.0
+

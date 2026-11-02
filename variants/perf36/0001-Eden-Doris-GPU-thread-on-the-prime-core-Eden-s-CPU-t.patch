@@ -1,0 +1,433 @@
+From 65d1b17cf189153937a47546a3c0fbacd04fae25 Mon Sep 17 00:00:00 2001
+From: Eden-Doris <doris@localhost>
+Date: Mon, 2 Nov 2026 00:42:44 -0500
+Subject: [PATCH 1/4] Eden (Doris): GPU thread on the prime core; Eden's CPU
+ topology from all cores; shader builders not background
+
+A TotK log (release 35, ClusterTune Medium) showed busy areas (3000-4600 draws a frame) at 17-22 fps
+with the GPU 50-75% busy and Eden's GPU emulation thread 63-87% busy on a middle core: that thread is
+the limit there. It ran on the X3 prime core at times until minute 12 and never after: Eden read its
+CPU topology at a moment Android had the app in a cpuset without the prime core and kept that.
+- The topology now comes from all the CPUs (masks naming CPUs outside the current cpuset are fine,
+  the kernel uses the allowed part), so it is never stuck without the prime core.
+- The GPU thread is kept on the prime core(s) and the other heavy emulator threads (emulated CPU
+  cores, Vulkan worker, presentation, fences, timing) on the middle cores, so they don't compete
+  for it (through Eden's core groups, which its policy refresh keeps). As Doris builds 13-14.
+- With asynchronous shaders off the game waits for every new pipeline, so the pipeline builders run
+  at normal priority on the performance cores instead of as background threads.
+Thread placement only: nothing that is drawn changes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014Ps8wnhVXtSU7d88gGtyHX
+---
+ src/common/CMakeLists.txt                     |  2 +
+ src/common/doris_cores.cpp                    | 25 ++++++
+ src/common/doris_cores.h                      | 20 +++++
+ src/common/thread.cpp                         | 77 +++++++++++++++----
+ src/common/thread.h                           |  8 ++
+ src/common/thread_worker.h                    |  6 +-
+ src/core/core_timing.cpp                      |  2 +
+ src/core/cpu_manager.cpp                      |  2 +
+ src/video_core/fence_manager.h                |  2 +
+ src/video_core/gpu_thread.cpp                 |  2 +
+ .../renderer_vulkan/vk_pipeline_cache.cpp     |  8 +-
+ .../renderer_vulkan/vk_present_manager.cpp    |  2 +
+ .../renderer_vulkan/vk_scheduler.cpp          |  2 +
+ 13 files changed, 140 insertions(+), 18 deletions(-)
+ create mode 100644 src/common/doris_cores.cpp
+ create mode 100644 src/common/doris_cores.h
+
+diff --git a/src/common/CMakeLists.txt b/src/common/CMakeLists.txt
+index 3851015969..cb6b653885 100644
+--- a/src/common/CMakeLists.txt
++++ b/src/common/CMakeLists.txt
+@@ -99,6 +99,8 @@ add_library(
+     scm_rev.h
+     scope_exit.h
+     scratch_buffer.h
++    doris_cores.cpp
++    doris_cores.h
+     doris_perf.cpp
+     doris_perf.h
+     doris_profiler.cpp
+diff --git a/src/common/doris_cores.cpp b/src/common/doris_cores.cpp
+new file mode 100644
+index 0000000000..9fbb20fa1f
+--- /dev/null
++++ b/src/common/doris_cores.cpp
+@@ -0,0 +1,25 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden (Doris)
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#include "common/doris_cores.h"
++
++#include <atomic>
++
++#include "common/logging.h"
++#include "common/thread.h"
++
++namespace Doris::Cores {
++
++void PinCurrentThread(Role role) {
++    // Goes through Eden's own core groups, so its periodic policy refresh keeps the placement
++    // instead of undoing it.
++    Common::SetCurrentThreadToDorisCores(role == Role::Gpu);
++    static std::atomic<unsigned> logged{0};
++    const unsigned bit = 1u << static_cast<unsigned>(role);
++    if ((logged.fetch_or(bit) & bit) == 0) {
++        LOG_INFO(Frontend, "Doris cores: {} threads placed on the {} cores",
++                 role == Role::Gpu ? "GPU" : "other emulator", role == Role::Gpu ? "prime" : "middle");
++    }
++}
++
++} // namespace Doris::Cores
+diff --git a/src/common/doris_cores.h b/src/common/doris_cores.h
+new file mode 100644
+index 0000000000..70611d804f
+--- /dev/null
++++ b/src/common/doris_cores.h
+@@ -0,0 +1,20 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden (Doris)
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++namespace Doris::Cores {
++
++enum class Role {
++    /// Eden's main GPU emulation thread: the busiest single thread, gets the fastest core.
++    Gpu,
++    /// Other heavy emulator threads (emulated CPU cores, Vulkan worker, presentation, fences,
++    /// timing): the remaining big cores, so they don't share the fastest one with the GPU thread.
++    Worker,
++};
++
++/// Pins the calling thread: the GPU thread to the prime core(s), the other heavy emulator threads to
++/// the middle cores. Nothing changes on a single-cluster CPU or without sched_setaffinity.
++void PinCurrentThread(Role role);
++
++} // namespace Doris::Cores
+diff --git a/src/common/thread.cpp b/src/common/thread.cpp
+index 7b4dec3dce..7409dbd408 100644
+--- a/src/common/thread.cpp
++++ b/src/common/thread.cpp
+@@ -105,6 +105,10 @@ enum class CoreGroup {
+     Unrestricted,
+     Performance,
+     Efficiency,
++    // Eden (Doris): the fastest performance cores (prime) and the other performance cores (middle).
++    // When they can't be told apart, both behave like Performance.
++    Prime,
++    Middle,
+ };
+ 
+ struct ThreadPolicy {
+@@ -125,6 +129,8 @@ struct CpuTopologyState {
+     cpu_set_t allowed{};
+     cpu_set_t performance{};
+     cpu_set_t efficiency{};
++    cpu_set_t prime{};
++    cpu_set_t middle{};
+     bool separated = false;
+     bool initialized = false;
+ 
+@@ -243,14 +249,19 @@ void ComputeTopologyLocked(CpuTopologyState& state) {
+     CPU_ZERO(&state.allowed);
+     CPU_ZERO(&state.performance);
+     CPU_ZERO(&state.efficiency);
+-
+-    if (sched_getaffinity(getpid(), sizeof(state.allowed), &state.allowed) != 0) {
+-        LOG_WARNING(Common, "Could not query process CPU affinity: {}",
+-                    ::Common::GetLastErrorMsg());
+-        return;
++    CPU_ZERO(&state.prime);
++    CPU_ZERO(&state.middle);
++
++    // Eden (Doris): every CPU the system has, not the process's affinity at this moment. Android
++    // moves the app between cpusets (top-app has the prime core, foreground often doesn't), and a
++    // topology read while the prime core was briefly missing kept every emulator thread off it for
++    // the rest of the session (a TotK log: the GPU thread ran on the X3 until minute 12, never
++    // after). A mask naming CPUs outside the current cpuset is fine: the kernel uses the allowed part.
++    const s32 total = PossibleCpuCount();
++    for (s32 cpu = 0; cpu < total; ++cpu) {
++        CPU_SET(cpu, &state.allowed);
+     }
+ 
+-    const s32 total = PossibleCpuCount();
+     auto cores = CollectCores(state.allowed, total, "cpu_capacity", true);
+     if (cores.empty() || (WeightsAreUniform(cores) && MidrsAreDistinct(cores))) {
+         auto by_frequency = CollectCores(state.allowed, total, "cpufreq/cpuinfo_max_freq", false);
+@@ -295,6 +306,20 @@ void ComputeTopologyLocked(CpuTopologyState& state) {
+         return;
+     }
+ 
++    // Eden (Doris): split the performance cores into the fastest ones and the rest.
++    for (const auto& core : cores) {
++        if (core.weight == fastest && CPU_ISSET(core.cpu, &state.performance)) {
++            CPU_SET(core.cpu, &state.prime);
++        }
++    }
++    for (s32 cpu = 0; cpu < total; ++cpu) {
++        if (CPU_ISSET(cpu, &state.performance) && !CPU_ISSET(cpu, &state.prime)) {
++            CPU_SET(cpu, &state.middle);
++        }
++    }
++    LOG_INFO(Common, "CPU topology: {} prime cores, {} middle cores", CPU_COUNT(&state.prime),
++             CPU_COUNT(&state.middle));
++
+     for (s32 cpu = 0; cpu < total; ++cpu) {
+         if (CPU_ISSET(cpu, &state.allowed) && !CPU_ISSET(cpu, &state.performance)) {
+             CPU_SET(cpu, &state.efficiency);
+@@ -314,17 +339,9 @@ void EnsureTopologyLocked(CpuTopologyState& state) {
+ }
+ 
+ void RefreshTopologyLocked(CpuTopologyState& state) {
++    // Eden (Doris): the topology comes from the hardware (all CPUs), so it never needs recomputing.
+     if (!state.initialized) {
+         ComputeTopologyLocked(state);
+-        return;
+-    }
+-    cpu_set_t current;
+-    CPU_ZERO(&current);
+-    if (sched_getaffinity(getpid(), sizeof(current), &current) != 0) {
+-        return;
+-    }
+-    if (std::memcmp(&current, &state.allowed, sizeof(current)) != 0) {
+-        ComputeTopologyLocked(state);
+     }
+ }
+ 
+@@ -333,7 +350,21 @@ bool ApplyCoreGroupLocked(CpuTopologyState& state, pid_t tid, CoreGroup group,
+     const bool restrict_group = group != CoreGroup::Unrestricted && state.separated;
+     const cpu_set_t* mask = &state.allowed;
+     if (restrict_group) {
+-        mask = group == CoreGroup::Performance ? &state.performance : &state.efficiency;
++        const bool tiers = CPU_COUNT(&state.prime) > 0 && CPU_COUNT(&state.middle) > 0;
++        switch (group) {
++        case CoreGroup::Efficiency:
++            mask = &state.efficiency;
++            break;
++        case CoreGroup::Prime:
++            mask = tiers ? &state.prime : &state.performance;
++            break;
++        case CoreGroup::Middle:
++            mask = tiers ? &state.middle : &state.performance;
++            break;
++        default:
++            mask = &state.performance;
++            break;
++        }
+     }
+     if (CPU_COUNT(mask) == 0) {
+         return false;
+@@ -559,6 +590,20 @@ void SetCurrentThreadToEfficiencyCores() {
+ #endif
+ }
+ 
++void SetCurrentThreadToDorisCores(bool fastest) {
++#if defined(__ANDROID__)
++    SetCurrentThreadCoreGroup(fastest ? CoreGroup::Prime : CoreGroup::Middle);
++#else
++    (void)fastest;
++#endif
++}
++
++void SetCurrentThreadToPerformanceCoresOnly() {
++#if defined(__ANDROID__)
++    SetCurrentThreadCoreGroup(CoreGroup::Performance);
++#endif
++}
++
+ void SetCurrentThreadToBackgroundWork() {
+ #if defined(__ANDROID__)
+     ADPF::AddCurrentThread(ADPF::Session::Background);
+diff --git a/src/common/thread.h b/src/common/thread.h
+index 4a36295931..692c568101 100644
+--- a/src/common/thread.h
++++ b/src/common/thread.h
+@@ -103,11 +103,19 @@ enum class ThreadPlacement : u32 {
+     Default = 0,
+     Background = 1,
+     Efficiency = 2,
++    /// Eden (Doris): normal priority on the performance cores, for work something is waiting on.
++    Performance = 3,
+ };
+ 
+ void SetCurrentThreadPriority(ThreadPriority new_priority);
+ void SetCurrentThreadName(const char* name);
+ void SetCurrentThreadToPerformanceCores();
++/// Eden (Doris): keep the calling thread on the fastest cores (prime) or on the other performance
++/// cores (middle). Recorded like the other core groups, so it survives policy refreshes.
++void SetCurrentThreadToDorisCores(bool fastest);
++/// Eden (Doris): keep the calling thread on the performance cores (middle and prime), without
++/// joining a performance hint session.
++void SetCurrentThreadToPerformanceCoresOnly();
+ void SetCurrentThreadToEfficiencyCores();
+ void SetCurrentThreadToBackgroundWork();
+ void SetCurrentThreadToAllCores();
+diff --git a/src/common/thread_worker.h b/src/common/thread_worker.h
+index ec3ca0af49..4a72b5dc90 100644
+--- a/src/common/thread_worker.h
++++ b/src/common/thread_worker.h
+@@ -42,13 +42,17 @@ public:
+         : workers_queued{num_workers}, thread_name{std::move(name)} {
+         const auto lambda = [this, func, placement](std::stop_token stop_token) {
+             Common::SetCurrentThreadName(thread_name.c_str());
+-            if (placement != ThreadPlacement::Default) {
++            if (placement != ThreadPlacement::Default &&
++                placement != ThreadPlacement::Performance) {
+                 Common::SetCurrentThreadPriority(ThreadPriority::Low);
+             }
+             switch (placement) {
+             case ThreadPlacement::Efficiency:
+                 Common::SetCurrentThreadToEfficiencyCores();
+                 break;
++            case ThreadPlacement::Performance:
++                Common::SetCurrentThreadToPerformanceCoresOnly();
++                break;
+             case ThreadPlacement::Background:
+                 Common::SetCurrentThreadToBackgroundWork();
+                 break;
+diff --git a/src/core/core_timing.cpp b/src/core/core_timing.cpp
+index d2ee6769cc..3dd5d2464e 100644
+--- a/src/core/core_timing.cpp
++++ b/src/core/core_timing.cpp
+@@ -18,6 +18,7 @@
+ #include "common/settings.h"
+ #include "core/core_timing.h"
+ #include "core/hardware_properties.h"
++#include "common/doris_cores.h"
+ 
+ namespace Core::Timing {
+ 
+@@ -75,6 +76,7 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
+             Common::SetCurrentThreadName("HostTiming");
+             Common::SetCurrentThreadPriority(Common::ThreadPriority::VeryHigh);
+             Common::SetCurrentThreadToPerformanceCores();
++            Doris::Cores::PinCurrentThread(Doris::Cores::Role::Worker);
+             on_thread_init();
+             has_started = true;
+ 
+diff --git a/src/core/cpu_manager.cpp b/src/core/cpu_manager.cpp
+index 346201827f..fc4c6b6292 100644
+--- a/src/core/cpu_manager.cpp
++++ b/src/core/cpu_manager.cpp
+@@ -18,6 +18,7 @@
+ #include "core/hle/kernel/physical_core.h"
+ #include "video_core/gpu.h"
+ #include "common/doris_perf.h"
++#include "common/doris_cores.h"
+ 
+ namespace Core {
+ 
+@@ -176,6 +177,7 @@ void CpuManager::RunThread(std::stop_token token, std::size_t core) {
+     Common::SetCurrentThreadName(name.c_str());
+     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
+     Common::SetCurrentThreadToPerformanceCores();
++    Doris::Cores::PinCurrentThread(Doris::Cores::Role::Worker);
+     Doris::Perf::RegisterGameThread();
+     auto& data = core_data[core];
+     data.host_context = Common::Fiber::ThreadToFiber();
+diff --git a/src/video_core/fence_manager.h b/src/video_core/fence_manager.h
+index 63a414a927..1022986122 100644
+--- a/src/video_core/fence_manager.h
++++ b/src/video_core/fence_manager.h
+@@ -24,6 +24,7 @@
+ #include "video_core/host1x/syncpoint_manager.h"
+ #include "video_core/rasterizer_interface.h"
+ #include "common/doris_perf.h"
++#include "common/doris_cores.h"
+ 
+ namespace VideoCommon {
+ 
+@@ -197,6 +198,7 @@ private:
+         Common::SetCurrentThreadName("GPUFencingThread");
+         Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
+         Common::SetCurrentThreadToPerformanceCores();
++        Doris::Cores::PinCurrentThread(Doris::Cores::Role::Worker);
+ 
+         TFence current_fence;
+         std::deque<std::function<void()>> current_operations;
+diff --git a/src/video_core/gpu_thread.cpp b/src/video_core/gpu_thread.cpp
+index 406c01278c..a26c8e638b 100644
+--- a/src/video_core/gpu_thread.cpp
++++ b/src/video_core/gpu_thread.cpp
+@@ -17,6 +17,7 @@
+ #include "video_core/host1x/host1x.h"
+ #include "video_core/renderer_base.h"
+ #include "common/doris_perf.h"
++#include "common/doris_cores.h"
+ #include "common/doris_profiler.h"
+ 
+ namespace VideoCommon::GPUThread {
+@@ -33,6 +34,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
+         Common::SetCurrentThreadName("GPU");
+         Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
+         Common::SetCurrentThreadToPerformanceCores();
++        Doris::Cores::PinCurrentThread(Doris::Cores::Role::Gpu);
+         Doris::Profiler::RegisterCurrentThread("GPU");
+         Doris::Perf::RegisterThread("GPU");
+         system.RegisterHostThread();
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index e9600cff4c..03b65b8607 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -351,8 +351,14 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
+       texture_cache{texture_cache_}, shader_notify{shader_notify_},
+       use_asynchronous_shaders{Settings::values.use_asynchronous_shaders.GetValue()},
+       use_vulkan_pipeline_cache{Settings::values.use_vulkan_driver_pipeline_cache.GetValue()},
++      // Eden (Doris): with asynchronous shaders off, the game stops until a new pipeline is
++      // built, so the builders must not be background threads (low priority, power-efficiency
++      // hint, usually little cores): a TotK log had the Vulkan worker waiting up to 3 ms per frame.
+       workers(device.HasBrokenParallelShaderCompiling() ? 1ULL : GetTotalPipelineWorkers(),
+-              "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),
++              "VkPipelineBuilder", {},
++              Settings::values.use_asynchronous_shaders.GetValue()
++                  ? Common::ThreadPlacement::Background
++                  : Common::ThreadPlacement::Performance),
+       serialization_thread(1, "VkPipelineSerialization", {},
+                            Common::ThreadPlacement::Background) {
+     const auto& float_control{device.FloatControlProperties()};
+diff --git a/src/video_core/renderer_vulkan/vk_present_manager.cpp b/src/video_core/renderer_vulkan/vk_present_manager.cpp
+index de9e5c7992..e042dd3170 100644
+--- a/src/video_core/renderer_vulkan/vk_present_manager.cpp
++++ b/src/video_core/renderer_vulkan/vk_present_manager.cpp
+@@ -17,6 +17,7 @@
+ #include "video_core/vulkan_common/vulkan_surface.h"
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+ #include "common/doris_perf.h"
++#include "common/doris_cores.h"
+ 
+ namespace Vulkan {
+ 
+@@ -327,6 +328,7 @@ void PresentManager::PresentThread(std::stop_token token) {
+     Common::SetCurrentThreadName("VulkanPresent");
+     Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
+     Common::SetCurrentThreadToPerformanceCores();
++    Doris::Cores::PinCurrentThread(Doris::Cores::Role::Worker);
+     while (!token.stop_requested()) {
+         std::unique_lock lock{queue_mutex};
+         // Wait for presentation frames
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index 1afd88ce03..08d7a5ea9f 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -25,6 +25,7 @@
+ #include "video_core/vulkan_common/vulkan_device.h"
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+ #include "common/doris_perf.h"
++#include "common/doris_cores.h"
+ #include "common/doris_profiler.h"
+ 
+ namespace Vulkan {
+@@ -283,6 +284,7 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
+     Common::SetCurrentThreadName("VulkanWorker");
+     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
+     Common::SetCurrentThreadToPerformanceCores();
++    Doris::Cores::PinCurrentThread(Doris::Cores::Role::Worker);
+     Doris::Profiler::RegisterCurrentThread("VulkanWorker");
+     Doris::Perf::RegisterThread("VulkanWorker");
+ 
+-- 
+2.43.0
+

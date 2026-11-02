@@ -8,7 +8,8 @@
 # continuity fix 0032, and variants/speed: versionCode, Vulkan worker woken only when asleep, frame
 # generation resuming 100 ms after a hitch, one GPU wait per texture-cleanup pass.
 #
-# Release 35: release 33's "-later" APK (stock Eden PR #4324 + the three later speed-ups), the one with no
-# graphical problems, plus the performance report, CPU profiler and hitch sampler (variants/report), always
-# on, to see what happens when frames drop. Nothing else changes.
--   patches:1-1 variants/speed variants/report
+# Release 36: release 35 (33-later + report) plus, from its log, changes that only affect speed (variants/perf36):
+# Eden's CPU topology from all cores and the GPU thread on the prime core (other emulator threads on the
+# middle cores), shader builders not as background threads, Vulkan worker hand-off every 16 draws,
+# staging buffers kept 300 frames, CPU profiler off (report and hitch sampler stay).
+-   patches:1-1 variants/speed variants/report variants/perf36
