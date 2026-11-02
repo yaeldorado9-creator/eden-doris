@@ -1,18 +1,20 @@
-From 65d1b17cf189153937a47546a3c0fbacd04fae25 Mon Sep 17 00:00:00 2001
+From 6981b8700218c5da672565420aee0f958f30cf3d Mon Sep 17 00:00:00 2001
 From: Eden-Doris <doris@localhost>
 Date: Mon, 2 Nov 2026 00:42:44 -0500
-Subject: [PATCH 1/4] Eden (Doris): GPU thread on the prime core; Eden's CPU
- topology from all cores; shader builders not background
+Subject: [PATCH 1/4] Eden (Doris): emulator threads on the middle cores;
+ Eden's CPU topology from all cores; shader builders not background
 
 A TotK log (release 35, ClusterTune Medium) showed busy areas (3000-4600 draws a frame) at 17-22 fps
-with the GPU 50-75% busy and Eden's GPU emulation thread 63-87% busy on a middle core: that thread is
-the limit there. It ran on the X3 prime core at times until minute 12 and never after: Eden read its
-CPU topology at a moment Android had the app in a cpuset without the prime core and kept that.
+with the GPU 50-75% busy and Eden's GPU emulation thread 63-87% busy: that thread is the limit there.
+Eden read its CPU topology at minute 12, at a moment Android had the app in a cpuset without the
+prime core, and kept that for the rest of the session.
 - The topology now comes from all the CPUs (masks naming CPUs outside the current cpuset are fine,
-  the kernel uses the allowed part), so it is never stuck without the prime core.
-- The GPU thread is kept on the prime core(s) and the other heavy emulator threads (emulated CPU
-  cores, Vulkan worker, presentation, fences, timing) on the middle cores, so they don't compete
-  for it (through Eden's core groups, which its policy refresh keeps). As Doris builds 13-14.
+  the kernel uses the allowed part), so it no longer depends on that moment.
+- The GPU thread and the other heavy emulator threads (emulated CPU cores, Vulkan worker,
+  presentation, fences, timing) are kept on the middle cores: never on the little cores, where they
+  are slow, and not on the prime core, which runs hotter (through Eden's core groups, which its
+  policy refresh keeps). Where they ran for most of that session, without the trips to the little
+  cores.
 - With asynchronous shaders off the game waits for every new pipeline, so the pipeline builders run
   at normal priority on the performance cores instead of as background threads.
 Thread placement only: nothing that is drawn changes.
@@ -22,7 +24,7 @@ Claude-Session: https://claude.ai/code/session_014Ps8wnhVXtSU7d88gGtyHX
 ---
  src/common/CMakeLists.txt                     |  2 +
  src/common/doris_cores.cpp                    | 25 ++++++
- src/common/doris_cores.h                      | 20 +++++
+ src/common/doris_cores.h                      | 22 ++++++
  src/common/thread.cpp                         | 77 +++++++++++++++----
  src/common/thread.h                           |  8 ++
  src/common/thread_worker.h                    |  6 +-
@@ -33,7 +35,7 @@ Claude-Session: https://claude.ai/code/session_014Ps8wnhVXtSU7d88gGtyHX
  .../renderer_vulkan/vk_pipeline_cache.cpp     |  8 +-
  .../renderer_vulkan/vk_present_manager.cpp    |  2 +
  .../renderer_vulkan/vk_scheduler.cpp          |  2 +
- 13 files changed, 140 insertions(+), 18 deletions(-)
+ 13 files changed, 142 insertions(+), 18 deletions(-)
  create mode 100644 src/common/doris_cores.cpp
  create mode 100644 src/common/doris_cores.h
 
@@ -52,7 +54,7 @@ index 3851015969..cb6b653885 100644
      doris_profiler.cpp
 diff --git a/src/common/doris_cores.cpp b/src/common/doris_cores.cpp
 new file mode 100644
-index 0000000000..9fbb20fa1f
+index 0000000000..fb6426f765
 --- /dev/null
 +++ b/src/common/doris_cores.cpp
 @@ -0,0 +1,25 @@
@@ -70,23 +72,23 @@ index 0000000000..9fbb20fa1f
 +
 +void PinCurrentThread(Role role) {
 +    // Goes through Eden's own core groups, so its periodic policy refresh keeps the placement
-+    // instead of undoing it.
-+    Common::SetCurrentThreadToDorisCores(role == Role::Gpu);
++    // instead of undoing it. Every role goes to the middle cores: no extra heat from the prime core.
++    Common::SetCurrentThreadToDorisCores(false);
 +    static std::atomic<unsigned> logged{0};
 +    const unsigned bit = 1u << static_cast<unsigned>(role);
 +    if ((logged.fetch_or(bit) & bit) == 0) {
-+        LOG_INFO(Frontend, "Doris cores: {} threads placed on the {} cores",
-+                 role == Role::Gpu ? "GPU" : "other emulator", role == Role::Gpu ? "prime" : "middle");
++        LOG_INFO(Frontend, "Doris cores: {} threads placed on the middle cores",
++                 role == Role::Gpu ? "GPU" : "other emulator");
 +    }
 +}
 +
 +} // namespace Doris::Cores
 diff --git a/src/common/doris_cores.h b/src/common/doris_cores.h
 new file mode 100644
-index 0000000000..70611d804f
+index 0000000000..e8dd83e8fd
 --- /dev/null
 +++ b/src/common/doris_cores.h
-@@ -0,0 +1,20 @@
+@@ -0,0 +1,22 @@
 +// SPDX-FileCopyrightText: Copyright 2026 Eden (Doris)
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +
@@ -95,15 +97,17 @@ index 0000000000..70611d804f
 +namespace Doris::Cores {
 +
 +enum class Role {
-+    /// Eden's main GPU emulation thread: the busiest single thread, gets the fastest core.
++    /// Eden's main GPU emulation thread.
 +    Gpu,
 +    /// Other heavy emulator threads (emulated CPU cores, Vulkan worker, presentation, fences,
-+    /// timing): the remaining big cores, so they don't share the fastest one with the GPU thread.
++    /// timing).
 +    Worker,
 +};
 +
-+/// Pins the calling thread: the GPU thread to the prime core(s), the other heavy emulator threads to
-+/// the middle cores. Nothing changes on a single-cluster CPU or without sched_setaffinity.
++/// Keeps the calling thread on the middle cores (the big cores other than the prime one): off the
++/// little cores, where the busy emulator threads would be slow, and off the prime core, which runs
++/// hotter (Yael's Thor already gets hot). Nothing changes on a single-cluster CPU or without
++/// sched_setaffinity.
 +void PinCurrentThread(Role role);
 +
 +} // namespace Doris::Cores

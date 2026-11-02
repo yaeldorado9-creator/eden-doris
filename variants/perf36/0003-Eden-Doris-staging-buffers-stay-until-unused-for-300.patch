@@ -1,4 +1,4 @@
-From 0e5902711cee68617a3e8eb049ae31f3ec9fe31d Mon Sep 17 00:00:00 2001
+From 509f74c6e2e82041d9e793412316c9aa3d485007 Mon Sep 17 00:00:00 2001
 From: Eden-Doris <doris@localhost>
 Date: Mon, 2 Nov 2026 00:42:44 -0500
 Subject: [PATCH 3/4] Eden (Doris): staging buffers stay until unused for 300

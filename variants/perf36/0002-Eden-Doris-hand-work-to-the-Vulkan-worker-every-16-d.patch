@@ -1,4 +1,4 @@
-From 13b9445f5b548f961c999550249b25b443d74e89 Mon Sep 17 00:00:00 2001
+From eb3cd8c746af68a27970a8a7bddc3b0b4d30ea7c Mon Sep 17 00:00:00 2001
 From: Eden-Doris <doris@localhost>
 Date: Mon, 2 Nov 2026 00:42:44 -0500
 Subject: [PATCH 2/4] Eden (Doris): hand work to the Vulkan worker every 16

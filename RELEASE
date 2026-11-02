@@ -9,7 +9,7 @@
 # generation resuming 100 ms after a hitch, one GPU wait per texture-cleanup pass.
 #
 # Release 36: release 35 (33-later + report) plus, from its log, changes that only affect speed (variants/perf36):
-# Eden's CPU topology from all cores and the GPU thread on the prime core (other emulator threads on the
-# middle cores), shader builders not as background threads, Vulkan worker hand-off every 16 draws,
+# Eden's CPU topology from all cores and the emulator threads (GPU thread included) on the middle cores (no
+# prime core: no extra heat), shader builders not as background threads, Vulkan worker hand-off every 16 draws,
 # staging buffers kept 300 frames, CPU profiler off (report and hitch sampler stay).
 -   patches:1-1 variants/speed variants/report variants/perf36

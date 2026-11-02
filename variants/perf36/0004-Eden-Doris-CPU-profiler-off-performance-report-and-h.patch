@@ -1,4 +1,4 @@
-From 8a45da9bd3fe731cae7af88087320bdab28e43ad Mon Sep 17 00:00:00 2001
+From 508a180db149bd4dac2c5c50ab15e1e1b0fdc44d Mon Sep 17 00:00:00 2001
 From: Eden-Doris <doris@localhost>
 Date: Mon, 2 Nov 2026 00:42:45 -0500
 Subject: [PATCH 4/4] Eden (Doris): CPU profiler off; performance report and
