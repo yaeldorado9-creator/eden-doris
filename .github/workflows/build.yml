@@ -40,6 +40,9 @@ jobs:
           java-version: 17
 
       - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+          log-accepted-android-sdk-licenses: false
       - uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Fetch the exact working nightly and apply only the new patches
