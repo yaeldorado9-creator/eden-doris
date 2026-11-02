@@ -20,4 +20,7 @@
 #                                 16 draws, staging buffers kept 300 frames, CPU profiler off
 #   variants/barriers              real GPU barriers after compute and at wait-for-idle points after memory-writing
 #                                 draws (Eden's waits otherwise unchanged): faster emulation changes GPU timing
--   patches:1-1 patches:6-6 patches:8-27 patches:32-32 variants/speed variants/report variants/perf36 variants/barriers
+#
+# Release 39 (one-off): Yael's current build (release 35: stock + the three later speed-ups + report) again, with a
+# newer versionCode so it installs over the main build 38 without uninstalling, as a fallback.
+-fallback   patches:1-1 variants/speed variants/report
