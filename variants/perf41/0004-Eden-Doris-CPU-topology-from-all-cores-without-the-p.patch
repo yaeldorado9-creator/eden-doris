@@ -1,0 +1,189 @@
+From 6eb90839d483677fba15aa27dcf6c056ccab37e5 Mon Sep 17 00:00:00 2001
+From: Eden-Doris <doris@localhost>
+Date: Mon, 2 Nov 2026 01:41:59 -0500
+Subject: [PATCH 4/4] Eden (Doris): CPU topology from all cores, without the
+ prime core; shader builders not background
+
+- Eden read its CPU topology from the process's affinity at the moment of the first request and
+  kept it; in a TotK log that moment came while Android had the app in a cpuset without the prime
+  core (minute 12), and the emulator threads stayed off it for the rest of the session. The
+  topology now comes from all the CPUs (a mask naming CPUs outside the current cpuset is fine).
+- The prime core(s) are left out of every emulator thread's mask: it runs hotter, and that session
+  ran without it from minute 12 on, so the heat stays as it was. The threads keep the little and
+  middle cores, as before; nothing is pinned (build 38 pinned seven busy threads to the four middle
+  cores and they had to take turns).
+- With asynchronous shaders off the game waits for every new pipeline, so the pipeline builders run
+  at normal priority on the performance cores instead of as background threads.
+Thread placement only: nothing that is drawn changes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014Ps8wnhVXtSU7d88gGtyHX
+---
+ src/common/thread.cpp                         | 56 ++++++++++++++-----
+ src/common/thread.h                           |  5 ++
+ src/common/thread_worker.h                    |  6 +-
+ .../renderer_vulkan/vk_pipeline_cache.cpp     |  8 ++-
+ 4 files changed, 58 insertions(+), 17 deletions(-)
+
+diff --git a/src/common/thread.cpp b/src/common/thread.cpp
+index 7b4dec3dce..3fca40dd07 100644
+--- a/src/common/thread.cpp
++++ b/src/common/thread.cpp
+@@ -244,13 +244,15 @@ void ComputeTopologyLocked(CpuTopologyState& state) {
+     CPU_ZERO(&state.performance);
+     CPU_ZERO(&state.efficiency);
+ 
+-    if (sched_getaffinity(getpid(), sizeof(state.allowed), &state.allowed) != 0) {
+-        LOG_WARNING(Common, "Could not query process CPU affinity: {}",
+-                    ::Common::GetLastErrorMsg());
+-        return;
++    // Eden (Doris): every CPU the system has, not the process's affinity at this moment. Android
++    // moves the app between cpusets (top-app has the prime core, foreground often doesn't), and a
++    // topology read at such a moment was kept for the rest of the session. A mask naming CPUs
++    // outside the current cpuset is fine: the kernel uses the allowed part.
++    const s32 total = PossibleCpuCount();
++    for (s32 cpu = 0; cpu < total; ++cpu) {
++        CPU_SET(cpu, &state.allowed);
+     }
+ 
+-    const s32 total = PossibleCpuCount();
+     auto cores = CollectCores(state.allowed, total, "cpu_capacity", true);
+     if (cores.empty() || (WeightsAreUniform(cores) && MidrsAreDistinct(cores))) {
+         auto by_frequency = CollectCores(state.allowed, total, "cpufreq/cpuinfo_max_freq", false);
+@@ -281,10 +283,36 @@ void ComputeTopologyLocked(CpuTopologyState& state) {
+     });
+ 
+     const s64 fastest = cores.front().weight;
++
++    // Eden (Doris): leave the prime core(s) (the fastest ones, when slower big cores exist too) out of
++    // every emulator thread's mask. The prime core runs hotter, and on Yael's Thor the emulator
++    // threads ended up off it for most of a session anyway; this keeps the same heat on purpose,
++    // while the threads keep the little and middle cores (no crowding on a few cores).
++    {
++        size_t prime_count = 0;
++        bool slower_big = false;
++        for (const auto& core : cores) {
++            if (core.weight == fastest) {
++                ++prime_count;
++            } else if (core.weight * 100 >= fastest * ANDROID_PERFORMANCE_CAPACITY_PERCENT) {
++                slower_big = true;
++            }
++        }
++        if (slower_big && prime_count < cores.size()) {
++            std::erase_if(cores, [fastest, &state](const CoreInfo& core) {
++                if (core.weight == fastest) {
++                    CPU_CLR(core.cpu, &state.allowed);
++                    return true;
++                }
++                return false;
++            });
++        }
++    }
++    const s64 fastest_left = cores.front().weight;
+     size_t taken = 0;
+     for (const auto& core : cores) {
+         const bool fast_enough =
+-            core.weight * 100 >= fastest * ANDROID_PERFORMANCE_CAPACITY_PERCENT;
++            core.weight * 100 >= fastest_left * ANDROID_PERFORMANCE_CAPACITY_PERCENT;
+         if (!fast_enough && taken >= ANDROID_MINIMUM_PERFORMANCE_CORES) {
+             break;
+         }
+@@ -314,17 +342,9 @@ void EnsureTopologyLocked(CpuTopologyState& state) {
+ }
+ 
+ void RefreshTopologyLocked(CpuTopologyState& state) {
++    // Eden (Doris): the topology comes from the hardware (all CPUs), so it never needs recomputing.
+     if (!state.initialized) {
+         ComputeTopologyLocked(state);
+-        return;
+-    }
+-    cpu_set_t current;
+-    CPU_ZERO(&current);
+-    if (sched_getaffinity(getpid(), sizeof(current), &current) != 0) {
+-        return;
+-    }
+-    if (std::memcmp(&current, &state.allowed, sizeof(current)) != 0) {
+-        ComputeTopologyLocked(state);
+     }
+ }
+ 
+@@ -559,6 +579,12 @@ void SetCurrentThreadToEfficiencyCores() {
+ #endif
+ }
+ 
++void SetCurrentThreadToPerformanceCoresOnly() {
++#if defined(__ANDROID__)
++    SetCurrentThreadCoreGroup(CoreGroup::Performance);
++#endif
++}
++
+ void SetCurrentThreadToBackgroundWork() {
+ #if defined(__ANDROID__)
+     ADPF::AddCurrentThread(ADPF::Session::Background);
+diff --git a/src/common/thread.h b/src/common/thread.h
+index 4a36295931..79dd24dd1a 100644
+--- a/src/common/thread.h
++++ b/src/common/thread.h
+@@ -103,11 +103,16 @@ enum class ThreadPlacement : u32 {
+     Default = 0,
+     Background = 1,
+     Efficiency = 2,
++    /// Eden (Doris): normal priority on the performance cores, for work something is waiting on.
++    Performance = 3,
+ };
+ 
+ void SetCurrentThreadPriority(ThreadPriority new_priority);
+ void SetCurrentThreadName(const char* name);
+ void SetCurrentThreadToPerformanceCores();
++/// Eden (Doris): keep the calling thread on the performance cores (middle and prime), without
++/// joining a performance hint session.
++void SetCurrentThreadToPerformanceCoresOnly();
+ void SetCurrentThreadToEfficiencyCores();
+ void SetCurrentThreadToBackgroundWork();
+ void SetCurrentThreadToAllCores();
+diff --git a/src/common/thread_worker.h b/src/common/thread_worker.h
+index ec3ca0af49..4a72b5dc90 100644
+--- a/src/common/thread_worker.h
++++ b/src/common/thread_worker.h
+@@ -42,13 +42,17 @@ public:
+         : workers_queued{num_workers}, thread_name{std::move(name)} {
+         const auto lambda = [this, func, placement](std::stop_token stop_token) {
+             Common::SetCurrentThreadName(thread_name.c_str());
+-            if (placement != ThreadPlacement::Default) {
++            if (placement != ThreadPlacement::Default &&
++                placement != ThreadPlacement::Performance) {
+                 Common::SetCurrentThreadPriority(ThreadPriority::Low);
+             }
+             switch (placement) {
+             case ThreadPlacement::Efficiency:
+                 Common::SetCurrentThreadToEfficiencyCores();
+                 break;
++            case ThreadPlacement::Performance:
++                Common::SetCurrentThreadToPerformanceCoresOnly();
++                break;
+             case ThreadPlacement::Background:
+                 Common::SetCurrentThreadToBackgroundWork();
+                 break;
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index e9600cff4c..23f0bd5818 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -351,8 +351,14 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
+       texture_cache{texture_cache_}, shader_notify{shader_notify_},
+       use_asynchronous_shaders{Settings::values.use_asynchronous_shaders.GetValue()},
+       use_vulkan_pipeline_cache{Settings::values.use_vulkan_driver_pipeline_cache.GetValue()},
++      // Eden (Doris): with asynchronous shaders off, the game stops until a new pipeline is
++      // built, so the builders must not be background threads (low priority, power-efficiency
++      // hint, usually little cores).
+       workers(device.HasBrokenParallelShaderCompiling() ? 1ULL : GetTotalPipelineWorkers(),
+-              "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),
++              "VkPipelineBuilder", {},
++              Settings::values.use_asynchronous_shaders.GetValue()
++                  ? Common::ThreadPlacement::Background
++                  : Common::ThreadPlacement::Performance),
+       serialization_thread(1, "VkPipelineSerialization", {},
+                            Common::ThreadPlacement::Background) {
+     const auto& float_control{device.FloatControlProperties()};
+-- 
+2.43.0
+

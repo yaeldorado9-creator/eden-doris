@@ -1,0 +1,37 @@
+From 3f56db923b406c93c2c24b068440dc1f499066ae Mon Sep 17 00:00:00 2001
+From: Eden-Doris <doris@localhost>
+Date: Mon, 2 Nov 2026 00:42:44 -0500
+Subject: [PATCH 1/4] Eden (Doris): hand work to the Vulkan worker every 16
+ draws, not 4
+
+Waking the Vulkan worker is a futex system call and it is usually asleep: about 11% of the GPU
+thread's CPU time in the release 35 log (800 wake-ups a frame in busy areas). Submits still happen
+every 512 draws as in Eden, so the GPU gets its work at the same moments; the same commands are
+recorded in the same order. As Doris builds 16-29.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014Ps8wnhVXtSU7d88gGtyHX
+---
+ src/video_core/renderer_vulkan/vk_rasterizer.cpp | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index ee3d6717af..9d0e2f1c2a 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -996,7 +996,11 @@ void RasterizerVulkan::LoadDiskResources(u64 title_id, std::stop_token stop_load
+ void RasterizerVulkan::FlushWork() {
+ #ifdef __ANDROID__
+     static constexpr u32 DRAWS_TO_DISPATCH = 512;
+-    static constexpr u32 CHECK_MASK = 3;
++    // Eden (Doris): hand recorded work to the Vulkan worker every 16 draws instead of 4. The worker
++    // is usually asleep by then, and waking it is a futex system call: about 11% of the GPU
++    // thread's CPU time in a TotK log (800 a frame in busy areas). Submits still happen every 512
++    // draws as in Eden, so the GPU starts its work at the same moments.
++    static constexpr u32 CHECK_MASK = 15;
+ #else
+     static constexpr u32 DRAWS_TO_DISPATCH = 4096;
+     static constexpr u32 CHECK_MASK = 7;
+-- 
+2.43.0
+

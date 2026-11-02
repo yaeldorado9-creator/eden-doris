@@ -1,0 +1,28 @@
+From 7ea21e632906a88044ead3b3b9fcf8e69625a3eb Mon Sep 17 00:00:00 2001
+From: Eden-Doris <doris@localhost>
+Date: Mon, 2 Nov 2026 00:42:45 -0500
+Subject: [PATCH 3/4] Eden (Doris): CPU profiler off; performance report and
+ hitch sampler stay on
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014Ps8wnhVXtSU7d88gGtyHX
+---
+ src/common/doris_profiler.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/common/doris_profiler.cpp b/src/common/doris_profiler.cpp
+index 49a8dac180..dee9cc48e5 100644
+--- a/src/common/doris_profiler.cpp
++++ b/src/common/doris_profiler.cpp
+@@ -530,7 +530,7 @@ void HitchFrameBoundary(double frame_ms) {
+ }
+ 
+ void RegisterCurrentThread(const char* label) {
+-    if (false) { // Eden (Doris): this build always runs the CPU profiler (no setting).
++    if (true) { // Eden (Doris): the CPU profiler is off in this build (the hitch sampler stays on).
+         return;
+     }
+     InstallHandler();
+-- 
+2.43.0
+
