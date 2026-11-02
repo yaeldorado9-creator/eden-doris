@@ -1,0 +1,234 @@
+From 2f9b11ba9a8253160879f4130ccac4f17070f54c Mon Sep 17 00:00:00 2001
+From: Eden-Doris <doris@localhost>
+Date: Mon, 2 Nov 2026 00:54:29 -0500
+Subject: [PATCH] Eden (Doris): real GPU barriers after compute and at
+ wait-for-idle points after memory-writing draws
+
+Eden only puts a barrier before a compute dispatch, and turns the game's "wait for idle" points into
+an event wait with TOP_OF_PIPE as its destination and no memory barrier, which on Adreno guarantees
+neither ordering nor visibility of earlier writes. Whether later draws then read unfinished culling
+results, indirect arguments or vertex data depends on timing, and the speed-ups (a faster GPU thread
+hands the GPU its work sooner) change the timing: Doris build 32 (speed-ups on stock Eden) brought
+dark squares back on the ground although each speed-up gives the same results as Eden's code.
+- After every compute dispatch, a barrier from the compute shader's writes to everything after it.
+- At a wait-for-idle point after a draw that wrote storage buffers or images (or used transform
+  feedback), a real full memory barrier; it ends the render pass as Eden's wait does.
+- Every other wait-for-idle is Eden's, unchanged.
+These only add synchronization (as Doris builds 6-29 did); what is drawn can only become more correct.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014Ps8wnhVXtSU7d88gGtyHX
+---
+ .../renderer_vulkan/vk_graphics_pipeline.cpp  |  7 +++
+ .../renderer_vulkan/vk_graphics_pipeline.h    |  5 ++
+ .../renderer_vulkan/vk_rasterizer.cpp         | 63 +++++++++++++++++++
+ .../renderer_vulkan/vk_rasterizer.h           | 11 ++++
+ src/video_core/renderer_vulkan/vk_scheduler.h |  8 +++
+ 5 files changed, 94 insertions(+)
+
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index 57f53f6852..026baeaed9 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -278,6 +278,13 @@ GraphicsPipeline::GraphicsPipeline(
+         num_image_elements += Shader::NumDescriptors(info->texture_descriptors);
+         num_image_elements += Shader::NumDescriptors(info->image_descriptors);
+         num_descriptor_entries += NumDescriptorEntries(*info);
++        doris_writes_memory = doris_writes_memory || info->stores_global_memory ||
++                              std::ranges::any_of(info->storage_buffers_descriptors,
++                                                  [](const auto& desc) { return desc.is_written; }) ||
++                              std::ranges::any_of(info->image_buffer_descriptors,
++                                                  [](const auto& desc) { return desc.is_written; }) ||
++                              std::ranges::any_of(info->image_descriptors,
++                                                  [](const auto& desc) { return desc.is_written; });
+     }
+     fragment_has_color0_output = stage_infos[NUM_STAGES - 1].stores_frag_color[0];
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+index 338af49bdf..8988b937c2 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+@@ -87,6 +87,10 @@ public:
+         const std::array<const Shader::Info*, NUM_STAGES>& infos);
+ 
+     bool HasDynamicVertexInput() const noexcept { return key.state.dynamic_vertex_input; }
++    /// Eden (Doris): true if a shader of this pipeline writes storage buffers or images.
++    bool DorisWritesMemory() const noexcept {
++        return doris_writes_memory;
++    }
+     bool SupportsAlphaToCoverage() const noexcept {
+         return fragment_has_color0_output;
+     }
+@@ -177,6 +181,7 @@ private:
+     size_t num_image_elements{};
+     u32 num_textures{};
+     bool fragment_has_color0_output{};
++    bool doris_writes_memory{};
+ 
+     vk::DescriptorSetLayout descriptor_set_layout;
+     DescriptorAllocator descriptor_allocator;
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 0ea241caf3..c6bb7e1750 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -258,6 +258,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+     pipeline->SetEngine(maxwell3d, gpu_memory);
+     if (!pipeline->Configure(is_indexed))
+         return;
++    if (pipeline->DorisWritesMemory() || maxwell3d->regs.transform_feedback_enabled != 0) {
++        doris_draw_writes_since_wfi = true;
++    }
+ 
+     UpdateDynamicStates(pipeline->HasDynamicVertexInput());
+ 
+@@ -621,6 +624,7 @@ void RasterizerVulkan::DispatchCompute() {
+             }
+             cmdbuf.DispatchIndirect(indirect_buffer, indirect_offset);
+         });
++        DorisAfterCompute();
+         return;
+     }
+     const std::array<u32, 3> dim{qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z};
+@@ -643,6 +647,7 @@ void RasterizerVulkan::DispatchCompute() {
+         }
+         cmdbuf.Dispatch(dim[0], dim[1], dim[2]);
+     });
++    DorisAfterCompute();
+ 
+     // Log compute dispatch
+     if (GPU::Logging::IsActive() &&
+@@ -858,11 +863,69 @@ void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,
+     InvalidateRegion(addr, size, which);
+ }
+ 
++namespace {
++// Eden (Doris): a barrier that makes every earlier write visible to every later command.
++constexpr VkMemoryBarrier DORIS_FULL_BARRIER{
++    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++    .pNext = nullptr,
++    .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
++    .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
++};
++} // Anonymous namespace
++
++void RasterizerVulkan::DorisAfterCompute() {
++    // Eden (Doris): make what the compute shader wrote (culling results, indirect draw arguments,
++    // vertex and instance data, images) visible to whatever runs next. Eden only has a barrier
++    // before a dispatch, so draws right after it could read unfinished data on Adreno, and the
++    // faster the GPU thread runs, the sooner the GPU gets those draws.
++    static constexpr VkMemoryBarrier AFTER_COMPUTE{
++        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++        .pNext = nullptr,
++        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
++        .dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_INDEX_READ_BIT |
++                         VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT |
++                         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
++                         VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
++    };
++    scheduler.Record([](vk::CommandBuffer cmdbuf) {
++        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, AFTER_COMPUTE);
++    });
++}
++
++void RasterizerVulkan::DorisFullBarrier() {
++    scheduler.RequestOutsideRenderPassOperationContext();
++    // A full barrier right after another one, with nothing at all recorded in between, changes
++    // nothing: everything before it is already ordered and visible.
++    if (scheduler.RecordedCommands() == doris_last_full_barrier) {
++        Doris::Perf::Add(Doris::Perf::Count::BarriersSkipped);
++        return;
++    }
++    scheduler.Record([](vk::CommandBuffer cmdbuf) {
++        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, DORIS_FULL_BARRIER);
++    });
++    doris_last_full_barrier = scheduler.RecordedCommands();
++}
++
+ void RasterizerVulkan::WaitForIdle() {
+     Doris::Perf::Add(Doris::Perf::Count::WaitForIdle);
+     if (scheduler.IsRenderPassActive()) {
+         Doris::Perf::Add(Doris::Perf::Count::WaitForIdleInRenderPass);
+     }
++    const bool draw_writes = doris_draw_writes_since_wfi;
++    doris_draw_writes_since_wfi = false;
++    if (draw_writes) {
++        // Eden (Doris): a draw since the previous wait wrote storage buffers or images (or used
++        // transform feedback). Eden's event wait below has TOP_OF_PIPE as its destination and no
++        // memory barrier, so it guarantees neither ordering nor visibility of those writes on
++        // Adreno. Use a real full barrier (it also ends the render pass, as Eden's wait does).
++        query_cache.NotifyWFI();
++        DorisFullBarrier();
++        fence_manager.SignalOrdering();
++        return;
++    }
++    Doris::Perf::Add(Doris::Perf::Count::WaitForIdleNoDrawWrites);
+     // Everything but wait pixel operations. This intentionally includes FRAGMENT_SHADER_BIT because
+     // fragment shaders can still write storage buffers.
+     VkPipelineStageFlags flags =
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index b14382bf0b..c42283314e 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -118,6 +118,11 @@ public:
+     void FlushAndInvalidateRegion(
+         DAddr addr, u64 size, VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
+     void WaitForIdle() override;
++
++    /// Eden (Doris): full memory barrier outside the render pass.
++    void DorisFullBarrier();
++    /// Eden (Doris): barrier after a compute dispatch.
++    void DorisAfterCompute();
+     void FragmentBarrier() override;
+     void TiledCacheBarrier() override;
+     void FlushCommands() override;
+@@ -229,6 +234,12 @@ private:
+     boost::container::static_vector<VkSampler, MAX_TEXTURES> sampler_handles;
+ 
+     u32 draw_counter = 0;
++    /// Eden (Doris): commands recorded at the last full barrier (a barrier right after another one
++    /// with nothing recorded in between changes nothing and is skipped).
++    u64 doris_last_full_barrier = ~u64{0};
++    /// Eden (Doris): a draw since the previous wait-for-idle wrote storage buffers or images, or
++    /// used transform feedback.
++    bool doris_draw_writes_since_wfi = true;
+ };
+ 
+ } // namespace Vulkan
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.h b/src/video_core/renderer_vulkan/vk_scheduler.h
+index 8073b7589c..5c2b30ec50 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.h
++++ b/src/video_core/renderer_vulkan/vk_scheduler.h
+@@ -103,6 +103,7 @@ public:
+     template <typename T>
+         requires std::is_invocable_v<T, vk::CommandBuffer, vk::CommandBuffer>
+     void RecordWithUploadBuffer(T&& command) {
++        ++recorded_commands;
+         if (chunk->Record(command)) {
+             return;
+         }
+@@ -119,6 +120,11 @@ public:
+             });
+     }
+ 
++    /// Eden (Doris): how many commands have been recorded so far (any kind).
++    [[nodiscard]] u64 RecordedCommands() const noexcept {
++        return recorded_commands;
++    }
++
+     /// Returns the current command buffer tick.
+     [[nodiscard]] u64 CurrentTick() const noexcept {
+         return master_semaphore->CurrentTick();
+@@ -322,6 +328,8 @@ private:
+     std::mutex execution_mutex;
+     std::mutex reserve_mutex;
+     std::mutex queue_mutex;
++    /// Eden (Doris): commands recorded so far (GPU emulation thread only).
++    u64 recorded_commands = 0;
+     std::condition_variable_any event_cv;
+     /// Eden (Doris): the worker is asleep waiting for work (guarded by queue_mutex).
+     bool worker_waiting = false;
+-- 
+2.43.0
+

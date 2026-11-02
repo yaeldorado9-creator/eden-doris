@@ -8,8 +8,16 @@
 # continuity fix 0032, and variants/speed: versionCode, Vulkan worker woken only when asleep, frame
 # generation resuming 100 ms after a hitch, one GPU wait per texture-cleanup pass.
 #
-# Release 36: release 35 (33-later + report) plus, from its log, changes that only affect speed (variants/perf36):
-# Eden's CPU topology from all cores and the emulator threads (GPU thread included) on the middle cores (no
-# prime core: no extra heat), shader builders not as background threads, Vulkan worker hand-off every 16 draws,
-# staging buffers kept 300 frames, CPU profiler off (report and hitch sampler stay).
--   patches:1-1 variants/speed variants/report variants/perf36
+# Main build (release 38+): stock Eden PR #4324 (the build Yael plays) + every speed-up that gives the same results
+# as Eden's code, + a safety net for GPU timing. For the Apex Doris 11 driver (14 = same with a log).
+#   patches 0006 0008-0027 0032   eden-lun speed-ups (each reviewed: same results as Eden's code; 0007, which
+#                                 made water vanish, left out) and the device-memory continuity fix
+#   variants/speed                 versionCode, Vulkan worker woken only when asleep, frame generation resuming
+#                                 100 ms after a hitch, one GPU wait per texture-cleanup pass
+#   variants/report                performance report and hitch sampler (always on; CPU profiler off below)
+#   variants/perf36                Eden's CPU topology from all cores, emulator threads on the middle cores (not the
+#                                 prime core: no extra heat), shader builders not background, worker hand-off every
+#                                 16 draws, staging buffers kept 300 frames, CPU profiler off
+#   variants/barriers              real GPU barriers after compute and at wait-for-idle points after memory-writing
+#                                 draws (Eden's waits otherwise unchanged): faster emulation changes GPU timing
+-   patches:1-1 patches:6-6 patches:8-27 patches:32-32 variants/speed variants/report variants/perf36 variants/barriers
