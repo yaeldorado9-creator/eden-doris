@@ -1,12 +1,9 @@
 name: Build Eden (Doris)
 
-# Every push to main builds the APKs listed in RELEASE and publishes them as a release (doris-<number>).
-# The Eden source is the PR #4324 build pinned in UPSTREAM; each APK applies its patch sets (from
-# patches/ and variants/) on top, in order. All APKs of a release share one versionCode.
 on:
   push:
     branches: [main]
-    paths: [UPSTREAM, RELEASE, DRIVER, 'patches/**', 'upstream/**', 'variants/**', '.github/workflows/build.yml']
+    paths: ['nightly/**', '.github/workflows/build.yml']
   workflow_dispatch:
 
 permissions:
@@ -18,7 +15,7 @@ concurrency:
 
 jobs:
   android:
-    name: Android APK
+    name: Doris nightly update
     runs-on: ubuntu-latest
     timeout-minutes: 240
     env:
@@ -29,101 +26,71 @@ jobs:
 
       - name: Make room on the runner
         run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/node_modules \
-                      /opt/hostedtoolcache/CodeQL /usr/local/.ghcup || true
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/node_modules /opt/hostedtoolcache/CodeQL /usr/local/.ghcup
           df -h /
 
       - name: Install host tools
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y glslang-tools libvulkan-dev
+          sudo apt-get install -y glslang-tools libvulkan-dev g++
 
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 17
 
+      - uses: android-actions/setup-android@v3
       - uses: mozilla-actions/sccache-action@v0.0.9
 
-      - name: One versionCode for every APK of this release
-        run: echo "DORIS_VERSION_CODE=$(( ($(date +%s) - 1451606400) / 10 ))" >> "$GITHUB_ENV"
-
-      - name: Eden source (the PR #4324 build)
+      - name: Fetch the exact working nightly and apply only the new patches
         run: |
-          val() { awk -v k="$1" '$1 == k { print $2 }' UPSTREAM; }
-          SHA=$(val commit); SERVER=$(val server); PR_REF=$(val pr_ref)
-          MIRROR=$(val fallback_mirror); BASE=$(val fallback_base)
+          SHA=$(python3 -c 'import json; print(json.load(open("nightly/base.json"))["commit"])')
+          SERVER=$(python3 -c 'import json; print(json.load(open("nightly/base.json"))["server"])')
+          MIRROR=$(python3 -c 'import json; print(json.load(open("nightly/base.json"))["mirror"])')
           git init -q eden
-          cd eden
-          AM="git -c user.name=Eden-Doris -c user.email=doris@localhost am -3"
-          if git fetch -q --depth 60 "$SERVER" "$PR_REF" && [ "$(git rev-parse FETCH_HEAD)" = "$SHA" ]; then
-            git checkout -q FETCH_HEAD
-            echo "Eden source: PR #4324 build $SHA, made on $(git rev-parse HEAD^)" | tee ../source.txt
-          else
-            echo "::warning::Eden's server did not give $SHA; using the GitHub mirror + upstream/pr4324.patch"
-            git fetch -q --depth 60 "$MIRROR" "$BASE"
-            git checkout -q FETCH_HEAD
-            $AM ../upstream/pr4324.patch
-            echo "Eden source: mirror $BASE + PR #4324 patch" | tee ../source.txt
-          fi
-          git rev-parse HEAD > ../base.txt
+          git -C eden fetch -q --depth 1 "$SERVER" "$SHA" || git -C eden fetch -q --depth 1 "$MIRROR" "$SHA"
+          git -C eden checkout -q --detach FETCH_HEAD
+          test "$(git -C eden rev-parse HEAD)" = "$SHA"
+          for patch in nightly/patches/*.patch; do
+            git -C eden apply --check "../$patch"
+            git -C eden apply "../$patch"
+          done
+          python3 nightly/check-source.py eden
+          python3 nightly/test-worker.py eden
+          echo "DORIS_VERSION_CODE=$(( ($(date +%s) - 1451606400) / 10 ))" >> "$GITHUB_ENV"
 
       - name: Restore downloaded dependencies
         uses: actions/cache@v4
         with:
           path: eden/.cache/cpm
-          key: cpm-${{ hashFiles('UPSTREAM', 'patches/**') }}
+          key: cpm-nightly-${{ hashFiles('nightly/base.json', 'nightly/patches/**') }}
           restore-keys: cpm-
 
-      # RELEASE: one APK per line, "<suffix or -> <patch set> [<patch set> ...]", where a patch set is a
-      # folder (all its patches) or "patches:<first>-<last>" (patches/ by number).
-      - name: Build the APKs
+      - name: Build one Doris release APK
         env:
-          GIT_TAG_NAME: ${{ env.DORIS_TAG }}
+          GIT_TAG_NAME: ${{ env.DORIS_TAG }}-nightly-7a6d055094
         run: |
-          mkdir -p out
-          : > notes-variants.md
-          first=1
-          grep -v '^[[:space:]]*#' RELEASE | grep -v '^[[:space:]]*$' | while read -r suffix sets; do
-            [ "$suffix" = "-" ] && suffix=""
-            name="Eden-Doris-${{ github.run_number }}${suffix}.apk"
-            echo "::group::$name: $sets"
-            ( cd eden
-              AM="git -c user.name=Eden-Doris -c user.email=doris@localhost am -3"
-              git am --abort >/dev/null 2>&1 || true
-              git reset -q --hard "$(cat ../base.txt)"
-              for set in $sets; do
-                case "$set" in
-                  patches:*)
-                    range=${set#patches:}; lo=${range%-*}; hi=${range#*-}
-                    for p in ../patches/*.patch; do
-                      n=$(basename "$p" | cut -c1-4)
-                      if [ $((10#$n)) -ge "$lo" ] && [ $((10#$n)) -le "$hi" ]; then $AM "$p"; fi
-                    done ;;
-                  *) $AM ../"$set"/*.patch ;;
-                esac
-              done
-              { echo "$name ($sets):"; echo '```'; git log --oneline -n 8; echo '```'; echo; } >> ../notes-variants.md )
-            ( cd eden/src/android
-              chmod +x gradlew
-              ./gradlew assembleDorisRelease --no-daemon --stacktrace \
-                -PYUZU_ANDROID_ARGS="-DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache" )
-            APK=$(find eden/src/android/app/build/outputs/apk/doris/release -name '*.apk' | head -n 1)
-            test -n "$APK"
-            cp -v "$APK" "out/$name"
-            if [ "$first" = 1 ]; then
-              # Unstripped library of the first APK, for turning profiler offsets into function names.
-              SYM=$(find eden/src/android/app/build/intermediates -name libyuzu-android.so -path '*arm64-v8a*' \
-                      -not -path '*stripped*' | head -n 1)
-              if [ -n "$SYM" ]; then
-                (cd "$(dirname "$SYM")" && zip -9 -q "$GITHUB_WORKSPACE/out/libyuzu-android-symbols-${{ github.run_number }}.zip" libyuzu-android.so)
-              fi
-              first=0
-            fi
-            echo "::endgroup::"
-          done
-          sccache -s || true
-          cd out && sha256sum *.apk | tee SHA256SUMS.txt
+          sdkmanager 'build-tools;36.0.0'
+          cd eden/src/android
+          chmod +x gradlew
+          ./gradlew assembleDorisRelease --no-daemon --stacktrace -Pnightly=false \
+            -PYUZU_ANDROID_ARGS="-DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache"
+          cd ../..
+          mkdir -p ../out
+          mapfile -t APKS < <(find src/android/app/build/outputs/apk/doris/release -name '*.apk')
+          test "${#APKS[@]}" = 1
+          cp "${APKS[0]}" "../out/Eden-Doris-${{ github.run_number }}.apk"
+
+      - name: Verify it updates existing Doris
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p previous
+          gh release download doris-40 --repo "$GITHUB_REPOSITORY" -p Eden-Doris-40-a.apk -D previous
+          python3 nightly/check-apk.py "$ANDROID_HOME/build-tools/36.0.0" \
+            previous/Eden-Doris-40-a.apk "out/Eden-Doris-${{ github.run_number }}.apk" | tee out/update-check.txt
+          cd out
+          sha256sum *.apk > SHA256SUMS.txt
 
       - uses: actions/upload-artifact@v4
         with:
@@ -131,23 +98,22 @@ jobs:
           path: out/
           if-no-files-found: error
 
-      - name: Publish the release
+      - name: Release the Doris update candidate
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          {
-            echo "Eden (Doris) build ${{ github.run_number }} — package dev.eden.eden_doris (installs beside every other Eden)."
-            echo "All APKs of this release have versionCode $DORIS_VERSION_CODE: each installs over the other and keeps the app's data."
-            echo
-            cat source.txt
-            echo
-            cat notes-variants.md
-          } > notes.md
-          # The driver this release is meant for (DRIVER), attached next to the APKs.
-          read -r DRV_TAG DRV_ZIP < <(grep -v '^[[:space:]]*#' DRIVER | grep -v '^[[:space:]]*$' | head -n 1)
-          if [ -n "$DRV_ZIP" ] && gh release download "$DRV_TAG" -p "$DRV_ZIP" -D out; then
-            echo "Driver: $DRV_ZIP (release $DRV_TAG). Install it in Eden: GPU driver manager, install, pick the zip." >> notes.md
-          fi
-          shopt -s nullglob
-          gh release create "$DORIS_TAG" out/*.apk out/SHA256SUMS.txt out/*.zip \
-            --title "Eden (Doris) ${{ github.run_number }}" --notes-file notes.md --target "${{ github.sha }}"
+          cat > notes.md <<'NOTES'
+          Updates the existing Eden (Doris) installation. Do not uninstall Doris first.
+
+          Based on working Eden nightly 7a6d055094. Keeps Doris's package and signing certificate, with a higher version code. The build verifies these against Doris 40.
+
+          Only native change: avoid unnecessary Vulkan worker and queue-drain wakeups. Historical Doris graphics patches and Lun changes are excluded. Rendering, GPU barriers, texture handling, vertex tracking and frame generation retain the pinned nightly's implementation.
+
+          Select your existing Turnip Gen8 V38 and match the working nightly's per-game and UltraCam settings. No replacement driver is bundled.
+
+          Candidate for on-device testing. A successful build and synchronization tests do not establish an FPS gain or graphics correctness on the Thor.
+          NOTES
+          cat out/update-check.txt >> notes.md
+          gh release create "$DORIS_TAG" out/*.apk out/SHA256SUMS.txt out/update-check.txt \
+            --repo "$GITHUB_REPOSITORY" --title "Eden (Doris) ${{ github.run_number }} — nightly update candidate" \
+            --notes-file notes.md --target "${{ github.sha }}" --prerelease

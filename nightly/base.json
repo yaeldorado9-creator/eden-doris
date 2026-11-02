@@ -1,0 +1,9 @@
+{
+  "commit": "7a6d055094846b7787f9b8c0f238c0c68709f632",
+  "server": "https://git.eden-emu.dev/eden-emu/eden.git",
+  "mirror": "https://github.com/luneflu/eden-lun.git",
+  "package": "dev.eden.eden_doris",
+  "previous_release": "doris-40",
+  "previous_apk": "Eden-Doris-40-a.apk",
+  "signing_keystore_sha256": "745c297ca50c36d72ccb6a46ecaaa659f6feb757effca57ad1b63e1d27acd056"
+}

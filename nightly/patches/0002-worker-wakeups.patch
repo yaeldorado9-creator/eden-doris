@@ -1,0 +1,75 @@
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index 4a7a7d5..0127933 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -75,7 +75,9 @@ void Scheduler::WaitWorker() {
+     // Ensure the queue is drained.
+     {
+         std::unique_lock ql{queue_mutex};
++        ++drain_waiters;
+         event_cv.wait(ql, [this] { return work_queue.empty(); });
++        --drain_waiters;
+     }
+ 
+     // Now wait for execution to finish.
+@@ -84,11 +86,17 @@ void Scheduler::WaitWorker() {
+ 
+ void Scheduler::DispatchWork() {
+     if (chunk && !chunk->Empty()) {
++        // Eden (Doris): wake the worker only when it is actually asleep. On Android every notify is a
++        // futex system call, and this runs every few draws.
++        bool wake_worker = false;
+         {
+             std::scoped_lock ql{queue_mutex};
+             work_queue.push(std::move(chunk));
++            wake_worker = worker_waiting;
++        }
++        if (wake_worker) {
++            event_cv.notify_all();
+         }
+-        event_cv.notify_all();
+         AcquireNewChunk();
+     }
+ }
+@@ -279,7 +287,11 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
+ 
+         work = std::move(work_queue.front());
+         work_queue.pop();
+-        event_cv.notify_all();
++        // Eden (Doris): only WaitWorker waits for the queue to drain; skip the system call when
++        // nobody is waiting.
++        if (drain_waiters != 0) {
++            event_cv.notify_all();
++        }
+         return true;
+     }};
+ 
+@@ -290,7 +302,12 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
+             std::unique_lock lk{queue_mutex};
+ 
+             // Wait for work.
+-            event_cv.wait(lk, stop_token, [&] { return TryPopQueue(work); });
++            event_cv.wait(lk, stop_token, [&] {
++                const bool popped = TryPopQueue(work);
++                worker_waiting = !popped;
++                return popped;
++            });
++            worker_waiting = false;
+ 
+             // If we've been asked to stop, we're done.
+             if (stop_token.stop_requested()) {
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.h b/src/video_core/renderer_vulkan/vk_scheduler.h
+index d4bc8d0..8073b75 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.h
++++ b/src/video_core/renderer_vulkan/vk_scheduler.h
+@@ -323,6 +323,10 @@ private:
+     std::mutex reserve_mutex;
+     std::mutex queue_mutex;
+     std::condition_variable_any event_cv;
++    /// Eden (Doris): the worker is asleep waiting for work (guarded by queue_mutex).
++    bool worker_waiting = false;
++    /// Eden (Doris): threads in WaitWorker waiting for the queue to drain (guarded by queue_mutex).
++    u32 drain_waiters = 0;
+     std::jthread worker_thread;
+ 
+     std::chrono::steady_clock::duration frame_interval{};
