@@ -20,4 +20,12 @@
 #                                 16 draws, staging buffers kept 300 frames, CPU profiler off
 #   variants/barriers              real GPU barriers after compute and at wait-for-idle points after memory-writing
 #                                 draws (Eden's waits otherwise unchanged): faster emulation changes GPU timing
--   patches:1-1 patches:6-6 patches:8-27 patches:32-32 variants/speed variants/report variants/perf36 variants/barriers
+#
+# Release 40 (test): build 38 showed graphical problems again and the eden-lun group is the common part of 32 and 38.
+# Yael's current build (35: stock + the three later speed-ups + report) plus one third of the group each, nothing else:
+#   -a  memory translation caches, descriptor and macro fast paths, continuity fix (0006 0010 0020 0022-0024 0032)
+#   -b  command processing: method sink bypass, dirty-flag skips, register-write batching (0011 0021 0026 + 0027 part)
+#   -c  Vulkan and cache fast paths (0008 0009 0012-0019 0025 + 0027 parts)
+-a   patches:1-1 variants/speed variants/report variants/lun-a
+-b   patches:1-1 variants/speed variants/report variants/lun-b
+-c   patches:1-1 variants/speed variants/report variants/lun-c
